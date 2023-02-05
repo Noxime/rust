@@ -2768,8 +2768,7 @@ dependencies = [
 [[package]]
 name = "object"
 version = "0.30.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea86265d3d3dcb6a27fc51bd29a4bf387fae9d2986b823079d4986af253eb439"
+source = "git+https://github.com/gimli-rs/object?rev=fd83015#fd8301516b5a86eb7a0626524db329e03354eb29"
 dependencies = [
  "crc32fast",
  "flate2",

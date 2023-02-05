@@ -180,9 +180,9 @@ pub(crate) fn create_object_file(sess: &Session) -> Option<write::Object<'static
                 e_flags |= elf::EF_RISCV_RVC;
             }
 
-            // Check if embedded is enabled
+            // Check if embedded ISA is enabled (16 registers)
             if features.contains("+e") {
-                e_flags |= 0b1000; // elf::EF_RISCV_RVE;
+                e_flags |= elf::EF_RISCV_RVE;
             }
 
             // Select the appropriate floating-point ABI
