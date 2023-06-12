@@ -1,9 +1,7 @@
-use super::bench::SIMPLE_RAYTRACER;
-use super::build_sysroot::{self, SYSROOT_SRC};
+use super::build_sysroot;
 use super::config;
 use super::path::{Dirs, RelPath};
 use super::prepare::GitRepo;
-use super::rustc_info::get_host_triple;
 use super::utils::{spawn_and_wait, spawn_and_wait_with_input, CargoProject, Compiler};
 use super::SysrootKind;
 use std::env;
@@ -95,54 +93,54 @@ const BASE_SYSROOT_SUITE: &[TestCase] = &[
     TestCase::build_bin_and_run("aot.issue-72793", "example/issue-72793.rs", &[]),
 ];
 
+// FIXME(rust-random/rand#1293): Newer rand versions fail to test on Windows. Update once this is
+// fixed.
 pub(crate) static RAND_REPO: GitRepo =
-    GitRepo::github("rust-random", "rand", "0f933f9c7176e53b2a3c7952ded484e1783f0bf1", "rand");
+    GitRepo::github("rust-random", "rand", "50b9a447410860af8d6db9a208c3576886955874", "rand");
 
 pub(crate) static RAND: CargoProject = CargoProject::new(&RAND_REPO.source_dir(), "rand");
 
 pub(crate) static REGEX_REPO: GitRepo =
-    GitRepo::github("rust-lang", "regex", "341f207c1071f7290e3f228c710817c280c8dca1", "regex");
+    GitRepo::github("rust-lang", "regex", "32fed9429eafba0ae92a64b01796a0c5a75b88c8", "regex");
 
 pub(crate) static REGEX: CargoProject = CargoProject::new(&REGEX_REPO.source_dir(), "regex");
 
 pub(crate) static PORTABLE_SIMD_REPO: GitRepo = GitRepo::github(
     "rust-lang",
     "portable-simd",
-    "582239ac3b32007613df04d7ffa78dc30f4c5645",
+    "ad8afa8c81273b3b49acbea38cd3bcf17a34cf2b",
     "portable-simd",
 );
 
 pub(crate) static PORTABLE_SIMD: CargoProject =
     CargoProject::new(&PORTABLE_SIMD_REPO.source_dir(), "portable_simd");
 
-pub(crate) static LIBCORE_TESTS: CargoProject =
-    CargoProject::new(&SYSROOT_SRC.join("library/core/tests"), "core_tests");
+pub(crate) static LIBCORE_TESTS_SRC: RelPath = RelPath::DOWNLOAD.join("coretests_src");
+
+pub(crate) static LIBCORE_TESTS: CargoProject = CargoProject::new(&LIBCORE_TESTS_SRC, "core_tests");
 
 const EXTENDED_SYSROOT_SUITE: &[TestCase] = &[
     TestCase::custom("test.rust-random/rand", &|runner| {
         RAND.clean(&runner.dirs);
 
         if runner.is_native {
-            eprintln!("[TEST] rust-random/rand");
             let mut test_cmd = RAND.test(&runner.target_compiler, &runner.dirs);
-            test_cmd.arg("--workspace");
+            test_cmd.arg("--workspace").arg("--").arg("-q");
             spawn_and_wait(test_cmd);
         } else {
-            eprintln!("[AOT] rust-random/rand");
+            eprintln!("Cross-Compiling: Not running tests");
             let mut build_cmd = RAND.build(&runner.target_compiler, &runner.dirs);
             build_cmd.arg("--workspace").arg("--tests");
             spawn_and_wait(build_cmd);
         }
     }),
-    TestCase::custom("test.simple-raytracer", &|runner| {
-        SIMPLE_RAYTRACER.clean(&runner.dirs);
-        spawn_and_wait(SIMPLE_RAYTRACER.build(&runner.target_compiler, &runner.dirs));
-    }),
     TestCase::custom("test.libcore", &|runner| {
         LIBCORE_TESTS.clean(&runner.dirs);
 
         if runner.is_native {
-            spawn_and_wait(LIBCORE_TESTS.test(&runner.target_compiler, &runner.dirs));
+            let mut test_cmd = LIBCORE_TESTS.test(&runner.target_compiler, &runner.dirs);
+            test_cmd.arg("--").arg("-q");
+            spawn_and_wait(test_cmd);
         } else {
             eprintln!("Cross-Compiling: Not running tests");
             let mut build_cmd = LIBCORE_TESTS.build(&runner.target_compiler, &runner.dirs);
@@ -153,18 +151,13 @@ const EXTENDED_SYSROOT_SUITE: &[TestCase] = &[
     TestCase::custom("test.regex-shootout-regex-dna", &|runner| {
         REGEX.clean(&runner.dirs);
 
-        // newer aho_corasick versions throw a deprecation warning
-        let lint_rust_flags = format!("{} --cap-lints warn", runner.target_compiler.rustflags);
-
         let mut build_cmd = REGEX.build(&runner.target_compiler, &runner.dirs);
         build_cmd.arg("--example").arg("shootout-regex-dna");
-        build_cmd.env("RUSTFLAGS", lint_rust_flags.clone());
         spawn_and_wait(build_cmd);
 
         if runner.is_native {
             let mut run_cmd = REGEX.run(&runner.target_compiler, &runner.dirs);
             run_cmd.arg("--example").arg("shootout-regex-dna");
-            run_cmd.env("RUSTFLAGS", lint_rust_flags);
 
             let input = fs::read_to_string(
                 REGEX.source_dir(&runner.dirs).join("examples").join("regexdna-input.txt"),
@@ -176,13 +169,6 @@ const EXTENDED_SYSROOT_SUITE: &[TestCase] = &[
             .unwrap();
 
             let output = spawn_and_wait_with_input(run_cmd, input);
-            // Make sure `[codegen mono items] start` doesn't poison the diff
-            let output = output
-                .lines()
-                .filter(|line| !line.contains("codegen mono items"))
-                .chain(Some("")) // This just adds the trailing newline
-                .collect::<Vec<&str>>()
-                .join("\r\n");
 
             let output_matches = expected.lines().eq(output.lines());
             if !output_matches {
@@ -197,27 +183,16 @@ const EXTENDED_SYSROOT_SUITE: &[TestCase] = &[
     TestCase::custom("test.regex", &|runner| {
         REGEX.clean(&runner.dirs);
 
-        // newer aho_corasick versions throw a deprecation warning
-        let lint_rust_flags = format!("{} --cap-lints warn", runner.target_compiler.rustflags);
-
         if runner.is_native {
             let mut run_cmd = REGEX.test(&runner.target_compiler, &runner.dirs);
-            run_cmd.args([
-                "--tests",
-                "--",
-                "--exclude-should-panic",
-                "--test-threads",
-                "1",
-                "-Zunstable-options",
-                "-q",
-            ]);
-            run_cmd.env("RUSTFLAGS", lint_rust_flags);
+            // regex-capi and regex-debug don't have any tests. Nor do they contain any code
+            // that is useful to test with cg_clif. Skip building them to reduce test time.
+            run_cmd.args(["-p", "regex", "-p", "regex-syntax", "--", "-q"]);
             spawn_and_wait(run_cmd);
         } else {
             eprintln!("Cross-Compiling: Not running tests");
             let mut build_cmd = REGEX.build(&runner.target_compiler, &runner.dirs);
             build_cmd.arg("--tests");
-            build_cmd.env("RUSTFLAGS", lint_rust_flags.clone());
             spawn_and_wait(build_cmd);
         }
     }),
@@ -254,8 +229,11 @@ pub(crate) fn run_tests(
             target_triple.clone(),
         );
 
-        let runner =
-            TestRunner::new(dirs.clone(), target_compiler, get_host_triple() == target_triple);
+        let runner = TestRunner::new(
+            dirs.clone(),
+            target_compiler,
+            bootstrap_host_compiler.triple == target_triple,
+        );
 
         BUILD_EXAMPLE_OUT_DIR.ensure_fresh(dirs);
         runner.run_testsuite(NO_SYSROOT_SUITE);
@@ -276,8 +254,11 @@ pub(crate) fn run_tests(
             target_triple.clone(),
         );
 
-        let runner =
-            TestRunner::new(dirs.clone(), target_compiler, get_host_triple() == target_triple);
+        let runner = TestRunner::new(
+            dirs.clone(),
+            target_compiler,
+            bootstrap_host_compiler.triple == target_triple,
+        );
 
         if run_base_sysroot {
             runner.run_testsuite(BASE_SYSROOT_SUITE);
@@ -301,7 +282,7 @@ struct TestRunner {
 }
 
 impl TestRunner {
-    pub fn new(dirs: Dirs, mut target_compiler: Compiler, is_native: bool) -> Self {
+    fn new(dirs: Dirs, mut target_compiler: Compiler, is_native: bool) -> Self {
         if let Ok(rustflags) = env::var("RUSTFLAGS") {
             target_compiler.rustflags.push(' ');
             target_compiler.rustflags.push_str(&rustflags);
@@ -323,7 +304,7 @@ impl TestRunner {
         Self { is_native, jit_supported, dirs, target_compiler }
     }
 
-    pub fn run_testsuite(&self, tests: &[TestCase]) {
+    fn run_testsuite(&self, tests: &[TestCase]) {
         for TestCase { config, cmd } in tests {
             let (tag, testname) = config.split_once('.').unwrap();
             let tag = tag.to_uppercase();
@@ -408,7 +389,7 @@ impl TestRunner {
         spawn_and_wait(self.rustc_command(args));
     }
 
-    fn run_out_command<'a>(&self, name: &str, args: &[&str]) {
+    fn run_out_command(&self, name: &str, args: &[&str]) {
         let mut full_cmd = vec![];
 
         // Prepend the RUN_WRAPPER's

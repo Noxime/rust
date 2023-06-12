@@ -8,7 +8,6 @@ use crate::visit::DocVisitor;
 use rustc_hir as hir;
 use rustc_lint::builtin::MISSING_DOCS;
 use rustc_middle::lint::LintLevelSource;
-use rustc_middle::ty::DefIdTree;
 use rustc_session::lint;
 use rustc_span::FileName;
 use serde::Serialize;
@@ -207,13 +206,7 @@ impl<'a, 'b> DocVisitor for CoverageCalculator<'a, 'b> {
                 let has_docs = !i.attrs.doc_strings.is_empty();
                 let mut tests = Tests { found_tests: 0 };
 
-                find_testable_code(
-                    &i.attrs.collapsed_doc_value().unwrap_or_default(),
-                    &mut tests,
-                    ErrorCodes::No,
-                    false,
-                    None,
-                );
+                find_testable_code(&i.doc_value(), &mut tests, ErrorCodes::No, false, None);
 
                 let has_doc_example = tests.found_tests != 0;
                 let hir_id = DocContext::as_local_hir_id(self.ctx.tcx, i.item_id).unwrap();

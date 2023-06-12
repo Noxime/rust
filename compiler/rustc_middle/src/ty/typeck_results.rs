@@ -8,10 +8,9 @@ use crate::{
     },
 };
 use rustc_data_structures::{
-    fx::FxHashMap,
+    fx::{FxHashMap, FxIndexMap},
     sync::Lrc,
     unord::{UnordItems, UnordSet},
-    vec_map::VecMap,
 };
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir as hir;
@@ -21,11 +20,12 @@ use rustc_hir::{
     hir_id::OwnerId,
     HirId, ItemLocalId, ItemLocalMap, ItemLocalSet,
 };
-use rustc_index::vec::{Idx, IndexVec};
+use rustc_index::{Idx, IndexVec};
 use rustc_macros::HashStable;
 use rustc_middle::mir::FakeReadCause;
 use rustc_session::Session;
 use rustc_span::Span;
+use rustc_target::abi::FieldIdx;
 use std::{collections::hash_map::Entry, hash::Hash, iter};
 
 use super::RvalueScopes;
@@ -43,7 +43,7 @@ pub struct TypeckResults<'tcx> {
     /// or patterns (`S { field }`). The index is often useful by itself, but to learn more
     /// about the field you also need definition of the variant to which the field
     /// belongs, but it may not exist if it's a tuple field (`tuple.0`).
-    field_indices: ItemLocalMap<usize>,
+    field_indices: ItemLocalMap<FieldIdx>,
 
     /// Stores the types for various nodes in the AST. Note that this table
     /// is not guaranteed to be populated outside inference. See
@@ -151,11 +151,11 @@ pub struct TypeckResults<'tcx> {
     /// this field will be set to `Some(ErrorGuaranteed)`.
     pub tainted_by_errors: Option<ErrorGuaranteed>,
 
-    /// All the opaque types that have hidden types set
-    /// by this function. We also store the
-    /// type here, so that mir-borrowck can use it as a hint for figuring out hidden types,
-    /// even if they are only set in dead code (which doesn't show up in MIR).
-    pub concrete_opaque_types: VecMap<LocalDefId, ty::OpaqueHiddenType<'tcx>>,
+    /// All the opaque types that have hidden types set by this function.
+    /// We also store the type here, so that the compiler can use it as a hint
+    /// for figuring out hidden types, even if they are only set in dead code
+    /// (which doesn't show up in MIR).
+    pub concrete_opaque_types: FxIndexMap<ty::OpaqueTypeKey<'tcx>, ty::OpaqueHiddenType<'tcx>>,
 
     /// Tracks the minimum captures required for a closure;
     /// see `MinCaptureInformationMap` for more details.
@@ -208,6 +208,9 @@ pub struct TypeckResults<'tcx> {
     /// Contains the data for evaluating the effect of feature `capture_disjoint_fields`
     /// on closure size.
     pub closure_size_eval: FxHashMap<LocalDefId, ClosureSizeProfileData<'tcx>>,
+
+    /// Container types and field indices of `offset_of!` expressions
+    offset_of_data: ItemLocalMap<(Ty<'tcx>, Vec<FieldIdx>)>,
 }
 
 /// Whenever a value may be live across a generator yield, the type of that value winds up in the
@@ -280,6 +283,7 @@ impl<'tcx> TypeckResults<'tcx> {
             generator_interior_predicates: Default::default(),
             treat_byte_string_as_slice: Default::default(),
             closure_size_eval: Default::default(),
+            offset_of_data: Default::default(),
         }
     }
 
@@ -314,19 +318,19 @@ impl<'tcx> TypeckResults<'tcx> {
         LocalTableInContextMut { hir_owner: self.hir_owner, data: &mut self.type_dependent_defs }
     }
 
-    pub fn field_indices(&self) -> LocalTableInContext<'_, usize> {
+    pub fn field_indices(&self) -> LocalTableInContext<'_, FieldIdx> {
         LocalTableInContext { hir_owner: self.hir_owner, data: &self.field_indices }
     }
 
-    pub fn field_indices_mut(&mut self) -> LocalTableInContextMut<'_, usize> {
+    pub fn field_indices_mut(&mut self) -> LocalTableInContextMut<'_, FieldIdx> {
         LocalTableInContextMut { hir_owner: self.hir_owner, data: &mut self.field_indices }
     }
 
-    pub fn field_index(&self, id: hir::HirId) -> usize {
+    pub fn field_index(&self, id: hir::HirId) -> FieldIdx {
         self.field_indices().get(id).cloned().expect("no index for a field")
     }
 
-    pub fn opt_field_index(&self, id: hir::HirId) -> Option<usize> {
+    pub fn opt_field_index(&self, id: hir::HirId) -> Option<FieldIdx> {
         self.field_indices().get(id).cloned()
     }
 
@@ -530,6 +534,14 @@ impl<'tcx> TypeckResults<'tcx> {
     pub fn coercion_casts(&self) -> &ItemLocalSet {
         &self.coercion_casts
     }
+
+    pub fn offset_of_data(&self) -> LocalTableInContext<'_, (Ty<'tcx>, Vec<FieldIdx>)> {
+        LocalTableInContext { hir_owner: self.hir_owner, data: &self.offset_of_data }
+    }
+
+    pub fn offset_of_data_mut(&mut self) -> LocalTableInContextMut<'_, (Ty<'tcx>, Vec<FieldIdx>)> {
+        LocalTableInContextMut { hir_owner: self.hir_owner, data: &mut self.offset_of_data }
+    }
 }
 
 /// Validate that the given HirId (respectively its `local_id` part) can be
@@ -569,7 +581,7 @@ impl<'a, V> LocalTableInContext<'a, V> {
         self.data.contains_key(&id.local_id)
     }
 
-    pub fn get(&self, id: hir::HirId) -> Option<&V> {
+    pub fn get(&self, id: hir::HirId) -> Option<&'a V> {
         validate_hir_id_for_typeck_results(self.hir_owner, id);
         self.data.get(&id.local_id)
     }

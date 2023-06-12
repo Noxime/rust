@@ -69,13 +69,81 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 this.write_scalar(result, dest)?;
             }
 
+            // File related shims
+            "NtWriteFile" => {
+                if !this.frame_in_std() {
+                    throw_unsup_format!(
+                        "`NtWriteFile` support is crude and just enough for stdout to work"
+                    );
+                }
+
+                let [
+                    handle,
+                    _event,
+                    _apc_routine,
+                    _apc_context,
+                    io_status_block,
+                    buf,
+                    n,
+                    byte_offset,
+                    _key,
+                ] = this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
+                let handle = this.read_target_isize(handle)?;
+                let buf = this.read_pointer(buf)?;
+                let n = this.read_scalar(n)?.to_u32()?;
+                let byte_offset = this.read_target_usize(byte_offset)?; // is actually a pointer
+                let io_status_block = this.deref_operand(io_status_block)?;
+
+                if byte_offset != 0 {
+                    throw_unsup_format!(
+                        "`NtWriteFile` `ByteOffset` parameter is non-null, which is unsupported"
+                    );
+                }
+
+                let written = if handle == -11 || handle == -12 {
+                    // stdout/stderr
+                    use std::io::{self, Write};
+
+                    let buf_cont =
+                        this.read_bytes_ptr_strip_provenance(buf, Size::from_bytes(u64::from(n)))?;
+                    let res = if this.machine.mute_stdout_stderr {
+                        Ok(buf_cont.len())
+                    } else if handle == -11 {
+                        io::stdout().write(buf_cont)
+                    } else {
+                        io::stderr().write(buf_cont)
+                    };
+                    // We write at most `n` bytes, which is a `u32`, so we cannot have written more than that.
+                    res.ok().map(|n| u32::try_from(n).unwrap())
+                } else {
+                    throw_unsup_format!(
+                        "on Windows, writing to anything except stdout/stderr is not supported"
+                    )
+                };
+                // We have to put the result into io_status_block.
+                if let Some(n) = written {
+                    let io_status_information =
+                        this.mplace_field_named(&io_status_block, "Information")?;
+                    this.write_scalar(
+                        Scalar::from_target_usize(n.into(), this),
+                        &io_status_information.into(),
+                    )?;
+                }
+                // Return whether this was a success. >= 0 is success.
+                // For the error code we arbitrarily pick 0xC0000185, STATUS_IO_DEVICE_ERROR.
+                this.write_scalar(
+                    Scalar::from_u32(if written.is_some() { 0 } else { 0xC0000185u32 }),
+                    dest,
+                )?;
+            }
+
             // Allocation
             "HeapAlloc" => {
                 let [handle, flags, size] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
-                this.read_machine_isize(handle)?;
+                this.read_target_isize(handle)?;
                 let flags = this.read_scalar(flags)?.to_u32()?;
-                let size = this.read_machine_usize(size)?;
+                let size = this.read_target_usize(size)?;
                 let heap_zero_memory = 0x00000008; // HEAP_ZERO_MEMORY
                 let zero_init = (flags & heap_zero_memory) == heap_zero_memory;
                 let res = this.malloc(size, zero_init, MiriMemoryKind::WinHeap)?;
@@ -84,7 +152,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             "HeapFree" => {
                 let [handle, flags, ptr] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
-                this.read_machine_isize(handle)?;
+                this.read_target_isize(handle)?;
                 this.read_scalar(flags)?.to_u32()?;
                 let ptr = this.read_pointer(ptr)?;
                 this.free(ptr, MiriMemoryKind::WinHeap)?;
@@ -93,10 +161,10 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             "HeapReAlloc" => {
                 let [handle, flags, ptr, size] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
-                this.read_machine_isize(handle)?;
+                this.read_target_isize(handle)?;
                 this.read_scalar(flags)?.to_u32()?;
                 let ptr = this.read_pointer(ptr)?;
-                let size = this.read_machine_usize(size)?;
+                let size = this.read_target_usize(size)?;
                 let res = this.realloc(ptr, size, MiriMemoryKind::WinHeap)?;
                 this.write_pointer(res, dest)?;
             }
@@ -151,7 +219,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     .copied()
                     .scan(Size::ZERO, |a, x| {
                         let res = Some(*a);
-                        *a += x;
+                        *a = a.checked_add(x, this).unwrap();
                         res
                     })
                     .collect();
@@ -299,7 +367,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 #[allow(non_snake_case)]
                 let [hModule, lpProcName] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
-                this.read_machine_isize(hModule)?;
+                this.read_target_isize(hModule)?;
                 let name = this.read_c_str(this.read_pointer(lpProcName)?)?;
                 if let Some(dlsym) = Dlsym::from_str(name, &this.tcx.sess.target.os)? {
                     let ptr = this.create_fn_alloc_ptr(FnVal::Other(dlsym));
@@ -323,7 +391,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let [algorithm, ptr, len, flags] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
                 let algorithm = this.read_scalar(algorithm)?;
-                let algorithm = algorithm.to_machine_usize(this)?;
+                let algorithm = algorithm.to_target_usize(this)?;
                 let ptr = this.read_pointer(ptr)?;
                 let len = this.read_scalar(len)?.to_u32()?;
                 let flags = this.read_scalar(flags)?.to_u32()?;
@@ -357,7 +425,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 // `term` needs this, so we fake it.
                 let [console, buffer_info] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
-                this.read_machine_isize(console)?;
+                this.read_target_isize(console)?;
                 this.deref_operand(buffer_info)?;
                 // Indicate an error.
                 // FIXME: we should set last_error, but to what?
@@ -371,7 +439,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 // one it is. This is very fake, but libtest needs it so we cannot make it a
                 // std-only shim.
                 // FIXME: this should return real HANDLEs when io support is added
-                this.write_scalar(Scalar::from_machine_isize(which.into(), this), dest)?;
+                this.write_scalar(Scalar::from_target_isize(which.into(), this), dest)?;
             }
             "CloseHandle" => {
                 let [handle] =
@@ -386,7 +454,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
                 this.check_no_isolation("`GetModuleFileNameW`")?;
 
-                let handle = this.read_machine_usize(handle)?;
+                let handle = this.read_target_usize(handle)?;
                 let filename = this.read_pointer(filename)?;
                 let size = this.read_scalar(size)?.to_u32()?;
 
@@ -473,7 +541,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             "GetConsoleMode" if this.frame_in_std() => {
                 let [console, mode] =
                     this.check_shim(abi, Abi::System { unwind: false }, link_name, args)?;
-                this.read_machine_isize(console)?;
+                this.read_target_isize(console)?;
                 this.deref_operand(mode)?;
                 // Indicate an error.
                 this.write_null(dest)?;

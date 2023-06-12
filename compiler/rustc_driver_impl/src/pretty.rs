@@ -9,7 +9,7 @@ use rustc_hir_pretty as pprust_hir;
 use rustc_middle::hir::map as hir_map;
 use rustc_middle::mir::{write_mir_graphviz, write_mir_pretty};
 use rustc_middle::ty::{self, TyCtxt};
-use rustc_session::config::{PpAstTreeMode, PpHirMode, PpMode, PpSourceMode};
+use rustc_session::config::{OutFileName, PpAstTreeMode, PpHirMode, PpMode, PpSourceMode};
 use rustc_session::Session;
 use rustc_span::symbol::Ident;
 use rustc_span::FileName;
@@ -359,8 +359,8 @@ fn get_source(sess: &Session) -> (String, FileName) {
 
 fn write_or_print(out: &str, sess: &Session) {
     match &sess.io.output_file {
-        None => print!("{out}"),
-        Some(p) => {
+        None | Some(OutFileName::Stdout) => print!("{out}"),
+        Some(OutFileName::Real(p)) => {
             if let Err(e) = std::fs::write(p, out) {
                 sess.emit_fatal(UnprettyDumpFail {
                     path: p.display().to_string(),
@@ -488,12 +488,7 @@ fn print_with_analysis(tcx: TyCtxt<'_>, ppm: PpMode) -> Result<(), ErrorGuarante
             abort_on_err(rustc_hir_analysis::check_crate(tcx), tcx.sess);
             debug!("pretty printing THIR tree");
             for did in tcx.hir().body_owners() {
-                let _ = writeln!(
-                    out,
-                    "{:?}:\n{}\n",
-                    did,
-                    tcx.thir_tree(ty::WithOptConstParam::unknown(did))
-                );
+                let _ = writeln!(out, "{:?}:\n{}\n", did, tcx.thir_tree(did));
             }
             out
         }
@@ -503,12 +498,7 @@ fn print_with_analysis(tcx: TyCtxt<'_>, ppm: PpMode) -> Result<(), ErrorGuarante
             abort_on_err(rustc_hir_analysis::check_crate(tcx), tcx.sess);
             debug!("pretty printing THIR flat");
             for did in tcx.hir().body_owners() {
-                let _ = writeln!(
-                    out,
-                    "{:?}:\n{}\n",
-                    did,
-                    tcx.thir_flat(ty::WithOptConstParam::unknown(did))
-                );
+                let _ = writeln!(out, "{:?}:\n{}\n", did, tcx.thir_flat(did));
             }
             out
         }

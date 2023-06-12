@@ -1,6 +1,6 @@
+use crate::fluent_generated as fluent;
 use rustc_errors::{
-    fluent, AddToDiagnostic, Diagnostic, ErrorGuaranteed, Handler, IntoDiagnostic,
-    SubdiagnosticMessage,
+    AddToDiagnostic, Diagnostic, ErrorGuaranteed, Handler, IntoDiagnostic, SubdiagnosticMessage,
 };
 use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_session::lint::Level;
@@ -39,7 +39,7 @@ impl AddToDiagnostic for OverruledAttributeSub {
                 diag.span_label(span, fluent::lint_node_source);
                 if let Some(rationale) = reason {
                     #[allow(rustc::untranslatable_diagnostic)]
-                    diag.note(rationale.as_str());
+                    diag.note(rationale.to_string());
                 }
             }
             OverruledAttributeSub::CommandLineSource => {
@@ -81,7 +81,7 @@ pub struct UnknownToolInScopedLint {
 
 #[derive(Diagnostic)]
 #[diag(lint_builtin_ellipsis_inclusive_range_patterns, code = "E0783")]
-pub struct BuiltinEllpisisInclusiveRangePatterns {
+pub struct BuiltinEllipsisInclusiveRangePatterns {
     #[primary_span]
     pub span: Span,
     #[suggestion(style = "short", code = "{replace}", applicability = "machine-applicable")]
@@ -116,7 +116,7 @@ impl IntoDiagnostic<'_> for CheckNameUnknown {
         let mut diag = handler.struct_err(fluent::lint_check_name_unknown);
         diag.code(rustc_errors::error_code!(E0602));
         if let Some(suggestion) = self.suggestion {
-            diag.help(fluent::help);
+            diag.help(fluent::lint_help);
             diag.set_arg("suggestion", suggestion);
         }
         diag.set_arg("lint_name", self.lint_name);

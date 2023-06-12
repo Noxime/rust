@@ -4,7 +4,6 @@
 
 #![feature(async_closure)]
 #![feature(box_patterns)]
-#![feature(box_syntax)]
 #![feature(const_trait_impl)]
 #![feature(decl_macro)]
 #![feature(generators)]
@@ -91,9 +90,6 @@ fn test_block() {
 
 #[test]
 fn test_expr() {
-    // ExprKind::Box
-    assert_eq!(stringify_expr!(box expr), "box expr");
-
     // ExprKind::Array
     assert_eq!(stringify_expr!([]), "[]");
     assert_eq!(stringify_expr!([true]), "[true]");
@@ -138,8 +134,7 @@ fn test_expr() {
     assert_eq!(stringify_expr!(expr as T<u8>), "expr as T<u8>");
 
     // ExprKind::Type
-    assert_eq!(stringify_expr!(expr: T), "expr: T");
-    assert_eq!(stringify_expr!(expr: T<u8>), "expr: T<u8>");
+    // There is no syntax for type ascription.
 
     // ExprKind::If
     assert_eq!(stringify_expr!(if true {}), "if true {}");
@@ -626,7 +621,7 @@ fn test_item() {
         stringify_item!(
             impl ~const Struct {}
         ),
-        "impl Struct {}", // FIXME
+        "impl ~const Struct {}",
     );
 
     // ItemKind::MacCall
@@ -838,7 +833,7 @@ fn test_ty() {
     assert_eq!(stringify_ty!(dyn Send + 'a), "dyn Send + 'a");
     assert_eq!(stringify_ty!(dyn 'a + Send), "dyn 'a + Send");
     assert_eq!(stringify_ty!(dyn ?Sized), "dyn ?Sized");
-    assert_eq!(stringify_ty!(dyn ~const Clone), "dyn Clone"); // FIXME
+    assert_eq!(stringify_ty!(dyn ~const Clone), "dyn ~const Clone");
     assert_eq!(stringify_ty!(dyn for<'a> Send), "dyn for<'a> Send");
 
     // TyKind::ImplTrait
@@ -846,7 +841,7 @@ fn test_ty() {
     assert_eq!(stringify_ty!(impl Send + 'a), "impl Send + 'a");
     assert_eq!(stringify_ty!(impl 'a + Send), "impl 'a + Send");
     assert_eq!(stringify_ty!(impl ?Sized), "impl ?Sized");
-    assert_eq!(stringify_ty!(impl ~const Clone), "impl Clone"); // FIXME
+    assert_eq!(stringify_ty!(impl ~const Clone), "impl ~const Clone");
     assert_eq!(stringify_ty!(impl for<'a> Send), "impl for<'a> Send");
 
     // TyKind::Paren

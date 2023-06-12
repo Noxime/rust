@@ -1,9 +1,9 @@
 //! Nameres-specific procedural macro data and helpers.
 
 use hir_expand::name::{AsName, Name};
-use tt::{Leaf, TokenTree};
 
 use crate::attr::Attrs;
+use crate::tt::{Leaf, TokenTree};
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct ProcMacroDef {
@@ -52,7 +52,7 @@ impl Attrs {
 }
 
 // This fn is intended for `#[proc_macro_derive(..)]` and `#[rustc_builtin_macro(..)]`, which have
-// the same strucuture.
+// the same structure.
 #[rustfmt::skip]
 pub(crate) fn parse_macro_name_and_helper_attrs(tt: &[TokenTree]) -> Option<(Name, Box<[Name]>)> {
     match tt {

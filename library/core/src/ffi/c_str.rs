@@ -1,4 +1,5 @@
 use crate::cmp::Ordering;
+use crate::error::Error;
 use crate::ffi::c_char;
 use crate::fmt;
 use crate::intrinsics;
@@ -78,9 +79,9 @@ use crate::str;
 ///
 /// [str]: prim@str "str"
 #[derive(Hash)]
-#[cfg_attr(not(test), rustc_diagnostic_item = "CStr")]
 #[stable(feature = "core_c_str", since = "1.64.0")]
 #[rustc_has_incoherent_inherent_impls]
+#[lang = "CStr"]
 // FIXME:
 // `fn from` in `impl From<&CStr> for Box<CStr>` current implementation relies
 // on `CStr` being layout-compatible with `[u8]`.
@@ -129,10 +130,12 @@ impl FromBytesWithNulError {
     const fn not_nul_terminated() -> FromBytesWithNulError {
         FromBytesWithNulError { kind: FromBytesWithNulErrorKind::NotNulTerminated }
     }
+}
 
-    #[doc(hidden)]
-    #[unstable(feature = "cstr_internals", issue = "none")]
-    pub fn __description(&self) -> &str {
+#[stable(feature = "frombyteswithnulerror_impls", since = "1.17.0")]
+impl Error for FromBytesWithNulError {
+    #[allow(deprecated)]
+    fn description(&self) -> &str {
         match self.kind {
             FromBytesWithNulErrorKind::InteriorNul(..) => {
                 "data provided contains an interior nul byte"
@@ -150,10 +153,10 @@ impl FromBytesWithNulError {
 /// This error is created by the [`CStr::from_bytes_until_nul`] method.
 ///
 #[derive(Clone, PartialEq, Eq, Debug)]
-#[unstable(feature = "cstr_from_bytes_until_nul", issue = "95027")]
+#[stable(feature = "cstr_from_bytes_until_nul", since = "1.69.0")]
 pub struct FromBytesUntilNulError(());
 
-#[unstable(feature = "cstr_from_bytes_until_nul", issue = "95027")]
+#[stable(feature = "cstr_from_bytes_until_nul", since = "1.69.0")]
 impl fmt::Display for FromBytesUntilNulError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "data provided does not contain a nul")
@@ -169,6 +172,7 @@ impl fmt::Debug for CStr {
 
 #[stable(feature = "cstr_default", since = "1.10.0")]
 impl Default for &CStr {
+    #[inline]
     fn default() -> Self {
         const SLICE: &[c_char] = &[0];
         // SAFETY: `SLICE` is indeed pointing to a valid nul-terminated string.
@@ -180,7 +184,7 @@ impl Default for &CStr {
 impl fmt::Display for FromBytesWithNulError {
     #[allow(deprecated, deprecated_in_future)]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.__description())?;
+        f.write_str(self.description())?;
         if let FromBytesWithNulErrorKind::InteriorNul(pos) = self.kind {
             write!(f, " at byte pos {pos}")?;
         }
@@ -306,8 +310,6 @@ impl CStr {
     ///
     /// # Examples
     /// ```
-    /// #![feature(cstr_from_bytes_until_nul)]
-    ///
     /// use std::ffi::CStr;
     ///
     /// let mut buffer = [0u8; 16];
@@ -322,13 +324,15 @@ impl CStr {
     /// assert_eq!(c_str.to_str().unwrap(), "AAAAAAAA");
     /// ```
     ///
-    #[unstable(feature = "cstr_from_bytes_until_nul", issue = "95027")]
-    #[rustc_const_unstable(feature = "cstr_from_bytes_until_nul", issue = "95027")]
+    #[stable(feature = "cstr_from_bytes_until_nul", since = "1.69.0")]
+    #[rustc_const_stable(feature = "cstr_from_bytes_until_nul", since = "1.69.0")]
     pub const fn from_bytes_until_nul(bytes: &[u8]) -> Result<&CStr, FromBytesUntilNulError> {
         let nul_pos = memchr::memchr(0, bytes);
         match nul_pos {
             Some(nul_pos) => {
-                let subslice = &bytes[..nul_pos + 1];
+                // FIXME(const-hack) replace with range index
+                // SAFETY: nul_pos + 1 <= bytes.len()
+                let subslice = unsafe { crate::slice::from_raw_parts(bytes.as_ptr(), nul_pos + 1) };
                 // SAFETY: We know there is a nul byte at nul_pos, so this slice
                 // (ending at the nul byte) is a well-formed C string.
                 Ok(unsafe { CStr::from_bytes_with_nul_unchecked(subslice) })
@@ -455,6 +459,10 @@ impl CStr {
     /// to a contiguous region of memory terminated with a 0 byte to represent
     /// the end of the string.
     ///
+    /// The type of the returned pointer is
+    /// [`*const c_char`][crate::ffi::c_char], and whether it's
+    /// an alias for `*const i8` or `*const u8` is platform-specific.
+    ///
     /// **WARNING**
     ///
     /// The returned pointer is read-only; writing to it (including passing it
@@ -468,6 +476,7 @@ impl CStr {
     /// # #![allow(unused_must_use)] #![allow(temporary_cstring_as_ptr)]
     /// use std::ffi::CString;
     ///
+    /// // Do not do this:
     /// let ptr = CString::new("Hello").expect("CString::new failed").as_ptr();
     /// unsafe {
     ///     // `ptr` is dangling
@@ -508,8 +517,6 @@ impl CStr {
     /// # Examples
     ///
     /// ```
-    /// #![feature(cstr_is_empty)]
-    ///
     /// use std::ffi::CStr;
     /// # use std::ffi::FromBytesWithNulError;
     ///
@@ -524,11 +531,13 @@ impl CStr {
     /// # }
     /// ```
     #[inline]
-    #[unstable(feature = "cstr_is_empty", issue = "102444")]
+    #[stable(feature = "cstr_is_empty", since = "1.71.0")]
+    #[rustc_const_stable(feature = "cstr_is_empty", since = "1.71.0")]
     pub const fn is_empty(&self) -> bool {
         // SAFETY: We know there is at least one byte; for empty strings it
         // is the NUL terminator.
-        (unsafe { self.inner.get_unchecked(0) }) == &0
+        // FIXME(const-hack): use get_unchecked
+        unsafe { *self.inner.as_ptr() == 0 }
     }
 
     /// Converts this C string to a byte slice.
@@ -552,8 +561,7 @@ impl CStr {
     #[must_use = "this returns the result of the operation, \
                   without modifying the original"]
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_const_unstable(feature = "const_cstr_methods", issue = "101719")]
-    pub const fn to_bytes(&self) -> &[u8] {
+    pub fn to_bytes(&self) -> &[u8] {
         let bytes = self.to_bytes_with_nul();
         // SAFETY: to_bytes_with_nul returns slice with length at least 1
         unsafe { bytes.get_unchecked(..bytes.len() - 1) }
@@ -604,8 +612,7 @@ impl CStr {
     /// assert_eq!(cstr.to_str(), Ok("foo"));
     /// ```
     #[stable(feature = "cstr_to_str", since = "1.4.0")]
-    #[rustc_const_unstable(feature = "const_cstr_methods", issue = "101719")]
-    pub const fn to_str(&self) -> Result<&str, str::Utf8Error> {
+    pub fn to_str(&self) -> Result<&str, str::Utf8Error> {
         // N.B., when `CStr` is changed to perform the length check in `.to_bytes()`
         // instead of in `from_ptr()`, it may be worth considering if this should
         // be rewritten to do the UTF-8 check inline with the length calculation
@@ -616,6 +623,7 @@ impl CStr {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl PartialEq for CStr {
+    #[inline]
     fn eq(&self, other: &CStr) -> bool {
         self.to_bytes().eq(other.to_bytes())
     }
@@ -624,12 +632,14 @@ impl PartialEq for CStr {
 impl Eq for CStr {}
 #[stable(feature = "rust1", since = "1.0.0")]
 impl PartialOrd for CStr {
+    #[inline]
     fn partial_cmp(&self, other: &CStr) -> Option<Ordering> {
         self.to_bytes().partial_cmp(&other.to_bytes())
     }
 }
 #[stable(feature = "rust1", since = "1.0.0")]
 impl Ord for CStr {
+    #[inline]
     fn cmp(&self, other: &CStr) -> Ordering {
         self.to_bytes().cmp(&other.to_bytes())
     }
@@ -639,6 +649,7 @@ impl Ord for CStr {
 impl ops::Index<ops::RangeFrom<usize>> for CStr {
     type Output = CStr;
 
+    #[inline]
     fn index(&self, index: ops::RangeFrom<usize>) -> &CStr {
         let bytes = self.to_bytes_with_nul();
         // we need to manually check the starting index to account for the null

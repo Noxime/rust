@@ -1,4 +1,7 @@
 //! Errors emitted by `rustc_hir_typeck`.
+use std::borrow::Cow;
+
+use crate::fluent_generated as fluent;
 use rustc_errors::{AddToDiagnostic, Applicability, Diagnostic, MultiSpan, SubdiagnosticMessage};
 use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_middle::ty::Ty;
@@ -14,7 +17,7 @@ pub struct FieldMultiplySpecifiedInInitializer {
     #[primary_span]
     #[label]
     pub span: Span,
-    #[label(previous_use_label)]
+    #[label(hir_typeck_previous_use_label)]
     pub prev_span: Span,
     pub ident: Ident,
 }
@@ -24,9 +27,9 @@ pub struct FieldMultiplySpecifiedInInitializer {
 pub struct ReturnStmtOutsideOfFnBody {
     #[primary_span]
     pub span: Span,
-    #[label(encl_body_label)]
+    #[label(hir_typeck_encl_body_label)]
     pub encl_body_span: Option<Span>,
-    #[label(encl_fn_label)]
+    #[label(hir_typeck_encl_fn_label)]
     pub encl_fn_span: Option<Span>,
 }
 
@@ -46,8 +49,8 @@ pub struct StructExprNonExhaustive {
 }
 
 #[derive(Diagnostic)]
-#[diag(hir_typeck_method_call_on_unknown_type, code = "E0699")]
-pub struct MethodCallOnUnknownType {
+#[diag(hir_typeck_method_call_on_unknown_raw_pointee, code = "E0699")]
+pub struct MethodCallOnUnknownRawPointee {
     #[primary_span]
     pub span: Span,
 }
@@ -107,7 +110,7 @@ pub enum ExpectedReturnTypeLabel<'tcx> {
 
 #[derive(Diagnostic)]
 #[diag(hir_typeck_missing_parentheses_in_range, code = "E0689")]
-pub struct MissingParentheseInRange {
+pub struct MissingParenthesesInRange {
     #[primary_span]
     #[label(hir_typeck_missing_parentheses_in_range)]
     pub span: Span,
@@ -157,20 +160,17 @@ impl AddToDiagnostic for TypeMismatchFruTypo {
 
         // Only explain that `a ..b` is a range if it's split up
         if self.expr_span.between(self.fru_span).is_empty() {
-            diag.span_note(
-                self.expr_span.to(self.fru_span),
-                rustc_errors::fluent::hir_typeck_fru_note,
-            );
+            diag.span_note(self.expr_span.to(self.fru_span), fluent::hir_typeck_fru_note);
         } else {
             let mut multispan: MultiSpan = vec![self.expr_span, self.fru_span].into();
-            multispan.push_span_label(self.expr_span, rustc_errors::fluent::hir_typeck_fru_expr);
-            multispan.push_span_label(self.fru_span, rustc_errors::fluent::hir_typeck_fru_expr2);
-            diag.span_note(multispan, rustc_errors::fluent::hir_typeck_fru_note);
+            multispan.push_span_label(self.expr_span, fluent::hir_typeck_fru_expr);
+            multispan.push_span_label(self.fru_span, fluent::hir_typeck_fru_expr2);
+            diag.span_note(multispan, fluent::hir_typeck_fru_note);
         }
 
         diag.span_suggestion(
             self.expr_span.shrink_to_hi(),
-            rustc_errors::fluent::hir_typeck_fru_suggestion,
+            fluent::hir_typeck_fru_suggestion,
             ", ",
             Applicability::MaybeIncorrect,
         );
@@ -229,4 +229,117 @@ impl HelpUseLatestEdition {
             Self::Standalone { edition }
         }
     }
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_typeck_const_select_must_be_const)]
+#[help]
+pub struct ConstSelectMustBeConst {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_typeck_const_select_must_be_fn)]
+#[note]
+#[help]
+pub struct ConstSelectMustBeFn<'a> {
+    #[primary_span]
+    pub span: Span,
+    pub ty: Ty<'a>,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_typeck_union_pat_multiple_fields)]
+pub struct UnionPatMultipleFields {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_typeck_union_pat_dotdot)]
+pub struct UnionPatDotDot {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_typeck_arg_mismatch_indeterminate)]
+pub struct ArgMismatchIndeterminate {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Subdiagnostic)]
+pub enum SuggestBoxing {
+    #[note(hir_typeck_suggest_boxing_note)]
+    #[multipart_suggestion(
+        hir_typeck_suggest_boxing_when_appropriate,
+        applicability = "machine-applicable"
+    )]
+    Unit {
+        #[suggestion_part(code = "Box::new(())")]
+        start: Span,
+        #[suggestion_part(code = "")]
+        end: Span,
+    },
+    #[note(hir_typeck_suggest_boxing_note)]
+    AsyncBody,
+    #[note(hir_typeck_suggest_boxing_note)]
+    #[multipart_suggestion(
+        hir_typeck_suggest_boxing_when_appropriate,
+        applicability = "machine-applicable"
+    )]
+    Other {
+        #[suggestion_part(code = "Box::new(")]
+        start: Span,
+        #[suggestion_part(code = ")")]
+        end: Span,
+    },
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_typeck_no_associated_item, code = "E0599")]
+pub struct NoAssociatedItem {
+    #[primary_span]
+    pub span: Span,
+    pub item_kind: &'static str,
+    pub item_name: Ident,
+    pub ty_prefix: Cow<'static, str>,
+    pub ty_str: String,
+    pub trait_missing_method: bool,
+}
+
+#[derive(Subdiagnostic)]
+#[note(hir_typeck_candidate_trait_note)]
+pub struct CandidateTraitNote {
+    #[primary_span]
+    pub span: Span,
+    pub trait_name: String,
+    pub item_name: Ident,
+    pub action_or_ty: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(hir_typeck_ctor_is_private, code = "E0603")]
+pub struct CtorIsPrivate {
+    #[primary_span]
+    pub span: Span,
+    pub def: String,
+}
+
+#[derive(Subdiagnostic)]
+#[multipart_suggestion(
+    hir_typeck_convert_using_method,
+    applicability = "machine-applicable",
+    style = "verbose"
+)]
+pub struct SuggestConvertViaMethod<'tcx> {
+    #[suggestion_part(code = "{sugg}")]
+    pub span: Span,
+    #[suggestion_part(code = "")]
+    pub borrow_removal_span: Option<Span>,
+    pub sugg: &'static str,
+    pub expected: Ty<'tcx>,
+    pub found: Ty<'tcx>,
 }

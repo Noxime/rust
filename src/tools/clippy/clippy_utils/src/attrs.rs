@@ -133,7 +133,7 @@ pub fn get_unique_attr<'a>(
     let mut unique_attr: Option<&ast::Attribute> = None;
     for attr in get_attr(sess, attrs, name) {
         if let Some(duplicate) = unique_attr {
-            sess.struct_span_err(attr.span, &format!("`{name}` is defined multiple times"))
+            sess.struct_span_err(attr.span, format!("`{name}` is defined multiple times"))
                 .span_note(duplicate.span, "first definition found here")
                 .emit();
         } else {
@@ -145,8 +145,8 @@ pub fn get_unique_attr<'a>(
 
 /// Return true if the attributes contain any of `proc_macro`,
 /// `proc_macro_derive` or `proc_macro_attribute`, false otherwise
-pub fn is_proc_macro(sess: &Session, attrs: &[ast::Attribute]) -> bool {
-    attrs.iter().any(|attr| sess.is_proc_macro_attr(attr))
+pub fn is_proc_macro(attrs: &[ast::Attribute]) -> bool {
+    attrs.iter().any(rustc_ast::Attribute::is_proc_macro_attr)
 }
 
 /// Return true if the attributes contain `#[doc(hidden)]`

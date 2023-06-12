@@ -9,7 +9,7 @@ use rustc_middle::mir;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, subst::SubstsRef, AdtDef, Ty};
 use rustc_trait_selection::traits::{
-    self, ImplSource, Obligation, ObligationCause, SelectionContext,
+    self, ImplSource, Obligation, ObligationCause, ObligationCtxt, SelectionContext,
 };
 
 use super::ConstCx;
@@ -157,7 +157,7 @@ impl Qualif for NeedsNonConstDrop {
             cx.tcx,
             ObligationCause::dummy_with_span(cx.body.span),
             cx.param_env,
-            ty::Binder::dummy(cx.tcx.at(cx.body.span).mk_trait_ref(LangItem::Destruct, [ty]))
+            ty::TraitRef::from_lang_item(cx.tcx, LangItem::Destruct, cx.body.span, [ty])
                 .with_constness(ty::BoundConstness::ConstIfConst),
         );
 
@@ -184,7 +184,10 @@ impl Qualif for NeedsNonConstDrop {
         }
 
         // If we had any errors, then it's bad
-        !traits::fully_solve_obligations(&infcx, impl_src.nested_obligations()).is_empty()
+        let ocx = ObligationCtxt::new(&infcx);
+        ocx.register_obligations(impl_src.nested_obligations());
+        let errors = ocx.select_all_or_error();
+        !errors.is_empty()
     }
 
     fn in_adt_inherently<'tcx>(
@@ -217,10 +220,10 @@ impl Qualif for CustomEq {
 
     fn in_adt_inherently<'tcx>(
         cx: &ConstCx<'_, 'tcx>,
-        adt: AdtDef<'tcx>,
+        def: AdtDef<'tcx>,
         substs: SubstsRef<'tcx>,
     ) -> bool {
-        let ty = cx.tcx.mk_ty(ty::Adt(adt, substs));
+        let ty = cx.tcx.mk_adt(def, substs);
         !ty.is_structural_eq_shallow(cx.tcx)
     }
 }
@@ -361,9 +364,8 @@ where
         assert!(promoted.is_none() || Q::ALLOW_PROMOTED);
 
         // Don't peek inside trait associated constants.
-        if promoted.is_none() && cx.tcx.trait_of_item(def.did).is_none() {
-            assert_eq!(def.const_param_did, None, "expected associated const: {def:?}");
-            let qualifs = cx.tcx.at(constant.span).mir_const_qualif(def.did);
+        if promoted.is_none() && cx.tcx.trait_of_item(def).is_none() {
+            let qualifs = cx.tcx.at(constant.span).mir_const_qualif(def);
 
             if !Q::in_qualifs(&qualifs) {
                 return false;

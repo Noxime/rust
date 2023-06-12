@@ -8,13 +8,13 @@ use rustc_hir_analysis::astconv::generics::{
     check_generic_arg_count_for_call, create_substs_for_generic_args,
 };
 use rustc_hir_analysis::astconv::{AstConv, CreateSubstsForGenericArgsCtxt, IsMethodCall};
-use rustc_infer::infer::{self, InferOk};
+use rustc_infer::infer::{self, DefineOpaqueTypes, InferOk};
 use rustc_middle::traits::{ObligationCauseCode, UnifyReceiverContext};
 use rustc_middle::ty::adjustment::{Adjust, Adjustment, PointerCast};
 use rustc_middle::ty::adjustment::{AllowTwoPhase, AutoBorrow, AutoBorrowMutability};
 use rustc_middle::ty::fold::TypeFoldable;
 use rustc_middle::ty::subst::{self, SubstsRef};
-use rustc_middle::ty::{self, GenericParamDefKind, Ty};
+use rustc_middle::ty::{self, GenericParamDefKind, Ty, TyCtxt};
 use rustc_middle::ty::{InternalSubsts, UserSubsts, UserType};
 use rustc_span::{Span, DUMMY_SP};
 use rustc_trait_selection::traits;
@@ -158,7 +158,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
         let Some((ty, n)) = autoderef.nth(pick.autoderefs) else {
             return self.tcx.ty_error_with_message(
                 rustc_span::DUMMY_SP,
-                &format!("failed autoderef {}", pick.autoderefs),
+                format!("failed autoderef {}", pick.autoderefs),
             );
         };
         assert_eq!(n, pick.autoderefs);
@@ -262,7 +262,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
                     let original_poly_trait_ref = principal.with_self_ty(this.tcx, object_ty);
                     let upcast_poly_trait_ref = this.upcast(original_poly_trait_ref, trait_def_id);
                     let upcast_trait_ref =
-                        this.replace_bound_vars_with_fresh_vars(upcast_poly_trait_ref);
+                        this.instantiate_binder_with_fresh_vars(upcast_poly_trait_ref);
                     debug!(
                         "original_poly_trait_ref={:?} upcast_trait_ref={:?} target_trait={:?}",
                         original_poly_trait_ref, upcast_trait_ref, trait_def_id
@@ -285,7 +285,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
             probe::WhereClausePick(poly_trait_ref) => {
                 // Where clauses can have bound regions in them. We need to instantiate
                 // those to convert from a poly-trait-ref to a trait-ref.
-                self.replace_bound_vars_with_fresh_vars(poly_trait_ref).substs
+                self.instantiate_binder_with_fresh_vars(poly_trait_ref).substs
             }
         }
     }
@@ -384,7 +384,15 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
                     }
                     (GenericParamDefKind::Const { .. }, GenericArg::Infer(inf)) => {
                         let tcx = self.cfcx.tcx();
-                        self.cfcx.ct_infer(tcx.type_of(param.def_id), Some(param), inf.span).into()
+                        self.cfcx
+                            .ct_infer(
+                                tcx.type_of(param.def_id)
+                                    .no_bound_vars()
+                                    .expect("const parameter types cannot be generic"),
+                                Some(param),
+                                inf.span,
+                            )
+                            .into()
                     }
                     _ => unreachable!(),
                 }
@@ -463,24 +471,33 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
             self_ty, method_self_ty, self.span, pick
         );
         let cause = self.cause(
-            self.span,
+            self.self_expr.span,
             ObligationCauseCode::UnifyReceiver(Box::new(UnifyReceiverContext {
                 assoc_item: pick.item,
                 param_env: self.param_env,
                 substs,
             })),
         );
-        match self.at(&cause, self.param_env).sup(method_self_ty, self_ty) {
+        match self.at(&cause, self.param_env).sup(DefineOpaqueTypes::No, method_self_ty, self_ty) {
             Ok(InferOk { obligations, value: () }) => {
                 self.register_predicates(obligations);
             }
-            Err(_) => {
-                span_bug!(
-                    self.span,
-                    "{} was a subtype of {} but now is not?",
-                    self_ty,
-                    method_self_ty
-                );
+            Err(terr) => {
+                // FIXME(arbitrary_self_types): We probably should limit the
+                // situations where this can occur by adding additional restrictions
+                // to the feature, like the self type can't reference method substs.
+                if self.tcx.features().arbitrary_self_types {
+                    self.err_ctxt()
+                        .report_mismatched_types(&cause, method_self_ty, self_ty, terr)
+                        .emit();
+                } else {
+                    span_bug!(
+                        self.span,
+                        "{} was a subtype of {} but now is not?",
+                        self_ty,
+                        method_self_ty
+                    );
+                }
             }
         }
     }
@@ -506,7 +523,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
         let sig = self.tcx.fn_sig(def_id).subst(self.tcx, all_substs);
         debug!("type scheme substituted, sig={:?}", sig);
 
-        let sig = self.replace_bound_vars_with_fresh_vars(sig);
+        let sig = self.instantiate_binder_with_fresh_vars(sig);
         debug!("late-bound lifetimes from method instantiated, sig={:?}", sig);
 
         (sig, method_predicates)
@@ -566,19 +583,15 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
     ) -> Option<Span> {
         let sized_def_id = self.tcx.lang_items().sized_trait()?;
 
-        traits::elaborate_predicates(self.tcx, predicates.predicates.iter().copied())
+        traits::elaborate(self.tcx, predicates.predicates.iter().copied())
             // We don't care about regions here.
-            .filter_map(|obligation| match obligation.predicate.kind().skip_binder() {
+            .filter_map(|pred| match pred.kind().skip_binder() {
                 ty::PredicateKind::Clause(ty::Clause::Trait(trait_pred))
                     if trait_pred.def_id() == sized_def_id =>
                 {
                     let span = predicates
                         .iter()
-                        .find_map(
-                            |(p, span)| {
-                                if p == obligation.predicate { Some(span) } else { None }
-                            },
-                        )
+                        .find_map(|(p, span)| if p == pred { Some(span) } else { None })
                         .unwrap_or(rustc_span::DUMMY_SP);
                     Some((trait_pred, span))
                 }
@@ -625,10 +638,10 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
         upcast_trait_refs.into_iter().next().unwrap()
     }
 
-    fn replace_bound_vars_with_fresh_vars<T>(&self, value: ty::Binder<'tcx, T>) -> T
+    fn instantiate_binder_with_fresh_vars<T>(&self, value: ty::Binder<'tcx, T>) -> T
     where
-        T: TypeFoldable<'tcx> + Copy,
+        T: TypeFoldable<TyCtxt<'tcx>> + Copy,
     {
-        self.fcx.replace_bound_vars_with_fresh_vars(self.span, infer::FnCall, value)
+        self.fcx.instantiate_binder_with_fresh_vars(self.span, infer::FnCall, value)
     }
 }

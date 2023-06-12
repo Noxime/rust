@@ -54,64 +54,6 @@ pub fn newtype_index(input: TokenStream) -> TokenStream {
     newtype::newtype(input)
 }
 
-/// Implements the `fluent_messages` macro, which performs compile-time validation of the
-/// compiler's Fluent resources (i.e. that the resources parse and don't multiply define the same
-/// messages) and generates constants that make using those messages in diagnostics more ergonomic.
-///
-/// For example, given the following invocation of the macro..
-///
-/// ```ignore (rust)
-/// fluent_messages! {
-///     typeck => "./typeck.ftl",
-/// }
-/// ```
-/// ..where `typeck.ftl` has the following contents..
-///
-/// ```fluent
-/// typeck_field_multiply_specified_in_initializer =
-///     field `{$ident}` specified more than once
-///     .label = used more than once
-///     .label_previous_use = first use of `{$ident}`
-/// ```
-/// ...then the macro parse the Fluent resource, emitting a diagnostic if it fails to do so, and
-/// will generate the following code:
-///
-/// ```ignore (rust)
-/// pub static DEFAULT_LOCALE_RESOURCES: &'static [&'static str] = &[
-///     include_str!("./typeck.ftl"),
-/// ];
-///
-/// mod fluent_generated {
-///     mod typeck {
-///         pub const field_multiply_specified_in_initializer: DiagnosticMessage =
-///             DiagnosticMessage::fluent("typeck_field_multiply_specified_in_initializer");
-///         pub const field_multiply_specified_in_initializer_label_previous_use: DiagnosticMessage =
-///             DiagnosticMessage::fluent_attr(
-///                 "typeck_field_multiply_specified_in_initializer",
-///                 "previous_use_label"
-///             );
-///     }
-/// }
-/// ```
-/// When emitting a diagnostic, the generated constants can be used as follows:
-///
-/// ```ignore (rust)
-/// let mut err = sess.struct_span_err(
-///     span,
-///     fluent::typeck::field_multiply_specified_in_initializer
-/// );
-/// err.span_default_label(span);
-/// err.span_label(
-///     previous_use_span,
-///     fluent::typeck::field_multiply_specified_in_initializer_label_previous_use
-/// );
-/// err.emit();
-/// ```
-#[proc_macro]
-pub fn fluent_messages(input: TokenStream) -> TokenStream {
-    diagnostics::fluent_messages(input)
-}
-
 decl_derive!([HashStable, attributes(stable_hasher)] => hash_stable::hash_stable_derive);
 decl_derive!(
     [HashStable_Generic, attributes(stable_hasher)] =>
@@ -124,8 +66,27 @@ decl_derive!([TyDecodable] => serialize::type_decodable_derive);
 decl_derive!([TyEncodable] => serialize::type_encodable_derive);
 decl_derive!([MetadataDecodable] => serialize::meta_decodable_derive);
 decl_derive!([MetadataEncodable] => serialize::meta_encodable_derive);
-decl_derive!([TypeFoldable, attributes(type_foldable)] => type_foldable::type_foldable_derive);
-decl_derive!([TypeVisitable, attributes(type_visitable)] => type_visitable::type_visitable_derive);
+decl_derive!(
+    [TypeFoldable, attributes(type_foldable)] =>
+    /// Derives `TypeFoldable` for the annotated `struct` or `enum` (`union` is not supported).
+    ///
+    /// The fold will produce a value of the same struct or enum variant as the input, with
+    /// each field respectively folded using the `TypeFoldable` implementation for its type.
+    /// However, if a field of a struct or an enum variant is annotated with
+    /// `#[type_foldable(identity)]` then that field will retain its incumbent value (and its
+    /// type is not required to implement `TypeFoldable`).
+    type_foldable::type_foldable_derive
+);
+decl_derive!(
+    [TypeVisitable, attributes(type_visitable)] =>
+    /// Derives `TypeVisitable` for the annotated `struct` or `enum` (`union` is not supported).
+    ///
+    /// Each field of the struct or enum variant will be visited in definition order, using the
+    /// `TypeVisitable` implementation for its type. However, if a field of a struct or an enum
+    /// variant is annotated with `#[type_visitable(ignore)]` then that field will not be
+    /// visited (and its type is not required to implement `TypeVisitable`).
+    type_visitable::type_visitable_derive
+);
 decl_derive!([Lift, attributes(lift)] => lift::lift_derive);
 decl_derive!(
     [Diagnostic, attributes(

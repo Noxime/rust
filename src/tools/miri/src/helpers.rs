@@ -1,5 +1,6 @@
 pub mod convert;
 
+use std::any::Any;
 use std::cmp;
 use std::iter;
 use std::num::NonZeroUsize;
@@ -23,7 +24,23 @@ use rand::RngCore;
 
 use crate::*;
 
-impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
+/// A trait to work around not having trait object upcasting:
+/// Add `AsAny` as supertrait and your trait objects can be turned into `&dyn Any` on which you can
+/// then call `downcast`.
+pub trait AsAny: Any {
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+impl<T: Any> AsAny for T {
+    #[inline(always)]
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    #[inline(always)]
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
+}
 
 // This mapping should match `decode_error_kind` in
 // <https://github.com/rust-lang/rust/blob/master/library/std/src/sys/unix/mod.rs>.
@@ -119,6 +136,7 @@ fn try_resolve_did(tcx: TyCtxt<'_>, path: &[&str], namespace: Option<Namespace>)
     }
 }
 
+impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
 pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     /// Checks if the given crate/module exists.
     fn have_module(&self, path: &[&str]) -> bool {
@@ -144,11 +162,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         let instance = this.resolve_path(path, Namespace::ValueNS);
         let cid = GlobalId { instance, promoted: None };
         // We don't give a span -- this isn't actually used directly by the program anyway.
-        let const_val = this
-            .eval_global(cid, None)
-            .unwrap_or_else(|err| panic!("failed to evaluate required Rust item: {path:?}\n{err}"));
+        let const_val = this.eval_global(cid, None).unwrap_or_else(|err| {
+            panic!("failed to evaluate required Rust item: {path:?}\n{err:?}")
+        });
         this.read_scalar(&const_val.into())
-            .unwrap_or_else(|err| panic!("failed to read required Rust item: {path:?}\n{err}"))
+            .unwrap_or_else(|err| panic!("failed to read required Rust item: {path:?}\n{err:?}"))
     }
 
     /// Helper function to get a `libc` constant as a `Scalar`.
@@ -478,6 +496,10 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 } else if matches!(v.layout.fields, FieldsShape::Union(..)) {
                     // A (non-frozen) union. We fall back to whatever the type says.
                     (self.unsafe_cell_action)(v)
+                } else if matches!(v.layout.ty.kind(), ty::Dynamic(_, _, ty::DynStar)) {
+                    // This needs to read the vtable pointer to proceed type-driven, but we don't
+                    // want to reentrantly read from memory here.
+                    (self.unsafe_cell_action)(v)
                 } else {
                     // We want to not actually read from memory for this visit. So, before
                     // walking this value, we have to make sure it is not a
@@ -502,7 +524,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 }
             }
 
-            // Make sure we visit aggregrates in increasing offset order.
+            // Make sure we visit aggregates in increasing offset order.
             fn visit_aggregate(
                 &mut self,
                 place: &MPlaceTy<'tcx, Provenance>,
@@ -758,10 +780,10 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         let this = self.eval_context_mut();
         let seconds_place = this.mplace_field(tp, 0)?;
         let seconds_scalar = this.read_scalar(&seconds_place.into())?;
-        let seconds = seconds_scalar.to_machine_isize(this)?;
+        let seconds = seconds_scalar.to_target_isize(this)?;
         let nanoseconds_place = this.mplace_field(tp, 1)?;
         let nanoseconds_scalar = this.read_scalar(&nanoseconds_place.into())?;
-        let nanoseconds = nanoseconds_scalar.to_machine_isize(this)?;
+        let nanoseconds = nanoseconds_scalar.to_target_isize(this)?;
 
         Ok(try {
             // tv_sec must be non-negative.
@@ -929,7 +951,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         if this.machine.panic_on_unsupported {
             // message is slightly different here to make automated analysis easier
             let error_msg = format!("unsupported Miri functionality: {}", error_msg.as_ref());
-            this.start_panic(error_msg.as_ref(), StackPopUnwind::Skip)?;
+            this.start_panic(error_msg.as_ref(), mir::UnwindAction::Continue)?;
             Ok(())
         } else {
             throw_unsup_format!("{}", error_msg.as_ref());

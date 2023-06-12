@@ -4,7 +4,7 @@ use std::io::Lines;
 
 pub trait MyTrait { fn dummy(&self) { } }
 
-// @has foo/struct.Alpha.html '//pre' "pub struct Alpha<A>(_)where A: MyTrait"
+// @has foo/struct.Alpha.html '//pre' "pub struct Alpha<A>(_) where A: MyTrait"
 pub struct Alpha<A>(A) where A: MyTrait;
 // @has foo/trait.Bravo.html '//pre' "pub trait Bravo<B>where B: MyTrait"
 pub trait Bravo<B> where B: MyTrait { fn get(&self, B: B); }
@@ -40,6 +40,12 @@ pub trait TraitWhere {
     fn lines(self) -> Lines<Self>
     where
         Self: Sized,
+    { todo!() }
+
+    fn merge<T>(self, a: T)
+    where
+        Self: Sized,
+        T: Sized,
     { todo!() }
 }
 

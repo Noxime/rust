@@ -5,11 +5,13 @@
 //! This module does line ending conversion and detection (so that we can
 //! convert back to `\r\n` on the way out).
 
-use std::sync::Arc;
+use ide_db::line_index::WideEncoding;
+use triomphe::Arc;
 
+#[derive(Clone, Copy)]
 pub enum PositionEncoding {
     Utf8,
-    Utf16,
+    Wide(WideEncoding),
 }
 
 pub(crate) struct LineIndex {

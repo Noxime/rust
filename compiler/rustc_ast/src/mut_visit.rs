@@ -7,20 +7,20 @@
 //! a `MutVisitor` renaming item names in a module will miss all of those
 //! that are created by the expansion of a macro.
 
-use crate::ast::*;
 use crate::ptr::P;
 use crate::token::{self, Token};
 use crate::tokenstream::*;
+use crate::{ast::*, StaticItem};
 
-use rustc_data_structures::map_in_place::MapInPlace;
+use rustc_data_structures::flat_map_in_place::FlatMapInPlace;
 use rustc_data_structures::sync::Lrc;
 use rustc_span::source_map::Spanned;
 use rustc_span::symbol::Ident;
 use rustc_span::Span;
-
 use smallvec::{smallvec, Array, SmallVec};
 use std::ops::DerefMut;
 use std::{panic, ptr};
+use thin_vec::ThinVec;
 
 pub trait ExpectOne<A: Array> {
     fn expect_one(self, err: &'static str) -> A::Item;
@@ -337,6 +337,17 @@ where
 
 // No `noop_` prefix because there isn't a corresponding method in `MutVisitor`.
 #[inline]
+pub fn visit_thin_vec<T, F>(elems: &mut ThinVec<T>, mut visit_elem: F)
+where
+    F: FnMut(&mut T),
+{
+    for elem in elems {
+        visit_elem(elem);
+    }
+}
+
+// No `noop_` prefix because there isn't a corresponding method in `MutVisitor`.
+#[inline]
 pub fn visit_opt<T, F>(opt: &mut Option<T>, mut visit_elem: F)
 where
     F: FnMut(&mut T),
@@ -355,6 +366,11 @@ pub fn visit_attrs<T: MutVisitor>(attrs: &mut AttrVec, vis: &mut T) {
 
 // No `noop_` prefix because there isn't a corresponding method in `MutVisitor`.
 pub fn visit_exprs<T: MutVisitor>(exprs: &mut Vec<P<Expr>>, vis: &mut T) {
+    exprs.flat_map_in_place(|expr| vis.filter_map_expr(expr))
+}
+
+// No `noop_` prefix because there isn't a corresponding method in `MutVisitor`.
+pub fn visit_thin_exprs<T: MutVisitor>(exprs: &mut ThinVec<P<Expr>>, vis: &mut T) {
     exprs.flat_map_in_place(|expr| vis.filter_map_expr(expr))
 }
 
@@ -474,7 +490,7 @@ pub fn noop_visit_ty<T: MutVisitor>(ty: &mut P<Ty>, vis: &mut T) {
             vis.visit_fn_decl(decl);
             vis.visit_span(decl_span);
         }
-        TyKind::Tup(tys) => visit_vec(tys, |ty| vis.visit_ty(ty)),
+        TyKind::Tup(tys) => visit_thin_vec(tys, |ty| vis.visit_ty(ty)),
         TyKind::Paren(ty) => vis.visit_ty(ty),
         TyKind::Path(qself, path) => {
             vis.visit_qself(qself);
@@ -561,7 +577,7 @@ pub fn noop_visit_angle_bracketed_parameter_data<T: MutVisitor>(
     vis: &mut T,
 ) {
     let AngleBracketedArgs { args, span } = data;
-    visit_vec(args, |arg| match arg {
+    visit_thin_vec(args, |arg| match arg {
         AngleBracketedArg::Arg(arg) => vis.visit_generic_arg(arg),
         AngleBracketedArg::Constraint(constraint) => vis.visit_constraint(constraint),
     });
@@ -573,7 +589,7 @@ pub fn noop_visit_parenthesized_parameter_data<T: MutVisitor>(
     vis: &mut T,
 ) {
     let ParenthesizedArgs { inputs, output, span, .. } = args;
-    visit_vec(inputs, |input| vis.visit_ty(input));
+    visit_thin_vec(inputs, |input| vis.visit_ty(input));
     noop_visit_fn_ret_ty(output, vis);
     vis.visit_span(span);
 }
@@ -615,7 +631,7 @@ pub fn noop_visit_attribute<T: MutVisitor>(attr: &mut Attribute, vis: &mut T) {
 }
 
 pub fn noop_visit_mac<T: MutVisitor>(mac: &mut MacCall, vis: &mut T) {
-    let MacCall { path, args, prior_type_ascription: _ } = mac;
+    let MacCall { path, args } = mac;
     vis.visit_path(path);
     visit_delim_args(args, vis);
 }
@@ -636,7 +652,7 @@ pub fn noop_visit_meta_item<T: MutVisitor>(mi: &mut MetaItem, vis: &mut T) {
     let MetaItem { path: _, kind, span } = mi;
     match kind {
         MetaItemKind::Word => {}
-        MetaItemKind::List(mis) => visit_vec(mis, |mi| vis.visit_meta_list_item(mi)),
+        MetaItemKind::List(mis) => visit_thin_vec(mis, |mi| vis.visit_meta_list_item(mi)),
         MetaItemKind::NameValue(_s) => {}
     }
     vis.visit_span(span);
@@ -839,9 +855,7 @@ pub fn noop_visit_closure_binder<T: MutVisitor>(binder: &mut ClosureBinder, vis:
     match binder {
         ClosureBinder::NotPresent => {}
         ClosureBinder::For { span: _, generic_params } => {
-            let mut vec = std::mem::take(generic_params).into_vec();
-            vec.flat_map_in_place(|param| vis.flat_map_generic_param(param));
-            *generic_params = P::from_vec(vec);
+            generic_params.flat_map_in_place(|param| vis.flat_map_generic_param(param));
         }
     }
 }
@@ -919,7 +933,7 @@ pub fn noop_visit_generics<T: MutVisitor>(generics: &mut Generics, vis: &mut T) 
 
 pub fn noop_visit_where_clause<T: MutVisitor>(wc: &mut WhereClause, vis: &mut T) {
     let WhereClause { has_where_token: _, predicates, span } = wc;
-    visit_vec(predicates, |predicate| vis.visit_where_predicate(predicate));
+    visit_thin_vec(predicates, |predicate| vis.visit_where_predicate(predicate));
     vis.visit_span(span);
 }
 
@@ -1015,14 +1029,12 @@ pub fn noop_visit_item_kind<T: MutVisitor>(kind: &mut ItemKind, vis: &mut T) {
     match kind {
         ItemKind::ExternCrate(_orig_name) => {}
         ItemKind::Use(use_tree) => vis.visit_use_tree(use_tree),
-        ItemKind::Static(ty, _, expr) => {
+        ItemKind::Static(box StaticItem { ty, mutability: _, expr }) => {
             vis.visit_ty(ty);
             visit_opt(expr, |expr| vis.visit_expr(expr));
         }
-        ItemKind::Const(defaultness, ty, expr) => {
-            visit_defaultness(defaultness, vis);
-            vis.visit_ty(ty);
-            visit_opt(expr, |expr| vis.visit_expr(expr));
+        ItemKind::Const(item) => {
+            visit_const_item(item, vis);
         }
         ItemKind::Fn(box Fn { defaultness, generics, sig, body }) => {
             visit_defaultness(defaultness, vis);
@@ -1105,10 +1117,8 @@ pub fn noop_flat_map_assoc_item<T: MutVisitor>(
     visitor.visit_vis(vis);
     visit_attrs(attrs, visitor);
     match kind {
-        AssocItemKind::Const(defaultness, ty, expr) => {
-            visit_defaultness(defaultness, visitor);
-            visitor.visit_ty(ty);
-            visit_opt(expr, |expr| visitor.visit_expr(expr));
+        AssocItemKind::Const(item) => {
+            visit_const_item(item, visitor);
         }
         AssocItemKind::Fn(box Fn { defaultness, generics, sig, body }) => {
             visit_defaultness(defaultness, visitor);
@@ -1136,6 +1146,15 @@ pub fn noop_flat_map_assoc_item<T: MutVisitor>(
     visitor.visit_span(span);
     visit_lazy_tts(tokens, visitor);
     smallvec![item]
+}
+
+fn visit_const_item<T: MutVisitor>(
+    ConstItem { defaultness, ty, expr }: &mut ConstItem,
+    visitor: &mut T,
+) {
+    visit_defaultness(defaultness, visitor);
+    visitor.visit_ty(ty);
+    visit_opt(expr, |expr| visitor.visit_expr(expr));
 }
 
 pub fn noop_visit_fn_header<T: MutVisitor>(header: &mut FnHeader, vis: &mut T) {
@@ -1227,7 +1246,7 @@ pub fn noop_visit_pat<T: MutVisitor>(pat: &mut P<Pat>, vis: &mut T) {
         PatKind::TupleStruct(qself, path, elems) => {
             vis.visit_qself(qself);
             vis.visit_path(path);
-            visit_vec(elems, |elem| vis.visit_pat(elem));
+            visit_thin_vec(elems, |elem| vis.visit_pat(elem));
         }
         PatKind::Path(qself, path) => {
             vis.visit_qself(qself);
@@ -1246,7 +1265,7 @@ pub fn noop_visit_pat<T: MutVisitor>(pat: &mut P<Pat>, vis: &mut T) {
             vis.visit_span(span);
         }
         PatKind::Tuple(elems) | PatKind::Slice(elems) | PatKind::Or(elems) => {
-            visit_vec(elems, |elem| vis.visit_pat(elem))
+            visit_thin_vec(elems, |elem| vis.visit_pat(elem))
         }
         PatKind::Paren(inner) => vis.visit_pat(inner),
         PatKind::MacCall(mac) => vis.visit_mac_call(mac),
@@ -1302,8 +1321,7 @@ pub fn noop_visit_expr<T: MutVisitor>(
     vis: &mut T,
 ) {
     match kind {
-        ExprKind::Box(expr) => vis.visit_expr(expr),
-        ExprKind::Array(exprs) => visit_exprs(exprs, vis),
+        ExprKind::Array(exprs) => visit_thin_exprs(exprs, vis),
         ExprKind::ConstBlock(anon_const) => {
             vis.visit_anon_const(anon_const);
         }
@@ -1311,10 +1329,10 @@ pub fn noop_visit_expr<T: MutVisitor>(
             vis.visit_expr(expr);
             vis.visit_anon_const(count);
         }
-        ExprKind::Tup(exprs) => visit_exprs(exprs, vis),
+        ExprKind::Tup(exprs) => visit_thin_exprs(exprs, vis),
         ExprKind::Call(f, args) => {
             vis.visit_expr(f);
-            visit_exprs(args, vis);
+            visit_thin_exprs(args, vis);
         }
         ExprKind::MethodCall(box MethodCall {
             seg: PathSegment { ident, id, args: seg_args },
@@ -1326,7 +1344,7 @@ pub fn noop_visit_expr<T: MutVisitor>(
             vis.visit_id(id);
             visit_opt(seg_args, |args| vis.visit_generic_args(args));
             vis.visit_method_receiver_expr(receiver);
-            visit_exprs(call_args, vis);
+            visit_thin_exprs(call_args, vis);
             vis.visit_span(span);
         }
         ExprKind::Binary(_binop, lhs, rhs) => {
@@ -1394,11 +1412,13 @@ pub fn noop_visit_expr<T: MutVisitor>(
             vis.visit_block(blk);
             visit_opt(label, |label| vis.visit_label(label));
         }
-        ExprKind::Async(_capture_by, node_id, body) => {
-            vis.visit_id(node_id);
+        ExprKind::Async(_capture_by, body) => {
             vis.visit_block(body);
         }
-        ExprKind::Await(expr) => vis.visit_expr(expr),
+        ExprKind::Await(expr, await_kw_span) => {
+            vis.visit_expr(expr);
+            vis.visit_span(await_kw_span);
+        }
         ExprKind::Assign(el, er, _) => {
             vis.visit_expr(el);
             vis.visit_expr(er);
@@ -1439,6 +1459,12 @@ pub fn noop_visit_expr<T: MutVisitor>(
         }
         ExprKind::InlineAsm(asm) => vis.visit_inline_asm(asm),
         ExprKind::FormatArgs(fmt) => vis.visit_format_args(fmt),
+        ExprKind::OffsetOf(container, fields) => {
+            vis.visit_ty(container);
+            for field in fields.iter_mut() {
+                vis.visit_ident(field);
+            }
+        }
         ExprKind::MacCall(mac) => vis.visit_mac_call(mac),
         ExprKind::Struct(se) => {
             let StructExpr { qself, path, fields, rest } = se.deref_mut();

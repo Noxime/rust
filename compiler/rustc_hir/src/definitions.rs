@@ -9,8 +9,8 @@ use crate::def_id::{CrateNum, DefIndex, LocalDefId, StableCrateId, CRATE_DEF_IND
 use crate::def_path_hash_map::DefPathHashMap;
 
 use rustc_data_structures::fx::FxHashMap;
-use rustc_data_structures::stable_hasher::StableHasher;
-use rustc_index::vec::IndexVec;
+use rustc_data_structures::stable_hasher::{Hash64, StableHasher};
+use rustc_index::IndexVec;
 use rustc_span::symbol::{kw, sym, Symbol};
 
 use std::fmt::{self, Write};
@@ -92,7 +92,7 @@ impl DefPathTable {
 /// The definition table containing node definitions.
 /// It holds the `DefPathTable` for `LocalDefId`s/`DefPath`s.
 /// It also stores mappings to convert `LocalDefId`s to/from `HirId`s.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Definitions {
     table: DefPathTable,
     next_disambiguator: FxHashMap<(LocalDefId, DefPathData), u32>,
@@ -130,7 +130,7 @@ impl DefKey {
 
         disambiguator.hash(&mut hasher);
 
-        let local_hash: u64 = hasher.finish();
+        let local_hash = hasher.finish();
 
         // Construct the new DefPathHash, making sure that the `crate_id`
         // portion of the hash is properly copied from the parent. This way the
@@ -280,6 +280,8 @@ pub enum DefPathData {
     AnonConst,
     /// An `impl Trait` type node.
     ImplTrait,
+    /// `impl Trait` generated associated type node.
+    ImplTraitAssocTy,
 }
 
 impl Definitions {
@@ -323,7 +325,7 @@ impl Definitions {
             },
         };
 
-        let parent_hash = DefPathHash::new(stable_crate_id, 0);
+        let parent_hash = DefPathHash::new(stable_crate_id, Hash64::ZERO);
         let def_path_hash = key.compute_stable_hash(parent_hash);
 
         // Create the root definition.
@@ -403,7 +405,7 @@ impl DefPathData {
             TypeNs(name) | ValueNs(name) | MacroNs(name) | LifetimeNs(name) => Some(name),
 
             Impl | ForeignMod | CrateRoot | Use | GlobalAsm | ClosureExpr | Ctor | AnonConst
-            | ImplTrait => None,
+            | ImplTrait | ImplTraitAssocTy => None,
         }
     }
 
@@ -422,7 +424,7 @@ impl DefPathData {
             ClosureExpr => DefPathDataName::Anon { namespace: sym::closure },
             Ctor => DefPathDataName::Anon { namespace: sym::constructor },
             AnonConst => DefPathDataName::Anon { namespace: sym::constant },
-            ImplTrait => DefPathDataName::Anon { namespace: sym::opaque },
+            ImplTrait | ImplTraitAssocTy => DefPathDataName::Anon { namespace: sym::opaque },
         }
     }
 }

@@ -1,5 +1,7 @@
 use rustc_middle::mir::interpret::InterpResult;
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitor};
+use rustc_middle::ty::{
+    self, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
+};
 use std::ops::ControlFlow;
 
 /// Checks whether a type contains generic parameters which require substitution.
@@ -9,10 +11,10 @@ use std::ops::ControlFlow;
 /// case these parameters are unused.
 pub(crate) fn ensure_monomorphic_enough<'tcx, T>(tcx: TyCtxt<'tcx>, ty: T) -> InterpResult<'tcx>
 where
-    T: TypeVisitable<'tcx>,
+    T: TypeVisitable<TyCtxt<'tcx>>,
 {
     debug!("ensure_monomorphic_enough: ty={:?}", ty);
-    if !ty.needs_subst() {
+    if !ty.has_param() {
         return Ok(());
     }
 
@@ -21,11 +23,11 @@ where
         tcx: TyCtxt<'tcx>,
     }
 
-    impl<'tcx> TypeVisitor<'tcx> for UsedParamsNeedSubstVisitor<'tcx> {
+    impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for UsedParamsNeedSubstVisitor<'tcx> {
         type BreakTy = FoundParam;
 
         fn visit_ty(&mut self, ty: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
-            if !ty.needs_subst() {
+            if !ty.has_param() {
                 return ControlFlow::Continue(());
             }
 
@@ -34,7 +36,7 @@ where
                 ty::Closure(def_id, substs)
                 | ty::Generator(def_id, substs, ..)
                 | ty::FnDef(def_id, substs) => {
-                    let instance = ty::InstanceDef::Item(ty::WithOptConstParam::unknown(def_id));
+                    let instance = ty::InstanceDef::Item(def_id);
                     let unused_params = self.tcx.unused_generic_params(instance);
                     for (index, subst) in substs.into_iter().enumerate() {
                         let index = index
@@ -44,7 +46,7 @@ where
                         // are used and require substitution.
                         // Just in case there are closures or generators within this subst,
                         // recurse.
-                        if unused_params.is_used(index) && subst.needs_subst() {
+                        if unused_params.is_used(index) && subst.has_param() {
                             return subst.visit_with(self);
                         }
                     }

@@ -72,7 +72,7 @@ fn has_cfg_or_cfg_attr(attrs: &[Attribute]) -> bool {
     // Therefore, the absence of a literal `cfg` or `cfg_attr` guarantees that
     // we don't need to do any eager expansion.
     attrs.iter().any(|attr| {
-        attr.ident().map_or(false, |ident| ident.name == sym::cfg || ident.name == sym::cfg_attr)
+        attr.ident().is_some_and(|ident| ident.name == sym::cfg || ident.name == sym::cfg_attr)
     })
 }
 
@@ -134,11 +134,11 @@ impl ToAttrTokenStream for LazyAttrTokenStreamImpl {
             // Process the replace ranges, starting from the highest start
             // position and working our way back. If have tokens like:
             //
-            // `#[cfg(FALSE)]` struct Foo { #[cfg(FALSE)] field: bool }`
+            // `#[cfg(FALSE)] struct Foo { #[cfg(FALSE)] field: bool }`
             //
             // Then we will generate replace ranges for both
             // the `#[cfg(FALSE)] field: bool` and the entire
-            // `#[cfg(FALSE)]` struct Foo { #[cfg(FALSE)] field: bool }`
+            // `#[cfg(FALSE)] struct Foo { #[cfg(FALSE)] field: bool }`
             //
             // By starting processing from the replace range with the greatest
             // start position, we ensure that any replace range which encloses

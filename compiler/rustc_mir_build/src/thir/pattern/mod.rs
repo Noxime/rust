@@ -16,34 +16,26 @@ use rustc_hir as hir;
 use rustc_hir::def::{CtorOf, DefKind, Res};
 use rustc_hir::pat_util::EnumerateAndAdjustIterator;
 use rustc_hir::RangeEnd;
-use rustc_index::vec::Idx;
+use rustc_index::Idx;
 use rustc_middle::mir::interpret::{
-    ConstValue, ErrorHandled, LitToConstError, LitToConstInput, Scalar,
+    ConstValue, ErrorHandled, GlobalId, LitToConstError, LitToConstInput, Scalar,
 };
-use rustc_middle::mir::{self, UserTypeProjection};
-use rustc_middle::mir::{BorrowKind, Field, Mutability};
+use rustc_middle::mir::{self, ConstantKind, UserTypeProjection};
+use rustc_middle::mir::{BorrowKind, Mutability};
 use rustc_middle::thir::{Ascription, BindingMode, FieldPat, LocalVarId, Pat, PatKind, PatRange};
 use rustc_middle::ty::subst::{GenericArg, SubstsRef};
 use rustc_middle::ty::CanonicalUserTypeAnnotation;
-use rustc_middle::ty::{self, AdtDef, ConstKind, DefIdTree, Region, Ty, TyCtxt, UserType};
+use rustc_middle::ty::TypeVisitableExt;
+use rustc_middle::ty::{self, AdtDef, Region, Ty, TyCtxt, UserType};
 use rustc_span::{Span, Symbol};
+use rustc_target::abi::FieldIdx;
 
 use std::cmp::Ordering;
-
-#[derive(Clone, Debug)]
-enum PatternError {
-    AssocConstInPattern(Span),
-    ConstParamInPattern(Span),
-    StaticInPattern(Span),
-    NonConstPath(Span),
-}
 
 struct PatCtxt<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     typeck_results: &'a ty::TypeckResults<'tcx>,
-    errors: Vec<PatternError>,
-    include_lint_checks: bool,
 }
 
 pub(super) fn pat_from_hir<'a, 'tcx>(
@@ -52,30 +44,13 @@ pub(super) fn pat_from_hir<'a, 'tcx>(
     typeck_results: &'a ty::TypeckResults<'tcx>,
     pat: &'tcx hir::Pat<'tcx>,
 ) -> Box<Pat<'tcx>> {
-    let mut pcx = PatCtxt::new(tcx, param_env, typeck_results);
+    let mut pcx = PatCtxt { tcx, param_env, typeck_results };
     let result = pcx.lower_pattern(pat);
-    if !pcx.errors.is_empty() {
-        let msg = format!("encountered errors lowering pattern: {:?}", pcx.errors);
-        tcx.sess.delay_span_bug(pat.span, &msg);
-    }
     debug!("pat_from_hir({:?}) = {:?}", pat, result);
     result
 }
 
 impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
-    fn new(
-        tcx: TyCtxt<'tcx>,
-        param_env: ty::ParamEnv<'tcx>,
-        typeck_results: &'a ty::TypeckResults<'tcx>,
-    ) -> Self {
-        PatCtxt { tcx, param_env, typeck_results, errors: vec![], include_lint_checks: false }
-    }
-
-    fn include_lint_checks(&mut self) -> &mut Self {
-        self.include_lint_checks = true;
-        self
-    }
-
     fn lower_pattern(&mut self, pat: &'tcx hir::Pat<'tcx>) -> Box<Pat<'tcx>> {
         // When implicit dereferences have been inserted in this pattern, the unadjusted lowered
         // pattern has the type that results *after* dereferencing. For example, in this code:
@@ -203,11 +178,7 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
                 if !lower_overflow && !higher_overflow {
                     self.tcx.sess.emit_err(LowerRangeBoundMustBeLessThanOrEqualToUpper {
                         span,
-                        teach: if self.tcx.sess.teach(&error_code!(E0030)) {
-                            Some(())
-                        } else {
-                            None
-                        },
+                        teach: self.tcx.sess.teach(&error_code!(E0030)).then_some(()),
                     });
                 }
                 PatKind::Wild
@@ -259,7 +230,7 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
                         self.lower_pattern_range(ty, lc, hc, end, lo_span, lo_expr, hi_expr)
                     }
                     None => {
-                        let msg = &format!(
+                        let msg = format!(
                             "found bad range pattern `{:?}` outside of error recovery",
                             (&lo, &hi),
                         );
@@ -360,7 +331,7 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
                 let subpatterns = fields
                     .iter()
                     .map(|field| FieldPat {
-                        field: Field::new(self.typeck_results.field_index(field.hir_id)),
+                        field: self.typeck_results.field_index(field.hir_id),
                         pattern: self.lower_pattern(&field.pat),
                     })
                     .collect();
@@ -383,7 +354,7 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
         pats.iter()
             .enumerate_and_adjust(expected_len, gap_pos)
             .map(|(i, subpattern)| FieldPat {
-                field: Field::new(i),
+                field: FieldIdx::new(i),
                 pattern: self.lower_pattern(subpattern),
             })
             .collect()
@@ -416,7 +387,7 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
             ty::Slice(..) => PatKind::Slice { prefix, slice, suffix },
             // Fixed-length array, `[T; len]`.
             ty::Array(_, len) => {
-                let len = len.eval_usize(self.tcx, self.param_env);
+                let len = len.eval_target_usize(self.tcx, self.param_env);
                 assert!(len >= prefix.len() as u64 + suffix.len() as u64);
                 PatKind::Array { prefix, slice, suffix }
             }
@@ -476,12 +447,15 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
             | Res::SelfTyAlias { .. }
             | Res::SelfCtor(..) => PatKind::Leaf { subpatterns },
             _ => {
-                let pattern_error = match res {
-                    Res::Def(DefKind::ConstParam, _) => PatternError::ConstParamInPattern(span),
-                    Res::Def(DefKind::Static(_), _) => PatternError::StaticInPattern(span),
-                    _ => PatternError::NonConstPath(span),
+                match res {
+                    Res::Def(DefKind::ConstParam, _) => {
+                        self.tcx.sess.emit_err(ConstParamInPattern { span })
+                    }
+                    Res::Def(DefKind::Static(_), _) => {
+                        self.tcx.sess.emit_err(StaticInPattern { span })
+                    }
+                    _ => self.tcx.sess.emit_err(NonConstPath { span }),
                 };
-                self.errors.push(pattern_error);
                 PatKind::Wild
             }
         };
@@ -534,7 +508,7 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
                 // It should be assoc consts if there's no error but we cannot resolve it.
                 debug_assert!(is_associated_const);
 
-                self.errors.push(PatternError::AssocConstInPattern(span));
+                self.tcx.sess.emit_err(AssocConstInPattern { span });
 
                 return pat_from_kind(PatKind::Wild);
             }
@@ -545,16 +519,24 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
             }
         };
 
-        // `mir_const_qualif` must be called with the `DefId` of the item where the const is
-        // defined, not where it is declared. The difference is significant for associated
-        // constants.
-        let mir_structural_match_violation = self.tcx.mir_const_qualif(instance.def_id()).custom_eq;
-        debug!("mir_structural_match_violation({:?}) -> {}", qpath, mir_structural_match_violation);
+        let cid = GlobalId { instance, promoted: None };
+        // Prefer valtrees over opaque constants.
+        let const_value = self
+            .tcx
+            .const_eval_global_id_for_typeck(param_env_reveal_all, cid, Some(span))
+            .map(|val| match val {
+                Some(valtree) => mir::ConstantKind::Ty(self.tcx.mk_const(valtree, ty)),
+                None => mir::ConstantKind::Val(
+                    self.tcx
+                        .const_eval_global_id(param_env_reveal_all, cid, Some(span))
+                        .expect("const_eval_global_id_for_typeck should have already failed"),
+                    ty,
+                ),
+            });
 
-        match self.tcx.const_eval_instance(param_env_reveal_all, instance, Some(span)) {
-            Ok(literal) => {
-                let const_ = mir::ConstantKind::Val(literal, ty);
-                let pattern = self.const_to_pat(const_, id, span, mir_structural_match_violation);
+        match const_value {
+            Ok(const_) => {
+                let pattern = self.const_to_pat(const_, id, span, Some(instance.def_id()));
 
                 if !is_associated_const {
                     return pattern;
@@ -600,31 +582,66 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
     /// Converts inline const patterns.
     fn lower_inline_const(
         &mut self,
-        anon_const: &'tcx hir::AnonConst,
+        block: &'tcx hir::ConstBlock,
         id: hir::HirId,
         span: Span,
     ) -> PatKind<'tcx> {
-        let value = mir::ConstantKind::from_inline_const(self.tcx, anon_const.def_id);
+        let tcx = self.tcx;
+        let def_id = block.def_id;
+        let body_id = block.body;
+        let expr = &tcx.hir().body(body_id).value;
+        let ty = tcx.typeck(def_id).node_type(block.hir_id);
 
-        // Evaluate early like we do in `lower_path`.
-        let value = value.eval(self.tcx, self.param_env);
-
-        match value {
-            mir::ConstantKind::Ty(c) => match c.kind() {
-                ConstKind::Param(_) => {
-                    self.errors.push(PatternError::ConstParamInPattern(span));
-                    return PatKind::Wild;
+        // Special case inline consts that are just literals. This is solely
+        // a performance optimization, as we could also just go through the regular
+        // const eval path below.
+        // FIXME: investigate the performance impact of removing this.
+        let lit_input = match expr.kind {
+            hir::ExprKind::Lit(ref lit) => Some(LitToConstInput { lit: &lit.node, ty, neg: false }),
+            hir::ExprKind::Unary(hir::UnOp::Neg, ref expr) => match expr.kind {
+                hir::ExprKind::Lit(ref lit) => {
+                    Some(LitToConstInput { lit: &lit.node, ty, neg: true })
                 }
-                ConstKind::Error(_) => {
-                    return PatKind::Wild;
-                }
-                _ => bug!("Expected ConstKind::Param"),
+                _ => None,
             },
-            mir::ConstantKind::Val(_, _) => self.const_to_pat(value, id, span, false).kind,
-            mir::ConstantKind::Unevaluated(..) => {
-                // If we land here it means the const can't be evaluated because it's `TooGeneric`.
-                self.tcx.sess.emit_err(ConstPatternDependsOnGenericParameter { span });
-                return PatKind::Wild;
+            _ => None,
+        };
+        if let Some(lit_input) = lit_input {
+            match tcx.at(expr.span).lit_to_const(lit_input) {
+                Ok(c) => return self.const_to_pat(ConstantKind::Ty(c), id, span, None).kind,
+                // If an error occurred, ignore that it's a literal
+                // and leave reporting the error up to const eval of
+                // the unevaluated constant below.
+                Err(_) => {}
+            }
+        }
+
+        let typeck_root_def_id = tcx.typeck_root_def_id(def_id.to_def_id());
+        let parent_substs =
+            tcx.erase_regions(ty::InternalSubsts::identity_for_item(tcx, typeck_root_def_id));
+        let substs =
+            ty::InlineConstSubsts::new(tcx, ty::InlineConstSubstsParts { parent_substs, ty })
+                .substs;
+
+        let uneval = mir::UnevaluatedConst { def: def_id.to_def_id(), substs, promoted: None };
+        debug_assert!(!substs.has_free_regions());
+
+        let ct = ty::UnevaluatedConst { def: def_id.to_def_id(), substs: substs };
+        // First try using a valtree in order to destructure the constant into a pattern.
+        if let Ok(Some(valtree)) =
+            self.tcx.const_eval_resolve_for_typeck(self.param_env, ct, Some(span))
+        {
+            self.const_to_pat(ConstantKind::Ty(self.tcx.mk_const(valtree, ty)), id, span, None).kind
+        } else {
+            // If that fails, convert it to an opaque constant pattern.
+            match tcx.const_eval_resolve(self.param_env, uneval, None) {
+                Ok(val) => self.const_to_pat(mir::ConstantKind::Val(val, ty), id, span, None).kind,
+                Err(ErrorHandled::TooGeneric) => {
+                    // If we land here it means the const can't be evaluated because it's `TooGeneric`.
+                    self.tcx.sess.emit_err(ConstPatternDependsOnGenericParameter { span });
+                    PatKind::Wild
+                }
+                Err(ErrorHandled::Reported(_)) => PatKind::Wild,
             }
         }
     }
@@ -653,8 +670,10 @@ impl<'a, 'tcx> PatCtxt<'a, 'tcx> {
 
         let lit_input =
             LitToConstInput { lit: &lit.node, ty: self.typeck_results.expr_ty(expr), neg };
-        match self.tcx.at(expr.span).lit_to_mir_constant(lit_input) {
-            Ok(constant) => self.const_to_pat(constant, expr.hir_id, lit.span, false).kind,
+        match self.tcx.at(expr.span).lit_to_const(lit_input) {
+            Ok(constant) => {
+                self.const_to_pat(ConstantKind::Ty(constant), expr.hir_id, lit.span, None).kind
+            }
             Err(LitToConstError::Reported(_)) => PatKind::Wild,
             Err(LitToConstError::TypeError) => bug!("lower_lit: had type error"),
         }
@@ -727,7 +746,7 @@ macro_rules! ClonePatternFoldableImpls {
 }
 
 ClonePatternFoldableImpls! { <'tcx>
-    Span, Field, Mutability, Symbol, LocalVarId, usize,
+    Span, FieldIdx, Mutability, Symbol, LocalVarId, usize,
     Region<'tcx>, Ty<'tcx>, BindingMode, AdtDef<'tcx>,
     SubstsRef<'tcx>, &'tcx GenericArg<'tcx>, UserType<'tcx>,
     UserTypeProjection, CanonicalUserTypeAnnotation<'tcx>
@@ -833,6 +852,9 @@ pub(crate) fn compare_const_vals<'tcx>(
                 mir::ConstantKind::Val(ConstValue::Scalar(Scalar::Int(a)), _a_ty),
                 mir::ConstantKind::Val(ConstValue::Scalar(Scalar::Int(b)), _b_ty),
             ) => return Some(a.cmp(&b)),
+            (mir::ConstantKind::Ty(a), mir::ConstantKind::Ty(b)) => {
+                return Some(a.kind().cmp(&b.kind()));
+            }
             _ => {}
         },
     }

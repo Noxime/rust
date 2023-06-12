@@ -1,10 +1,28 @@
 macro_rules! uint_impl {
-    ($SelfT:ty, $ActualT:ident, $SignedT:ident, $NonZeroT:ident,
-        $BITS:expr, $MaxV:expr,
-        $rot:expr, $rot_op:expr, $rot_result:expr, $swap_op:expr, $swapped:expr,
-        $reversed:expr, $le_bytes:expr, $be_bytes:expr,
-        $to_xe_bytes_doc:expr, $from_xe_bytes_doc:expr,
-        $bound_condition:expr) => {
+    (
+        Self = $SelfT:ty,
+        ActualT = $ActualT:ident,
+        SignedT = $SignedT:ident,
+        NonZeroT = $NonZeroT:ident,
+
+        // There are all for use *only* in doc comments.
+        // As such, they're all passed as literals -- passing them as a string
+        // literal is fine if they need to be multiple code tokens.
+        // In non-comments, use the associated constants rather than these.
+        BITS = $BITS:literal,
+        MAX = $MaxV:literal,
+        rot = $rot:literal,
+        rot_op = $rot_op:literal,
+        rot_result = $rot_result:literal,
+        swap_op = $swap_op:literal,
+        swapped = $swapped:literal,
+        reversed = $reversed:literal,
+        le_bytes = $le_bytes:literal,
+        be_bytes = $be_bytes:literal,
+        to_xe_bytes_doc = $to_xe_bytes_doc:expr,
+        from_xe_bytes_doc = $from_xe_bytes_doc:expr,
+        bound_condition = $bound_condition:literal,
+    ) => {
         /// The smallest value that can be represented by this integer type.
         ///
         /// # Examples
@@ -18,7 +36,7 @@ macro_rules! uint_impl {
         pub const MIN: Self = 0;
 
         /// The largest value that can be represented by this integer type
-        #[doc = concat!("(2<sup>", $BITS, "</sup> &minus; 1", $bound_condition, ")")]
+        #[doc = concat!("(2<sup>", $BITS, "</sup> &minus; 1", $bound_condition, ").")]
         ///
         /// # Examples
         ///
@@ -38,7 +56,7 @@ macro_rules! uint_impl {
         #[doc = concat!("assert_eq!(", stringify!($SelfT), "::BITS, ", stringify!($BITS), ");")]
         /// ```
         #[stable(feature = "int_bits_const", since = "1.53.0")]
-        pub const BITS: u32 = $BITS;
+        pub const BITS: u32 = Self::MAX.count_ones();
 
         /// Converts a string slice in a given base to an integer.
         ///
@@ -705,14 +723,17 @@ macro_rules! uint_impl {
         /// ```
         #[stable(feature = "int_log", since = "1.67.0")]
         #[rustc_const_stable(feature = "int_log", since = "1.67.0")]
-        #[rustc_allow_const_fn_unstable(const_option)]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline]
         #[track_caller]
         pub const fn ilog(self, base: Self) -> u32 {
             assert!(base >= 2, "base of integer logarithm must be at least 2");
-            self.checked_ilog(base).expect("argument of integer logarithm must be positive")
+            if let Some(log) = self.checked_ilog(base) {
+                log
+            } else {
+                int_log10::panic_for_nonpositive_argument()
+            }
         }
 
         /// Returns the base 2 logarithm of the number, rounded down.
@@ -728,13 +749,16 @@ macro_rules! uint_impl {
         /// ```
         #[stable(feature = "int_log", since = "1.67.0")]
         #[rustc_const_stable(feature = "int_log", since = "1.67.0")]
-        #[rustc_allow_const_fn_unstable(const_option)]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline]
         #[track_caller]
         pub const fn ilog2(self) -> u32 {
-            self.checked_ilog2().expect("argument of integer logarithm must be positive")
+            if let Some(log) = self.checked_ilog2() {
+                log
+            } else {
+                int_log10::panic_for_nonpositive_argument()
+            }
         }
 
         /// Returns the base 10 logarithm of the number, rounded down.
@@ -750,13 +774,16 @@ macro_rules! uint_impl {
         /// ```
         #[stable(feature = "int_log", since = "1.67.0")]
         #[rustc_const_stable(feature = "int_log", since = "1.67.0")]
-        #[rustc_allow_const_fn_unstable(const_option)]
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline]
         #[track_caller]
         pub const fn ilog10(self) -> u32 {
-            self.checked_ilog10().expect("argument of integer logarithm must be positive")
+            if let Some(log) = self.checked_ilog10() {
+                log
+            } else {
+                int_log10::panic_for_nonpositive_argument()
+            }
         }
 
         /// Returns the logarithm of the number with respect to an arbitrary base,
@@ -912,7 +939,7 @@ macro_rules! uint_impl {
             // SAFETY: the caller must uphold the safety contract for
             // `unchecked_shl`.
             // Any legal shift amount is losslessly representable in the self type.
-            unsafe { intrinsics::unchecked_shl(self, rhs.try_into().ok().unwrap_unchecked()) }
+            unsafe { intrinsics::unchecked_shl(self, conv_rhs_for_unchecked_shift!($SelfT, rhs)) }
         }
 
         /// Checked shift right. Computes `self >> rhs`, returning `None`
@@ -960,7 +987,7 @@ macro_rules! uint_impl {
             // SAFETY: the caller must uphold the safety contract for
             // `unchecked_shr`.
             // Any legal shift amount is losslessly representable in the self type.
-            unsafe { intrinsics::unchecked_shr(self, rhs.try_into().ok().unwrap_unchecked()) }
+            unsafe { intrinsics::unchecked_shr(self, conv_rhs_for_unchecked_shift!($SelfT, rhs)) }
         }
 
         /// Checked exponentiation. Computes `self.pow(exp)`, returning `None` if
@@ -1336,12 +1363,11 @@ macro_rules! uint_impl {
         ///
         /// Basic usage:
         ///
-        /// Please note that this example is shared between integer types.
-        /// Which explains why `i8` is used here.
-        ///
         /// ```
-        /// assert_eq!(100i8.wrapping_neg(), -100);
-        /// assert_eq!((-128i8).wrapping_neg(), -128);
+        #[doc = concat!("assert_eq!(0_", stringify!($SelfT), ".wrapping_neg(), 0);")]
+        #[doc = concat!("assert_eq!(", stringify!($SelfT), "::MAX.wrapping_neg(), 1);")]
+        #[doc = concat!("assert_eq!(13_", stringify!($SelfT), ".wrapping_neg(), (!13) + 1);")]
+        #[doc = concat!("assert_eq!(42_", stringify!($SelfT), ".wrapping_neg(), !(42 - 1));")]
         /// ```
         #[stable(feature = "num_wrapping", since = "1.2.0")]
         #[rustc_const_stable(feature = "const_wrapping_math", since = "1.32.0")]
@@ -1381,7 +1407,7 @@ macro_rules! uint_impl {
             // SAFETY: the masking by the bitsize of the type ensures that we do not shift
             // out of bounds
             unsafe {
-                self.unchecked_shl(rhs & ($BITS - 1))
+                self.unchecked_shl(rhs & (Self::BITS - 1))
             }
         }
 
@@ -1414,7 +1440,7 @@ macro_rules! uint_impl {
             // SAFETY: the masking by the bitsize of the type ensures that we do not shift
             // out of bounds
             unsafe {
-                self.unchecked_shr(rhs & ($BITS - 1))
+                self.unchecked_shr(rhs & (Self::BITS - 1))
             }
         }
 
@@ -1838,7 +1864,7 @@ macro_rules! uint_impl {
                       without modifying the original"]
         #[inline(always)]
         pub const fn overflowing_shl(self, rhs: u32) -> (Self, bool) {
-            (self.wrapping_shl(rhs), (rhs > ($BITS - 1)))
+            (self.wrapping_shl(rhs), rhs >= Self::BITS)
         }
 
         /// Shifts self right by `rhs` bits.
@@ -1863,7 +1889,7 @@ macro_rules! uint_impl {
                       without modifying the original"]
         #[inline(always)]
         pub const fn overflowing_shr(self, rhs: u32) -> (Self, bool) {
-            (self.wrapping_shr(rhs), (rhs > ($BITS - 1)))
+            (self.wrapping_shr(rhs), rhs >= Self::BITS)
         }
 
         /// Raises self to the power of `exp`, using exponentiation by squaring.

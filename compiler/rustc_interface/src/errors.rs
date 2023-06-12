@@ -32,10 +32,6 @@ pub struct MixedBinCrate;
 pub struct MixedProcMacroCrate;
 
 #[derive(Diagnostic)]
-#[diag(interface_proc_macro_doc_without_arg)]
-pub struct ProcMacroDocWithoutArg;
-
-#[derive(Diagnostic)]
 #[diag(interface_error_writing_dependencies)]
 pub struct ErrorWritingDependencies<'a> {
     pub path: &'a Path,
@@ -112,3 +108,7 @@ pub struct IgnoringExtraFilename;
 #[derive(Diagnostic)]
 #[diag(interface_ignoring_out_dir)]
 pub struct IgnoringOutDir;
+
+#[derive(Diagnostic)]
+#[diag(interface_multiple_output_types_to_stdout)]
+pub struct MultipleOutputTypesToStdout;

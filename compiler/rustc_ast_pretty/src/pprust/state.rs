@@ -4,7 +4,7 @@ mod item;
 
 use crate::pp::Breaks::{Consistent, Inconsistent};
 use crate::pp::{self, Breaks};
-
+use rustc_ast::attr::AttrIdGenerator;
 use rustc_ast::ptr::P;
 use rustc_ast::token::{self, BinOpToken, CommentKind, Delimiter, Nonterminal, Token, TokenKind};
 use rustc_ast::tokenstream::{TokenStream, TokenTree};
@@ -20,9 +20,8 @@ use rustc_span::edition::Edition;
 use rustc_span::source_map::{SourceMap, Spanned};
 use rustc_span::symbol::{kw, sym, Ident, IdentPrinter, Symbol};
 use rustc_span::{BytePos, FileName, Span, DUMMY_SP};
-
-use rustc_ast::attr::AttrIdGenerator;
 use std::borrow::Cow;
+use thin_vec::ThinVec;
 
 pub use self::delimited::IterDelimited;
 
@@ -210,6 +209,10 @@ pub fn literal_to_string(lit: token::Lit) -> String {
         token::ByteStr => format!("b\"{symbol}\""),
         token::ByteStrRaw(n) => {
             format!("br{delim}\"{string}\"{delim}", delim = "#".repeat(n as usize), string = symbol)
+        }
+        token::CStr => format!("c\"{symbol}\""),
+        token::CStrRaw(n) => {
+            format!("cr{delim}\"{symbol}\"{delim}", delim = "#".repeat(n as usize))
         }
         token::Integer | token::Float | token::Bool | token::Err => symbol.to_string(),
     };
@@ -687,7 +690,7 @@ pub trait PrintState<'a>: std::ops::Deref<Target = pp::Printer> + std::ops::Dere
     fn bclose_maybe_open(&mut self, span: rustc_span::Span, empty: bool, close_box: bool) {
         let has_comment = self.maybe_print_comment(span.hi());
         if !empty || has_comment {
-            self.break_offset_if_not_bol(1, -(INDENT_UNIT as isize));
+            self.break_offset_if_not_bol(1, -INDENT_UNIT);
         }
         self.word("}");
         if close_box {
@@ -985,7 +988,9 @@ impl<'a> State<'a> {
 
     pub fn print_assoc_constraint(&mut self, constraint: &ast::AssocConstraint) {
         self.print_ident(constraint.ident);
-        constraint.gen_args.as_ref().map(|args| self.print_generic_args(args, false));
+        if let Some(args) = constraint.gen_args.as_ref() {
+            self.print_generic_args(args, false)
+        }
         self.space();
         match &constraint.kind {
             ast::AssocConstraintKind::Equality { term } => {
@@ -1567,8 +1572,25 @@ impl<'a> State<'a> {
 
             match bound {
                 GenericBound::Trait(tref, modifier) => {
-                    if modifier == &TraitBoundModifier::Maybe {
-                        self.word("?");
+                    match modifier {
+                        TraitBoundModifier::None => {}
+                        TraitBoundModifier::Negative => {
+                            self.word("!");
+                        }
+                        TraitBoundModifier::Maybe => {
+                            self.word("?");
+                        }
+                        TraitBoundModifier::MaybeConst => {
+                            self.word_space("~const");
+                        }
+                        TraitBoundModifier::MaybeConstNegative => {
+                            self.word_space("~const");
+                            self.word("!");
+                        }
+                        TraitBoundModifier::MaybeConstMaybe => {
+                            self.word_space("~const");
+                            self.word("?");
+                        }
                     }
                     self.print_poly_trait_ref(tref);
                 }
@@ -1712,10 +1734,10 @@ impl<'a> State<'a> {
         self.ibox(INDENT_UNIT);
         self.print_formal_generic_params(generic_params);
         let generics = ast::Generics {
-            params: Vec::new(),
+            params: ThinVec::new(),
             where_clause: ast::WhereClause {
                 has_where_token: false,
-                predicates: Vec::new(),
+                predicates: ThinVec::new(),
                 span: DUMMY_SP,
             },
             span: DUMMY_SP,

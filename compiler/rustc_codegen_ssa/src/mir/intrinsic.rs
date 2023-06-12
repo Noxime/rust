@@ -135,13 +135,6 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     .unwrap();
                 OperandRef::from_const(bx, value, ret_ty).immediate_or_packed_pair(bx)
             }
-            sym::offset => {
-                let ty = substs.type_at(0);
-                let layout = bx.layout_of(ty);
-                let ptr = args[0].immediate();
-                let offset = args[1].immediate();
-                bx.inbounds_gep(bx.backend_type(layout), ptr, &[offset])
-            }
             sym::arith_offset => {
                 let ty = substs.type_at(0);
                 let layout = bx.layout_of(ty);
@@ -218,11 +211,6 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 args[1].val.unaligned_volatile_store(bx, dst);
                 return;
             }
-            sym::add_with_overflow
-            | sym::sub_with_overflow
-            | sym::mul_with_overflow
-            | sym::unchecked_div
-            | sym::unchecked_rem
             | sym::unchecked_shl
             | sym::unchecked_shr
             | sym::unchecked_add
@@ -232,47 +220,11 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 let ty = arg_tys[0];
                 match int_type_width_signed(ty, bx.tcx()) {
                     Some((_width, signed)) => match name {
-                        sym::add_with_overflow
-                        | sym::sub_with_overflow
-                        | sym::mul_with_overflow => {
-                            let op = match name {
-                                sym::add_with_overflow => OverflowOp::Add,
-                                sym::sub_with_overflow => OverflowOp::Sub,
-                                sym::mul_with_overflow => OverflowOp::Mul,
-                                _ => bug!(),
-                            };
-                            let (val, overflow) =
-                                bx.checked_binop(op, ty, args[0].immediate(), args[1].immediate());
-                            // Convert `i1` to a `bool`, and write it to the out parameter
-                            let val = bx.from_immediate(val);
-                            let overflow = bx.from_immediate(overflow);
-
-                            let dest = result.project_field(bx, 0);
-                            bx.store(val, dest.llval, dest.align);
-                            let dest = result.project_field(bx, 1);
-                            bx.store(overflow, dest.llval, dest.align);
-
-                            return;
-                        }
                         sym::exact_div => {
                             if signed {
                                 bx.exactsdiv(args[0].immediate(), args[1].immediate())
                             } else {
                                 bx.exactudiv(args[0].immediate(), args[1].immediate())
-                            }
-                        }
-                        sym::unchecked_div => {
-                            if signed {
-                                bx.sdiv(args[0].immediate(), args[1].immediate())
-                            } else {
-                                bx.udiv(args[0].immediate(), args[1].immediate())
-                            }
-                        }
-                        sym::unchecked_rem => {
-                            if signed {
-                                bx.srem(args[0].immediate(), args[1].immediate())
-                            } else {
-                                bx.urem(args[0].immediate(), args[1].immediate())
                             }
                         }
                         sym::unchecked_shl => bx.shl(args[0].immediate(), args[1].immediate()),

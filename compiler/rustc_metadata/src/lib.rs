@@ -4,7 +4,6 @@
 #![feature(generators)]
 #![feature(iter_from_generator)]
 #![feature(let_chains)]
-#![feature(once_cell)]
 #![feature(proc_macro_internals)]
 #![feature(macro_metavar_expr)]
 #![feature(min_specialization)]
@@ -23,13 +22,13 @@ extern crate proc_macro;
 extern crate rustc_macros;
 #[macro_use]
 extern crate rustc_middle;
-#[macro_use]
-extern crate rustc_data_structures;
 
 #[macro_use]
 extern crate tracing;
 
 pub use rmeta::{provide, provide_extern};
+use rustc_errors::{DiagnosticMessage, SubdiagnosticMessage};
+use rustc_fluent_macro::fluent_messages;
 
 mod dependency_format;
 mod foreign_modules;
@@ -44,3 +43,5 @@ pub mod locator;
 pub use fs::{emit_wrapper_file, METADATA_FILENAME};
 pub use native_libs::find_native_static_library;
 pub use rmeta::{encode_metadata, EncodedMetadata, METADATA_HEADER};
+
+fluent_messages! { "../messages.ftl" }

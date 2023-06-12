@@ -138,10 +138,9 @@ pub(crate) fn codegen_x86_llvm_intrinsic_call<'tcx>(
             llvm_add_sub(fx, BinOp::Sub, ret, b_in, a, b);
         }
         _ => {
-            fx.tcx.sess.warn(&format!(
-                "unsupported x86 llvm intrinsic {}; replacing with trap",
-                intrinsic
-            ));
+            fx.tcx
+                .sess
+                .warn(format!("unsupported x86 llvm intrinsic {}; replacing with trap", intrinsic));
             crate::trap::trap_unimplemented(fx, intrinsic);
             return;
         }
@@ -179,8 +178,8 @@ fn llvm_add_sub<'tcx>(
 
     // c + carry -> c + first intermediate carry or borrow respectively
     let int0 = crate::num::codegen_checked_int_binop(fx, bin_op, a, b);
-    let c = int0.value_field(fx, mir::Field::new(0));
-    let cb0 = int0.value_field(fx, mir::Field::new(1)).load_scalar(fx);
+    let c = int0.value_field(fx, FieldIdx::new(0));
+    let cb0 = int0.value_field(fx, FieldIdx::new(1)).load_scalar(fx);
 
     // c + carry -> c + second intermediate carry or borrow respectively
     let cb_in_as_u64 = fx.bcx.ins().uextend(types::I64, cb_in);
@@ -191,7 +190,7 @@ fn llvm_add_sub<'tcx>(
     // carry0 | carry1 -> carry or borrow respectively
     let cb_out = fx.bcx.ins().bor(cb0, cb1);
 
-    let layout = fx.layout_of(fx.tcx.mk_tup([fx.tcx.types.u8, fx.tcx.types.u64].iter()));
+    let layout = fx.layout_of(fx.tcx.mk_tup(&[fx.tcx.types.u8, fx.tcx.types.u64]));
     let val = CValue::by_val_pair(cb_out, c, layout);
     ret.write_cvalue(fx, val);
 }

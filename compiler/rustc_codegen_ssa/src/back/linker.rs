@@ -133,6 +133,9 @@ pub fn get_linker<'a>(
         LinkerFlavor::Unix(Cc::No) if sess.target.os == "l4re" => {
             Box::new(L4Bender::new(cmd, sess)) as Box<dyn Linker>
         }
+        LinkerFlavor::Unix(Cc::No) if sess.target.os == "aix" => {
+            Box::new(AixLinker::new(cmd, sess)) as Box<dyn Linker>
+        }
         LinkerFlavor::WasmLld(Cc::No) => Box::new(WasmLd::new(cmd, sess)) as Box<dyn Linker>,
         LinkerFlavor::Gnu(cc, _)
         | LinkerFlavor::Darwin(cc, _)
@@ -141,7 +144,7 @@ pub fn get_linker<'a>(
             cmd,
             sess,
             target_cpu,
-            hinted_static: false,
+            hinted_static: None,
             is_ld: cc == Cc::No,
             is_gnu: flavor.is_gnu(),
         }) as Box<dyn Linker>,
@@ -211,7 +214,7 @@ pub struct GccLinker<'a> {
     cmd: Command,
     sess: &'a Session,
     target_cpu: &'a str,
-    hinted_static: bool, // Keeps track of the current hinting mode.
+    hinted_static: Option<bool>, // Keeps track of the current hinting mode.
     // Link as ld
     is_ld: bool,
     is_gnu: bool,
@@ -272,9 +275,9 @@ impl<'a> GccLinker<'a> {
         if !self.takes_hints() {
             return;
         }
-        if !self.hinted_static {
+        if self.hinted_static != Some(true) {
             self.linker_arg("-Bstatic");
-            self.hinted_static = true;
+            self.hinted_static = Some(true);
         }
     }
 
@@ -282,9 +285,9 @@ impl<'a> GccLinker<'a> {
         if !self.takes_hints() {
             return;
         }
-        if self.hinted_static {
+        if self.hinted_static != Some(false) {
             self.linker_arg("-Bdynamic");
-            self.hinted_static = false;
+            self.hinted_static = Some(false);
         }
     }
 
@@ -473,13 +476,13 @@ impl<'a> Linker for GccLinker<'a> {
         self.cmd.arg(path);
     }
     fn full_relro(&mut self) {
-        self.linker_args(&["-zrelro", "-znow"]);
+        self.linker_args(&["-z", "relro", "-z", "now"]);
     }
     fn partial_relro(&mut self) {
-        self.linker_arg("-zrelro");
+        self.linker_args(&["-z", "relro"]);
     }
     fn no_relro(&mut self) {
-        self.linker_arg("-znorelro");
+        self.linker_args(&["-z", "norelro"]);
     }
 
     fn link_rust_dylib(&mut self, lib: &str, _path: &Path) {
@@ -720,6 +723,7 @@ impl<'a> Linker for GccLinker<'a> {
                 let mut arg = OsString::from("--version-script=");
                 arg.push(path);
                 self.linker_arg(arg);
+                self.linker_arg("--no-undefined-version");
             }
         }
     }
@@ -758,7 +762,7 @@ impl<'a> Linker for GccLinker<'a> {
         if self.sess.target.is_like_windows {
             self.linker_arg("--nxcompat");
         } else if self.is_gnu {
-            self.linker_arg("-znoexecstack");
+            self.linker_args(&["-z", "noexecstack"]);
         }
     }
 
@@ -1117,9 +1121,12 @@ impl<'a> Linker for EmLinker<'a> {
 
     fn debuginfo(&mut self, _strip: Strip, _: &[PathBuf]) {
         // Preserve names or generate source maps depending on debug info
+        // For more information see https://emscripten.org/docs/tools_reference/emcc.html#emcc-g
         self.cmd.arg(match self.sess.opts.debuginfo {
             DebugInfo::None => "-g0",
-            DebugInfo::Limited => "--profiling-funcs",
+            DebugInfo::Limited | DebugInfo::LineTablesOnly | DebugInfo::LineDirectivesOnly => {
+                "--profiling-funcs"
+            }
             DebugInfo::Full => "-g",
         });
     }
@@ -1364,16 +1371,16 @@ impl<'a> Linker for L4Bender<'a> {
     }
 
     fn full_relro(&mut self) {
-        self.cmd.arg("-zrelro");
-        self.cmd.arg("-znow");
+        self.cmd.arg("-z").arg("relro");
+        self.cmd.arg("-z").arg("now");
     }
 
     fn partial_relro(&mut self) {
-        self.cmd.arg("-zrelro");
+        self.cmd.arg("-z").arg("relro");
     }
 
     fn no_relro(&mut self) {
-        self.cmd.arg("-znorelro");
+        self.cmd.arg("-z").arg("norelro");
     }
 
     fn cmd(&mut self) -> &mut Command {
@@ -1471,6 +1478,177 @@ impl<'a> L4Bender<'a> {
             self.hinted_static = true;
         }
     }
+}
+
+/// Linker for AIX.
+pub struct AixLinker<'a> {
+    cmd: Command,
+    sess: &'a Session,
+    hinted_static: Option<bool>,
+}
+
+impl<'a> AixLinker<'a> {
+    pub fn new(cmd: Command, sess: &'a Session) -> AixLinker<'a> {
+        AixLinker { cmd: cmd, sess: sess, hinted_static: None }
+    }
+
+    fn hint_static(&mut self) {
+        if self.hinted_static != Some(true) {
+            self.cmd.arg("-bstatic");
+            self.hinted_static = Some(true);
+        }
+    }
+
+    fn hint_dynamic(&mut self) {
+        if self.hinted_static != Some(false) {
+            self.cmd.arg("-bdynamic");
+            self.hinted_static = Some(false);
+        }
+    }
+
+    fn build_dylib(&mut self, _out_filename: &Path) {
+        self.cmd.arg("-bM:SRE");
+        self.cmd.arg("-bnoentry");
+        // FIXME: Use CreateExportList utility to create export list
+        // and remove -bexpfull.
+        self.cmd.arg("-bexpfull");
+    }
+}
+
+impl<'a> Linker for AixLinker<'a> {
+    fn link_dylib(&mut self, lib: &str, _verbatim: bool, _as_needed: bool) {
+        self.hint_dynamic();
+        self.cmd.arg(format!("-l{}", lib));
+    }
+
+    fn link_staticlib(&mut self, lib: &str, _verbatim: bool) {
+        self.hint_static();
+        self.cmd.arg(format!("-l{}", lib));
+    }
+
+    fn link_rlib(&mut self, lib: &Path) {
+        self.hint_static();
+        self.cmd.arg(lib);
+    }
+
+    fn include_path(&mut self, path: &Path) {
+        self.cmd.arg("-L").arg(path);
+    }
+
+    fn framework_path(&mut self, _: &Path) {
+        bug!("frameworks are not supported on AIX");
+    }
+
+    fn output_filename(&mut self, path: &Path) {
+        self.cmd.arg("-o").arg(path);
+    }
+
+    fn add_object(&mut self, path: &Path) {
+        self.cmd.arg(path);
+    }
+
+    fn full_relro(&mut self) {}
+
+    fn partial_relro(&mut self) {}
+
+    fn no_relro(&mut self) {}
+
+    fn cmd(&mut self) -> &mut Command {
+        &mut self.cmd
+    }
+
+    fn set_output_kind(&mut self, output_kind: LinkOutputKind, out_filename: &Path) {
+        match output_kind {
+            LinkOutputKind::DynamicDylib => {
+                self.hint_dynamic();
+                self.build_dylib(out_filename);
+            }
+            LinkOutputKind::StaticDylib => {
+                self.hint_static();
+                self.build_dylib(out_filename);
+            }
+            _ => {}
+        }
+    }
+
+    fn link_rust_dylib(&mut self, lib: &str, _: &Path) {
+        self.hint_dynamic();
+        self.cmd.arg(format!("-l{}", lib));
+    }
+
+    fn link_framework(&mut self, _framework: &str, _as_needed: bool) {
+        bug!("frameworks not supported on AIX");
+    }
+
+    fn link_whole_staticlib(&mut self, lib: &str, verbatim: bool, search_path: &[PathBuf]) {
+        self.hint_static();
+        let lib = find_native_static_library(lib, verbatim, search_path, &self.sess);
+        self.cmd.arg(format!("-bkeepfile:{}", lib.to_str().unwrap()));
+    }
+
+    fn link_whole_rlib(&mut self, lib: &Path) {
+        self.hint_static();
+        self.cmd.arg(format!("-bkeepfile:{}", lib.to_str().unwrap()));
+    }
+
+    fn gc_sections(&mut self, _keep_metadata: bool) {
+        self.cmd.arg("-bgc");
+    }
+
+    fn no_gc_sections(&mut self) {
+        self.cmd.arg("-bnogc");
+    }
+
+    fn optimize(&mut self) {}
+
+    fn pgo_gen(&mut self) {}
+
+    fn control_flow_guard(&mut self) {}
+
+    fn debuginfo(&mut self, strip: Strip, _: &[PathBuf]) {
+        match strip {
+            Strip::None => {}
+            // FIXME: -s strips the symbol table, line number information
+            // and relocation information.
+            Strip::Debuginfo | Strip::Symbols => {
+                self.cmd.arg("-s");
+            }
+        }
+    }
+
+    fn no_crt_objects(&mut self) {}
+
+    fn no_default_libraries(&mut self) {}
+
+    fn export_symbols(&mut self, tmpdir: &Path, _crate_type: CrateType, symbols: &[String]) {
+        let path = tmpdir.join("list.exp");
+        let res: io::Result<()> = try {
+            let mut f = BufWriter::new(File::create(&path)?);
+            // FIXME: use llvm-nm to generate export list.
+            for symbol in symbols {
+                debug!("  _{}", symbol);
+                writeln!(f, "  {}", symbol)?;
+            }
+        };
+        if let Err(e) = res {
+            self.sess.fatal(format!("failed to write export file: {}", e));
+        }
+        self.cmd.arg(format!("-bE:{}", path.to_str().unwrap()));
+    }
+
+    fn subsystem(&mut self, _subsystem: &str) {}
+
+    fn reset_per_library_state(&mut self) {
+        self.hint_dynamic();
+    }
+
+    fn linker_plugin_lto(&mut self) {}
+
+    fn add_eh_frame_header(&mut self) {}
+
+    fn add_no_exec(&mut self) {}
+
+    fn add_as_needed(&mut self) {}
 }
 
 fn for_each_exported_symbols_include_dep<'tcx>(

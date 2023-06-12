@@ -20,7 +20,6 @@ use crate::llvm::debuginfo::{
 };
 use crate::value::Value;
 
-use cstr::cstr;
 use rustc_codegen_ssa::debuginfo::type_names::cpp_like_debuginfo;
 use rustc_codegen_ssa::debuginfo::type_names::VTableNameKind;
 use rustc_codegen_ssa::traits::*;
@@ -29,7 +28,6 @@ use rustc_hir::def::CtorKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_middle::bug;
 use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
-use rustc_middle::ty::subst::GenericArgKind;
 use rustc_middle::ty::{
     self, AdtKind, Instance, ParamEnv, PolyExistentialTraitRef, Ty, TyCtxt, Visibility,
 };
@@ -132,7 +130,7 @@ fn build_fixed_size_array_di_node<'ll, 'tcx>(
 
     let (size, align) = cx.size_and_align_of(array_type);
 
-    let upper_bound = len.eval_usize(cx.tcx, ty::ParamEnv::reveal_all()) as c_longlong;
+    let upper_bound = len.eval_target_usize(cx.tcx, ty::ParamEnv::reveal_all()) as c_longlong;
 
     let subrange =
         unsafe { Some(llvm::LLVMRustDIBuilderGetOrCreateSubrange(DIB(cx), 0, upper_bound)) };
@@ -176,15 +174,14 @@ fn build_pointer_or_reference_di_node<'ll, 'tcx>(
 
     return_if_di_node_created_in_meantime!(cx, unique_type_id);
 
-    let (thin_pointer_size, thin_pointer_align) =
-        cx.size_and_align_of(cx.tcx.mk_imm_ptr(cx.tcx.types.unit));
+    let data_layout = &cx.tcx.data_layout;
     let ptr_type_debuginfo_name = compute_debuginfo_type_name(cx.tcx, ptr_type, true);
 
     match fat_pointer_kind(cx, pointee_type) {
         None => {
             // This is a thin pointer. Create a regular pointer type and give it the correct name.
             debug_assert_eq!(
-                (thin_pointer_size, thin_pointer_align),
+                (data_layout.pointer_size, data_layout.pointer_align.abi),
                 cx.size_and_align_of(ptr_type),
                 "ptr_type={}, pointee_type={}",
                 ptr_type,
@@ -195,8 +192,8 @@ fn build_pointer_or_reference_di_node<'ll, 'tcx>(
                 llvm::LLVMRustDIBuilderCreatePointerType(
                     DIB(cx),
                     pointee_type_di_node,
-                    thin_pointer_size.bits(),
-                    thin_pointer_align.bits() as u32,
+                    data_layout.pointer_size.bits(),
+                    data_layout.pointer_align.abi.bits() as u32,
                     0, // Ignore DWARF address space.
                     ptr_type_debuginfo_name.as_ptr().cast(),
                     ptr_type_debuginfo_name.len(),
@@ -808,14 +805,12 @@ pub fn build_compile_unit_di_node<'ll, 'tcx>(
     name_in_debuginfo.push(codegen_unit_name);
 
     debug!("build_compile_unit_di_node: {:?}", name_in_debuginfo);
-    let rustc_producer =
-        format!("rustc version {}", option_env!("CFG_VERSION").expect("CFG_VERSION"),);
+    let rustc_producer = format!("rustc version {}", tcx.sess.cfg_version);
     // FIXME(#41252) Remove "clang LLVM" if we can get GDB and LLVM to play nice.
     let producer = format!("clang LLVM ({})", rustc_producer);
 
     let name_in_debuginfo = name_in_debuginfo.to_string_lossy();
     let work_dir = tcx.sess.opts.working_dir.to_string_lossy(FileNameDisplayPreference::Remapped);
-    let flags = "\0";
     let output_filenames = tcx.output_filenames(());
     let split_name = if tcx.sess.target_can_use_split_dwarf() {
         output_filenames
@@ -831,24 +826,7 @@ pub fn build_compile_unit_di_node<'ll, 'tcx>(
     }
     .unwrap_or_default();
     let split_name = split_name.to_str().unwrap();
-
-    // FIXME(#60020):
-    //
-    //    This should actually be
-    //
-    //        let kind = DebugEmissionKind::from_generic(tcx.sess.opts.debuginfo);
-    //
-    //    That is, we should set LLVM's emission kind to `LineTablesOnly` if
-    //    we are compiling with "limited" debuginfo. However, some of the
-    //    existing tools relied on slightly more debuginfo being generated than
-    //    would be the case with `LineTablesOnly`, and we did not want to break
-    //    these tools in a "drive-by fix", without a good idea or plan about
-    //    what limited debuginfo should exactly look like. So for now we keep
-    //    the emission kind as `FullDebug`.
-    //
-    //    See https://github.com/rust-lang/rust/issues/60020 for details.
-    let kind = DebugEmissionKind::FullDebug;
-    assert!(tcx.sess.opts.debuginfo != DebugInfo::None);
+    let kind = DebugEmissionKind::from_generic(tcx.sess.opts.debuginfo);
 
     unsafe {
         let compile_unit_file = llvm::LLVMRustDIBuilderCreateFile(
@@ -869,7 +847,7 @@ pub fn build_compile_unit_di_node<'ll, 'tcx>(
             producer.as_ptr().cast(),
             producer.len(),
             tcx.sess.opts.optimize != config::OptLevel::No,
-            flags.as_ptr().cast(),
+            c"".as_ptr().cast(),
             0,
             // NB: this doesn't actually have any perceptible effect, it seems. LLVM will instead
             // put the path supplied to `MCSplitDwarfFile` into the debug info of the final
@@ -882,8 +860,6 @@ pub fn build_compile_unit_di_node<'ll, 'tcx>(
         );
 
         if tcx.sess.opts.unstable_opts.profile {
-            let cu_desc_metadata =
-                llvm::LLVMRustMetadataAsValue(debug_context.llcontext, unit_metadata);
             let default_gcda_path = &output_filenames.with_extension("gcda");
             let gcda_path =
                 tcx.sess.opts.unstable_opts.profile_emit.as_ref().unwrap_or(default_gcda_path);
@@ -891,20 +867,16 @@ pub fn build_compile_unit_di_node<'ll, 'tcx>(
             let gcov_cu_info = [
                 path_to_mdstring(debug_context.llcontext, &output_filenames.with_extension("gcno")),
                 path_to_mdstring(debug_context.llcontext, gcda_path),
-                cu_desc_metadata,
+                unit_metadata,
             ];
-            let gcov_metadata = llvm::LLVMMDNodeInContext(
+            let gcov_metadata = llvm::LLVMMDNodeInContext2(
                 debug_context.llcontext,
                 gcov_cu_info.as_ptr(),
-                gcov_cu_info.len() as c_uint,
+                gcov_cu_info.len(),
             );
+            let val = llvm::LLVMMetadataAsValue(debug_context.llcontext, gcov_metadata);
 
-            let llvm_gcov_ident = cstr!("llvm.gcov");
-            llvm::LLVMAddNamedMetadataOperand(
-                debug_context.llmod,
-                llvm_gcov_ident.as_ptr(),
-                gcov_metadata,
-            );
+            llvm::LLVMAddNamedMetadataOperand(debug_context.llmod, c"llvm.gcov".as_ptr(), val);
         }
 
         // Insert `llvm.ident` metadata on the wasm targets since that will
@@ -917,7 +889,7 @@ pub fn build_compile_unit_di_node<'ll, 'tcx>(
             );
             llvm::LLVMAddNamedMetadataOperand(
                 debug_context.llmod,
-                cstr!("llvm.ident").as_ptr(),
+                c"llvm.ident".as_ptr(),
                 llvm::LLVMMDNodeInContext(debug_context.llcontext, &name_metadata, 1),
             );
         }
@@ -925,15 +897,9 @@ pub fn build_compile_unit_di_node<'ll, 'tcx>(
         return unit_metadata;
     };
 
-    fn path_to_mdstring<'ll>(llcx: &'ll llvm::Context, path: &Path) -> &'ll Value {
+    fn path_to_mdstring<'ll>(llcx: &'ll llvm::Context, path: &Path) -> &'ll llvm::Metadata {
         let path_str = path_to_c_string(path);
-        unsafe {
-            llvm::LLVMMDStringInContext(
-                llcx,
-                path_str.as_ptr(),
-                path_str.as_bytes().len() as c_uint,
-            )
-        }
+        unsafe { llvm::LLVMMDStringInContext2(llcx, path_str.as_ptr(), path_str.as_bytes().len()) }
     }
 }
 
@@ -1211,12 +1177,12 @@ fn build_generic_type_param_di_nodes<'ll, 'tcx>(
             let names = get_parameter_names(cx, generics);
             let template_params: SmallVec<_> = iter::zip(substs, names)
                 .filter_map(|(kind, name)| {
-                    if let GenericArgKind::Type(ty) = kind.unpack() {
+                    kind.as_type().map(|ty| {
                         let actual_type =
                             cx.tcx.normalize_erasing_regions(ParamEnv::reveal_all(), ty);
                         let actual_type_di_node = type_di_node(cx, actual_type);
                         let name = name.as_str();
-                        Some(unsafe {
+                        unsafe {
                             llvm::LLVMRustDIBuilderCreateTemplateTypeParameter(
                                 DIB(cx),
                                 None,
@@ -1224,10 +1190,8 @@ fn build_generic_type_param_di_nodes<'ll, 'tcx>(
                                 name.len(),
                                 actual_type_di_node,
                             )
-                        })
-                    } else {
-                        None
-                    }
+                        }
+                    })
                 })
                 .collect();
 

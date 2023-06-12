@@ -7,7 +7,6 @@
 //! `RETURN_PLACE` the MIR arguments) are always fully normalized (and
 //! contain revealed `impl Trait` values).
 
-use rustc_index::vec::Idx;
 use rustc_infer::infer::LateBoundRegionConversionTime;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, Ty};
@@ -19,18 +18,14 @@ use super::{Locations, TypeChecker};
 
 impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
     /// Check explicit closure signature annotation,
-    /// e.g., `|x: FxHashMap<_, &'static u32>| ...`.
+    /// e.g., `|x: FxIndexMap<_, &'static u32>| ...`.
     #[instrument(skip(self, body), level = "debug")]
     pub(super) fn check_signature_annotation(&mut self, body: &Body<'tcx>) {
         let mir_def_id = body.source.def_id().expect_local();
         if !self.tcx().is_closure(mir_def_id.to_def_id()) {
             return;
         }
-        let Some(user_provided_poly_sig) =
-            self.tcx().typeck(mir_def_id).user_provided_sigs.get(&mir_def_id)
-        else {
-            return;
-        };
+        let user_provided_poly_sig = self.tcx().closure_user_provided_sig(mir_def_id);
 
         // Instantiate the canonicalized variables from user-provided signature
         // (e.g., the `_` in the code above) with fresh variables.
@@ -38,7 +33,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         // so that they represent the view from "inside" the closure.
         let user_provided_sig = self
             .instantiate_canonical_with_fresh_inference_vars(body.span, &user_provided_poly_sig);
-        let user_provided_sig = self.infcx.replace_bound_vars_with_fresh_vars(
+        let user_provided_sig = self.infcx.instantiate_binder_with_fresh_vars(
             body.span,
             LateBoundRegionConversionTime::FnCall,
             user_provided_sig,
@@ -87,7 +82,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
             }
 
             // In MIR, argument N is stored in local N+1.
-            let local = Local::new(argument_index + 1);
+            let local = Local::from_usize(argument_index + 1);
 
             let mir_input_ty = body.local_decls[local].ty;
 
@@ -111,7 +106,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         if body.yield_ty().is_some() != universal_regions.yield_ty.is_some() {
             self.tcx().sess.delay_span_bug(
                 body.span,
-                &format!(
+                format!(
                     "Expected body to have yield_ty ({:?}) iff we have a UR yield_ty ({:?})",
                     body.yield_ty(),
                     universal_regions.yield_ty,

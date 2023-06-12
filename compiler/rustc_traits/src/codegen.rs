@@ -3,9 +3,9 @@
 // seems likely that they should eventually be merged into more
 // general routines.
 
-use rustc_infer::infer::{DefiningAnchor, TyCtxtInferExt};
+use rustc_infer::infer::TyCtxtInferExt;
 use rustc_infer::traits::{FulfillmentErrorCode, TraitEngineExt as _};
-use rustc_middle::traits::CodegenObligationError;
+use rustc_middle::traits::{CodegenObligationError, DefiningAnchor};
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_trait_selection::traits::error_reporting::TypeErrCtxtExt;
 use rustc_trait_selection::traits::{
@@ -55,7 +55,7 @@ pub fn codegen_select_candidate<'tcx>(
     // Currently, we use a fulfillment context to completely resolve
     // all nested obligations. This is because they can inform the
     // inference of the impl's type parameters.
-    let mut fulfill_cx = <dyn TraitEngine<'tcx>>::new(tcx);
+    let mut fulfill_cx = <dyn TraitEngine<'tcx>>::new(&infcx);
     let impl_source = selection.map(|predicate| {
         fulfill_cx.register_predicate_obligation(&infcx, predicate);
     });

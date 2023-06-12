@@ -282,7 +282,7 @@ pub(super) fn transcribe<'a>(
             }
 
             // There should be no meta-var declarations in the invocation of a macro.
-            mbe::TokenTree::MetaVarDecl(..) => panic!("unexpected `TokenTree::MetaVarDecl"),
+            mbe::TokenTree::MetaVarDecl(..) => panic!("unexpected `TokenTree::MetaVarDecl`"),
         }
     }
 }
@@ -367,7 +367,7 @@ impl LockstepIterSize {
 ///
 /// Example: `$($($x $y)+*);+` -- we need to make sure that `x` and `y` repeat the same amount as
 /// each other at the given depth when the macro was invoked. If they don't it might mean they were
-/// declared at unequal depths or there was a compile bug. For example, if we have 3 repetitions of
+/// declared at depths which weren't equal or there was a compiler bug. For example, if we have 3 repetitions of
 /// the outer sequence and 4 repetitions of the inner sequence for `x`, we should have the same for
 /// `y`; otherwise, we can't transcribe them both at the given depth.
 fn lockstep_iter_size(
@@ -510,7 +510,7 @@ fn out_of_bounds_err<'a>(
              must be less than {max}"
         )
     };
-    cx.struct_span_err(span, &msg)
+    cx.struct_span_err(span, msg)
 }
 
 fn transcribe_metavar_expr<'a>(

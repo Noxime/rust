@@ -16,7 +16,6 @@ use rustc_ast_pretty::pprust;
 use rustc_attr::{self as attr, TransparencyError};
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
 use rustc_errors::{Applicability, ErrorGuaranteed};
-use rustc_feature::Features;
 use rustc_lint_defs::builtin::{
     RUST_2021_INCOMPATIBLE_OR_PATTERNS, SEMICOLON_IN_EXPRESSIONS_FROM_MACROS,
 };
@@ -251,8 +250,7 @@ fn expand_macro<'cx>(
                 trace_macros_note(&mut cx.expansions, sp, msg);
             }
 
-            let mut p = Parser::new(sess, tts, false, None);
-            p.last_type_ascription = cx.current_expansion.prior_type_ascription;
+            let p = Parser::new(sess, tts, false, None);
 
             if is_local {
                 cx.resolver.record_macro_rule_usage(node_id, i);
@@ -342,7 +340,7 @@ pub(super) fn try_match_macro<'matcher, T: Tracker<'matcher>>(
             Success(named_matches) => {
                 debug!("Parsed arm successfully");
                 // The matcher was `Success(..)`ful.
-                // Merge the gated spans from parsing the matcher with the pre-existing ones.
+                // Merge the gated spans from parsing the matcher with the preexisting ones.
                 sess.gated_spans.merge(gated_spans_snapshot);
 
                 return Ok((i, named_matches));
@@ -379,7 +377,6 @@ pub(super) fn try_match_macro<'matcher, T: Tracker<'matcher>>(
 /// Converts a macro item into a syntax extension.
 pub fn compile_declarative_macro(
     sess: &Session,
-    features: &Features,
     def: &ast::Item,
     edition: Edition,
 ) -> (SyntaxExtension, Vec<(usize, Span)>) {
@@ -477,7 +474,7 @@ pub fn compile_declarative_macro(
 
                 let s = parse_failure_msg(&token);
                 let sp = token.span.substitute_dummy(def.span);
-                let mut err = sess.parse_sess.span_diagnostic.struct_span_err(sp, &s);
+                let mut err = sess.parse_sess.span_diagnostic.struct_span_err(sp, s);
                 err.span_label(sp, msg);
                 annotate_doc_comment(&mut err, sess.source_map(), sp);
                 err.emit();
@@ -486,7 +483,7 @@ pub fn compile_declarative_macro(
             Error(sp, msg) => {
                 sess.parse_sess
                     .span_diagnostic
-                    .struct_span_err(sp.substitute_dummy(def.span), &msg)
+                    .struct_span_err(sp.substitute_dummy(def.span), msg)
                     .emit();
                 return dummy_syn_ext();
             }
@@ -508,7 +505,7 @@ pub fn compile_declarative_macro(
                         true,
                         &sess.parse_sess,
                         def.id,
-                        features,
+                        sess.features_untracked(),
                         edition,
                     )
                     .pop()
@@ -532,7 +529,7 @@ pub fn compile_declarative_macro(
                         false,
                         &sess.parse_sess,
                         def.id,
-                        features,
+                        sess.features_untracked(),
                         edition,
                     )
                     .pop()
@@ -558,7 +555,7 @@ pub fn compile_declarative_macro(
     let (transparency, transparency_error) = attr::find_transparency(&def.attrs, macro_rules);
     match transparency_error {
         Some(TransparencyError::UnknownTransparency(value, span)) => {
-            diag.span_err(span, &format!("unknown macro transparency: `{}`", value));
+            diag.span_err(span, format!("unknown macro transparency: `{}`", value));
         }
         Some(TransparencyError::MultipleTransparencyAttrs(old_span, new_span)) => {
             diag.span_err(vec![old_span, new_span], "multiple macro transparency attributes");
@@ -631,6 +628,40 @@ fn check_lhs_nt_follows(sess: &ParseSess, def: &ast::Item, lhs: &mbe::TokenTree)
     // after parsing/expansion. we can report every error in every macro this way.
 }
 
+fn is_empty_token_tree(sess: &ParseSess, seq: &mbe::SequenceRepetition) -> bool {
+    if seq.separator.is_some() {
+        false
+    } else {
+        let mut is_empty = true;
+        let mut iter = seq.tts.iter().peekable();
+        while let Some(tt) = iter.next() {
+            match tt {
+                mbe::TokenTree::MetaVarDecl(_, _, Some(NonterminalKind::Vis)) => {}
+                mbe::TokenTree::Token(t @ Token { kind: DocComment(..), .. }) => {
+                    let mut now = t;
+                    while let Some(&mbe::TokenTree::Token(
+                        next @ Token { kind: DocComment(..), .. },
+                    )) = iter.peek()
+                    {
+                        now = next;
+                        iter.next();
+                    }
+                    let span = t.span.to(now.span);
+                    sess.span_diagnostic.span_note_without_error(
+                        span,
+                        "doc comments are ignored in matcher position",
+                    );
+                }
+                mbe::TokenTree::Sequence(_, sub_seq)
+                    if (sub_seq.kleene.op == mbe::KleeneOp::ZeroOrMore
+                        || sub_seq.kleene.op == mbe::KleeneOp::ZeroOrOne) => {}
+                _ => is_empty = false,
+            }
+        }
+        is_empty
+    }
+}
+
 /// Checks that the lhs contains no repetition which could match an empty token
 /// tree, because then the matcher would hang indefinitely.
 fn check_lhs_no_empty_seq(sess: &ParseSess, tts: &[mbe::TokenTree]) -> bool {
@@ -647,16 +678,7 @@ fn check_lhs_no_empty_seq(sess: &ParseSess, tts: &[mbe::TokenTree]) -> bool {
                 }
             }
             TokenTree::Sequence(span, seq) => {
-                if seq.separator.is_none()
-                    && seq.tts.iter().all(|seq_tt| match seq_tt {
-                        TokenTree::MetaVarDecl(_, _, Some(NonterminalKind::Vis)) => true,
-                        TokenTree::Sequence(_, sub_seq) => {
-                            sub_seq.kleene.op == mbe::KleeneOp::ZeroOrMore
-                                || sub_seq.kleene.op == mbe::KleeneOp::ZeroOrOne
-                        }
-                        _ => false,
-                    })
-                {
+                if is_empty_token_tree(sess, seq) {
                     let sp = span.entire();
                     sess.span_diagnostic.span_err(sp, "repetition matches empty token tree");
                     return false;
@@ -875,7 +897,7 @@ impl<'tt> FirstSets<'tt> {
     }
 }
 
-// Most `mbe::TokenTree`s are pre-existing in the matcher, but some are defined
+// Most `mbe::TokenTree`s are preexisting in the matcher, but some are defined
 // implicitly, such as opening/closing delimiters and sequence repetition ops.
 // This type encapsulates both kinds. It implements `Clone` while avoiding the
 // need for `mbe::TokenTree` to implement `Clone`.
@@ -1167,7 +1189,7 @@ fn check_matcher_core<'tt>(
                             let sp = next_token.span();
                             let mut err = sess.span_diagnostic.struct_span_err(
                                 sp,
-                                &format!(
+                                format!(
                                     "`${name}:{frag}` {may_be} followed by `{next}`, which \
                                      is not allowed for `{frag}` fragments",
                                     name = name,
@@ -1199,13 +1221,13 @@ fn check_matcher_core<'tt>(
                             match possible {
                                 &[] => {}
                                 &[t] => {
-                                    err.note(&format!(
+                                    err.note(format!(
                                         "only {} is allowed after `{}` fragments",
                                         t, kind,
                                     ));
                                 }
                                 ts => {
-                                    err.note(&format!(
+                                    err.note(format!(
                                         "{}{} or {}",
                                         msg,
                                         ts[..ts.len() - 1].to_vec().join(", "),

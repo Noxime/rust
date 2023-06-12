@@ -1,13 +1,14 @@
 use hir::def_id::DefId;
 use rustc_hir as hir;
 use rustc_index::bit_set::BitSet;
-use rustc_index::vec::{Idx, IndexVec};
+use rustc_index::{IndexSlice, IndexVec};
 use rustc_middle::mir::{GeneratorLayout, GeneratorSavedLocal};
+use rustc_middle::query::Providers;
 use rustc_middle::ty::layout::{
     IntegerExt, LayoutCx, LayoutError, LayoutOf, TyAndLayout, MAX_SIMD_LANES,
 };
 use rustc_middle::ty::{
-    self, subst::SubstsRef, AdtDef, EarlyBinder, ReprOptions, Ty, TyCtxt, TypeVisitable,
+    self, subst::SubstsRef, AdtDef, EarlyBinder, ReprOptions, Ty, TyCtxt, TypeVisitableExt,
 };
 use rustc_session::{DataTypeKind, FieldInfo, FieldKind, SizeKind, VariantInfo};
 use rustc_span::symbol::Symbol;
@@ -17,10 +18,13 @@ use rustc_target::abi::*;
 use std::fmt::Debug;
 use std::iter;
 
+use crate::errors::{
+    MultipleArrayFieldsSimdType, NonPrimitiveSimdType, OversizedSimdType, ZeroLengthSimdType,
+};
 use crate::layout_sanity_check::sanity_check_layout;
 
-pub fn provide(providers: &mut ty::query::Providers) {
-    *providers = ty::query::Providers { layout_of, ..*providers };
+pub fn provide(providers: &mut Providers) {
+    *providers = Providers { layout_of, ..*providers };
 }
 
 #[instrument(skip(tcx, query), level = "debug")]
@@ -62,26 +66,13 @@ fn layout_of<'tcx>(
     Ok(layout)
 }
 
-// Invert a bijective mapping, i.e. `invert(map)[y] = x` if `map[x] = y`.
-// This is used to go between `memory_index` (source field order to memory order)
-// and `inverse_memory_index` (memory order to source field order).
-// See also `FieldsShape::Arbitrary::memory_index` for more details.
-// FIXME(eddyb) build a better abstraction for permutations, if possible.
-fn invert_mapping(map: &[u32]) -> Vec<u32> {
-    let mut inverse = vec![0; map.len()];
-    for i in 0..map.len() {
-        inverse[map[i] as usize] = i as u32;
-    }
-    inverse
-}
-
 fn univariant_uninterned<'tcx>(
     cx: &LayoutCx<'tcx, TyCtxt<'tcx>>,
     ty: Ty<'tcx>,
-    fields: &[TyAndLayout<'_>],
+    fields: &IndexSlice<FieldIdx, Layout<'_>>,
     repr: &ReprOptions,
     kind: StructKind,
-) -> Result<LayoutS<VariantIdx>, LayoutError<'tcx>> {
+) -> Result<LayoutS, LayoutError<'tcx>> {
     let dl = cx.data_layout();
     let pack = repr.pack;
     if pack.is_some() && repr.align.is_some() {
@@ -104,23 +95,23 @@ fn layout_of_uncached<'tcx>(
         assert!(size.bits() <= 128);
         Scalar::Initialized { value, valid_range: WrappingRange::full(size) }
     };
-    let scalar = |value: Primitive| tcx.intern_layout(LayoutS::scalar(cx, scalar_unit(value)));
+    let scalar = |value: Primitive| tcx.mk_layout(LayoutS::scalar(cx, scalar_unit(value)));
 
-    let univariant = |fields: &[TyAndLayout<'_>], repr: &ReprOptions, kind| {
-        Ok(tcx.intern_layout(univariant_uninterned(cx, ty, fields, repr, kind)?))
+    let univariant = |fields: &IndexSlice<FieldIdx, Layout<'_>>, repr: &ReprOptions, kind| {
+        Ok(tcx.mk_layout(univariant_uninterned(cx, ty, fields, repr, kind)?))
     };
     debug_assert!(!ty.has_non_region_infer());
 
     Ok(match *ty.kind() {
         // Basic scalars.
-        ty::Bool => tcx.intern_layout(LayoutS::scalar(
+        ty::Bool => tcx.mk_layout(LayoutS::scalar(
             cx,
             Scalar::Initialized {
                 value: Int(I8, false),
                 valid_range: WrappingRange { start: 0, end: 1 },
             },
         )),
-        ty::Char => tcx.intern_layout(LayoutS::scalar(
+        ty::Char => tcx.mk_layout(LayoutS::scalar(
             cx,
             Scalar::Initialized {
                 value: Int(I32, false),
@@ -136,11 +127,11 @@ fn layout_of_uncached<'tcx>(
         ty::FnPtr(_) => {
             let mut ptr = scalar_unit(Pointer(dl.instruction_address_space));
             ptr.valid_range_mut().start = 1;
-            tcx.intern_layout(LayoutS::scalar(cx, ptr))
+            tcx.mk_layout(LayoutS::scalar(cx, ptr))
         }
 
         // The never type.
-        ty::Never => tcx.intern_layout(cx.layout_of_never_type()),
+        ty::Never => tcx.mk_layout(cx.layout_of_never_type()),
 
         // Potentially-wide pointers.
         ty::Ref(_, pointee, _) | ty::RawPtr(ty::TypeAndMut { ty: pointee, .. }) => {
@@ -151,12 +142,16 @@ fn layout_of_uncached<'tcx>(
 
             let pointee = tcx.normalize_erasing_regions(param_env, pointee);
             if pointee.is_sized(tcx, param_env) {
-                return Ok(tcx.intern_layout(LayoutS::scalar(cx, data_ptr)));
+                return Ok(tcx.mk_layout(LayoutS::scalar(cx, data_ptr)));
             }
 
             let unsized_part = tcx.struct_tail_erasing_lifetimes(pointee, param_env);
 
-            let metadata = if let Some(metadata_def_id) = tcx.lang_items().metadata_type() {
+            let metadata = if let Some(metadata_def_id) = tcx.lang_items().metadata_type()
+                // Projection eagerly bails out when the pointee references errors,
+                // fall back to structurally deducing metadata.
+                && !pointee.references_error()
+            {
                 let metadata_ty = tcx.normalize_erasing_regions(
                     param_env,
                     tcx.mk_projection(metadata_def_id, [pointee]),
@@ -164,7 +159,7 @@ fn layout_of_uncached<'tcx>(
                 let metadata_layout = cx.layout_of(metadata_ty)?;
                 // If the metadata is a 1-zst, then the pointer is thin.
                 if metadata_layout.is_zst() && metadata_layout.align.abi.bytes() == 1 {
-                    return Ok(tcx.intern_layout(LayoutS::scalar(cx, data_ptr)));
+                    return Ok(tcx.mk_layout(LayoutS::scalar(cx, data_ptr)));
                 }
 
                 let Abi::Scalar(metadata) = metadata_layout.abi else {
@@ -174,7 +169,7 @@ fn layout_of_uncached<'tcx>(
             } else {
                 match unsized_part.kind() {
                     ty::Foreign(..) => {
-                        return Ok(tcx.intern_layout(LayoutS::scalar(cx, data_ptr)));
+                        return Ok(tcx.mk_layout(LayoutS::scalar(cx, data_ptr)));
                     }
                     ty::Slice(_) | ty::Str => scalar_unit(Int(dl.ptr_sized_integer(), false)),
                     ty::Dynamic(..) => {
@@ -189,15 +184,15 @@ fn layout_of_uncached<'tcx>(
             };
 
             // Effectively a (ptr, meta) tuple.
-            tcx.intern_layout(cx.scalar_pair(data_ptr, metadata))
+            tcx.mk_layout(cx.scalar_pair(data_ptr, metadata))
         }
 
         ty::Dynamic(_, _, ty::DynStar) => {
-            let mut data = scalar_unit(Int(dl.ptr_sized_integer(), false));
+            let mut data = scalar_unit(Pointer(AddressSpace::DATA));
             data.valid_range_mut().start = 0;
             let mut vtable = scalar_unit(Pointer(AddressSpace::DATA));
             vtable.valid_range_mut().start = 1;
-            tcx.intern_layout(cx.scalar_pair(data, vtable))
+            tcx.mk_layout(cx.scalar_pair(data, vtable))
         }
 
         // Arrays and slices.
@@ -209,7 +204,8 @@ fn layout_of_uncached<'tcx>(
                 }
             }
 
-            let count = count.try_eval_usize(tcx, param_env).ok_or(LayoutError::Unknown(ty))?;
+            let count =
+                count.try_eval_target_usize(tcx, param_env).ok_or(LayoutError::Unknown(ty))?;
             let element = cx.layout_of(element)?;
             let size = element.size.checked_mul(count, dl).ok_or(LayoutError::SizeOverflow(ty))?;
 
@@ -221,8 +217,8 @@ fn layout_of_uncached<'tcx>(
 
             let largest_niche = if count != 0 { element.largest_niche } else { None };
 
-            tcx.intern_layout(LayoutS {
-                variants: Variants::Single { index: VariantIdx::new(0) },
+            tcx.mk_layout(LayoutS {
+                variants: Variants::Single { index: FIRST_VARIANT },
                 fields: FieldsShape::Array { stride: element.size, count },
                 abi,
                 largest_niche,
@@ -232,8 +228,8 @@ fn layout_of_uncached<'tcx>(
         }
         ty::Slice(element) => {
             let element = cx.layout_of(element)?;
-            tcx.intern_layout(LayoutS {
-                variants: Variants::Single { index: VariantIdx::new(0) },
+            tcx.mk_layout(LayoutS {
+                variants: Variants::Single { index: FIRST_VARIANT },
                 fields: FieldsShape::Array { stride: element.size, count: 0 },
                 abi: Abi::Aggregate { sized: false },
                 largest_niche: None,
@@ -241,8 +237,8 @@ fn layout_of_uncached<'tcx>(
                 size: Size::ZERO,
             })
         }
-        ty::Str => tcx.intern_layout(LayoutS {
-            variants: Variants::Single { index: VariantIdx::new(0) },
+        ty::Str => tcx.mk_layout(LayoutS {
+            variants: Variants::Single { index: FIRST_VARIANT },
             fields: FieldsShape::Array { stride: Size::from_bytes(1), count: 0 },
             abi: Abi::Aggregate { sized: false },
             largest_niche: None,
@@ -251,12 +247,14 @@ fn layout_of_uncached<'tcx>(
         }),
 
         // Odd unit types.
-        ty::FnDef(..) => univariant(&[], &ReprOptions::default(), StructKind::AlwaysSized)?,
+        ty::FnDef(..) => {
+            univariant(IndexSlice::empty(), &ReprOptions::default(), StructKind::AlwaysSized)?
+        }
         ty::Dynamic(_, _, ty::Dyn) | ty::Foreign(..) => {
             let mut unit = univariant_uninterned(
                 cx,
                 ty,
-                &[],
+                IndexSlice::empty(),
                 &ReprOptions::default(),
                 StructKind::AlwaysSized,
             )?;
@@ -264,7 +262,7 @@ fn layout_of_uncached<'tcx>(
                 Abi::Aggregate { ref mut sized } => *sized = false,
                 _ => bug!(),
             }
-            tcx.intern_layout(unit)
+            tcx.mk_layout(unit)
         }
 
         ty::Generator(def_id, substs, _) => generator_layout(cx, ty, def_id, substs)?,
@@ -272,7 +270,7 @@ fn layout_of_uncached<'tcx>(
         ty::Closure(_, ref substs) => {
             let tys = substs.as_closure().upvar_tys();
             univariant(
-                &tys.map(|ty| cx.layout_of(ty)).collect::<Result<Vec<_>, _>>()?,
+                &tys.map(|ty| Ok(cx.layout_of(ty)?.layout)).try_collect::<IndexVec<_, _>>()?,
                 &ReprOptions::default(),
                 StructKind::AlwaysSized,
             )?
@@ -283,7 +281,7 @@ fn layout_of_uncached<'tcx>(
                 if tys.len() == 0 { StructKind::AlwaysSized } else { StructKind::MaybeUnsized };
 
             univariant(
-                &tys.iter().map(|k| cx.layout_of(k)).collect::<Result<Vec<_>, _>>()?,
+                &tys.iter().map(|k| Ok(cx.layout_of(k)?.layout)).try_collect::<IndexVec<_, _>>()?,
                 &ReprOptions::default(),
                 kind,
             )?
@@ -300,6 +298,8 @@ fn layout_of_uncached<'tcx>(
                 return Err(LayoutError::Unknown(ty));
             }
 
+            let fields = &def.non_enum_variant().fields;
+
             // Supported SIMD vectors are homogeneous ADTs with at least one field:
             //
             // * #[repr(simd)] struct S(T, T, T, T);
@@ -310,18 +310,22 @@ fn layout_of_uncached<'tcx>(
 
             // SIMD vectors with zero fields are not supported.
             // (should be caught by typeck)
-            if def.non_enum_variant().fields.is_empty() {
-                tcx.sess.fatal(&format!("monomorphising SIMD type `{}` of zero length", ty));
+            if fields.is_empty() {
+                tcx.sess.emit_fatal(ZeroLengthSimdType { ty })
             }
 
             // Type of the first ADT field:
-            let f0_ty = def.non_enum_variant().fields[0].ty(tcx, substs);
+            let f0_ty = fields[FieldIdx::from_u32(0)].ty(tcx, substs);
 
             // Heterogeneous SIMD vectors are not supported:
             // (should be caught by typeck)
-            for fi in &def.non_enum_variant().fields {
+            for fi in fields {
                 if fi.ty(tcx, substs) != f0_ty {
-                    tcx.sess.fatal(&format!("monomorphising heterogeneous SIMD type `{}`", ty));
+                    tcx.sess.delay_span_bug(
+                        DUMMY_SP,
+                        "#[repr(simd)] was applied to an ADT with heterogeneous field type",
+                    );
+                    return Err(LayoutError::Unknown(ty));
                 }
             }
 
@@ -336,12 +340,9 @@ fn layout_of_uncached<'tcx>(
                 // First ADT field is an array:
 
                 // SIMD vectors with multiple array fields are not supported:
-                // (should be caught by typeck)
+                // Can't be caught by typeck with a generic simd type.
                 if def.non_enum_variant().fields.len() != 1 {
-                    tcx.sess.fatal(&format!(
-                        "monomorphising SIMD type `{}` with more than one array field",
-                        ty
-                    ));
+                    tcx.sess.emit_fatal(MultipleArrayFieldsSimdType { ty });
                 }
 
                 // Extract the number of elements from the layout of the array field:
@@ -361,12 +362,9 @@ fn layout_of_uncached<'tcx>(
             //
             // Can't be caught in typeck if the array length is generic.
             if e_len == 0 {
-                tcx.sess.fatal(&format!("monomorphising SIMD type `{}` of zero length", ty));
+                tcx.sess.emit_fatal(ZeroLengthSimdType { ty });
             } else if e_len > MAX_SIMD_LANES {
-                tcx.sess.fatal(&format!(
-                    "monomorphising SIMD type `{}` of length greater than {}",
-                    ty, MAX_SIMD_LANES,
-                ));
+                tcx.sess.emit_fatal(OversizedSimdType { ty, max_lanes: MAX_SIMD_LANES });
             }
 
             // Compute the ABI of the element type:
@@ -374,11 +372,7 @@ fn layout_of_uncached<'tcx>(
             let Abi::Scalar(e_abi) = e_ly.abi else {
                 // This error isn't caught in typeck, e.g., if
                 // the element type of the vector is generic.
-                tcx.sess.fatal(&format!(
-                    "monomorphising SIMD type `{}` with a non-primitive-scalar \
-                    (integer/float/pointer) element type `{}`",
-                    ty, e_ty
-                ))
+                tcx.sess.emit_fatal(NonPrimitiveSimdType { ty, e_ty });
             };
 
             // Compute the size and alignment of the vector:
@@ -388,13 +382,13 @@ fn layout_of_uncached<'tcx>(
 
             // Compute the placement of the vector fields:
             let fields = if is_array {
-                FieldsShape::Arbitrary { offsets: vec![Size::ZERO], memory_index: vec![0] }
+                FieldsShape::Arbitrary { offsets: [Size::ZERO].into(), memory_index: [0].into() }
             } else {
                 FieldsShape::Array { stride: e_ly.size, count: e_len }
             };
 
-            tcx.intern_layout(LayoutS {
-                variants: Variants::Single { index: VariantIdx::new(0) },
+            tcx.mk_layout(LayoutS {
+                variants: Variants::Single { index: FIRST_VARIANT },
                 fields,
                 abi: Abi::Vector { element: e_abi, count: e_len },
                 largest_niche: e_ly.largest_niche,
@@ -412,10 +406,10 @@ fn layout_of_uncached<'tcx>(
                 .map(|v| {
                     v.fields
                         .iter()
-                        .map(|field| cx.layout_of(field.ty(tcx, substs)))
-                        .collect::<Result<Vec<_>, _>>()
+                        .map(|field| Ok(cx.layout_of(field.ty(tcx, substs))?.layout))
+                        .try_collect::<IndexVec<_, _>>()
                 })
-                .collect::<Result<IndexVec<VariantIdx, _>, _>>()?;
+                .try_collect::<IndexVec<VariantIdx, _>>()?;
 
             if def.is_union() {
                 if def.repr().pack.is_some() && def.repr().align.is_some() {
@@ -426,12 +420,12 @@ fn layout_of_uncached<'tcx>(
                     return Err(LayoutError::Unknown(ty));
                 }
 
-                return Ok(tcx.intern_layout(
+                return Ok(tcx.mk_layout(
                     cx.layout_of_union(&def.repr(), &variants).ok_or(LayoutError::Unknown(ty))?,
                 ));
             }
 
-            tcx.intern_layout(
+            tcx.mk_layout(
                 cx.layout_of_struct_or_enum(
                     &def.repr(),
                     &variants,
@@ -451,10 +445,12 @@ fn layout_of_uncached<'tcx>(
                     {
                         let param_env = tcx.param_env(def.did());
                         def.is_struct()
-                            && match def.variants().iter().next().and_then(|x| x.fields.last()) {
-                                Some(last_field) => {
-                                    tcx.type_of(last_field.did).is_sized(tcx, param_env)
-                                }
+                            && match def.variants().iter().next().and_then(|x| x.fields.raw.last())
+                            {
+                                Some(last_field) => tcx
+                                    .type_of(last_field.did)
+                                    .subst_identity()
+                                    .is_sized(tcx, param_env),
                                 None => false,
                             }
                     },
@@ -470,14 +466,11 @@ fn layout_of_uncached<'tcx>(
             return Err(LayoutError::Unknown(ty));
         }
 
-        ty::Placeholder(..)
-        | ty::GeneratorWitness(..)
-        | ty::GeneratorWitnessMIR(..)
-        | ty::Infer(_) => {
+        ty::Bound(..) | ty::GeneratorWitness(..) | ty::GeneratorWitnessMIR(..) | ty::Infer(_) => {
             bug!("Layout::compute: unexpected type `{}`", ty)
         }
 
-        ty::Bound(..) | ty::Param(_) | ty::Error(_) => {
+        ty::Placeholder(..) | ty::Param(_) | ty::Error(_) => {
             return Err(LayoutError::Unknown(ty));
         }
     })
@@ -488,8 +481,7 @@ fn layout_of_uncached<'tcx>(
 enum SavedLocalEligibility {
     Unassigned,
     Assigned(VariantIdx),
-    // FIXME: Use newtype_index so we aren't wasting bytes
-    Ineligible(Option<u32>),
+    Ineligible(Option<FieldIdx>),
 }
 
 // When laying out generators, we divide our saved local fields into two
@@ -518,7 +510,7 @@ fn generator_saved_local_eligibility(
     use SavedLocalEligibility::*;
 
     let mut assignments: IndexVec<GeneratorSavedLocal, SavedLocalEligibility> =
-        IndexVec::from_elem_n(Unassigned, info.field_tys.len());
+        IndexVec::from_elem(Unassigned, &info.field_tys);
 
     // The saved locals not eligible for overlap. These will get
     // "promoted" to the prefix of our generator.
@@ -601,7 +593,7 @@ fn generator_saved_local_eligibility(
     // Write down the order of our locals that will be promoted to the prefix.
     {
         for (idx, local) in ineligible_locals.iter().enumerate() {
-            assignments[local] = Ineligible(Some(idx as u32));
+            assignments[local] = Ineligible(Some(FieldIdx::from_usize(idx)));
         }
     }
     debug!("generator saved local assignments: {:?}", assignments);
@@ -618,7 +610,7 @@ fn generator_layout<'tcx>(
 ) -> Result<Layout<'tcx>, LayoutError<'tcx>> {
     use SavedLocalEligibility::*;
     let tcx = cx.tcx;
-    let subst_field = |ty: Ty<'tcx>| EarlyBinder(ty).subst(tcx, substs);
+    let subst_field = |ty: Ty<'tcx>| EarlyBinder::bind(ty).subst(tcx, substs);
 
     let Some(info) = tcx.generator_layout(def_id) else {
         return Err(LayoutError::Unknown(ty));
@@ -633,26 +625,24 @@ fn generator_layout<'tcx>(
     // `info.variant_fields` already accounts for the reserved variants, so no need to add them.
     let max_discr = (info.variant_fields.len() - 1) as u128;
     let discr_int = Integer::fit_unsigned(max_discr);
-    let discr_int_ty = discr_int.to_ty(tcx, false);
     let tag = Scalar::Initialized {
         value: Primitive::Int(discr_int, false),
         valid_range: WrappingRange { start: 0, end: max_discr },
     };
-    let tag_layout = cx.tcx.intern_layout(LayoutS::scalar(cx, tag));
-    let tag_layout = TyAndLayout { ty: discr_int_ty, layout: tag_layout };
+    let tag_layout = cx.tcx.mk_layout(LayoutS::scalar(cx, tag));
 
     let promoted_layouts = ineligible_locals
         .iter()
         .map(|local| subst_field(info.field_tys[local].ty))
         .map(|ty| tcx.mk_maybe_uninit(ty))
-        .map(|ty| cx.layout_of(ty));
+        .map(|ty| Ok(cx.layout_of(ty)?.layout));
     let prefix_layouts = substs
         .as_generator()
         .prefix_tys()
-        .map(|ty| cx.layout_of(ty))
+        .map(|ty| Ok(cx.layout_of(ty)?.layout))
         .chain(iter::once(Ok(tag_layout)))
         .chain(promoted_layouts)
-        .collect::<Result<Vec<_>, _>>()?;
+        .try_collect::<IndexVec<_, _>>()?;
     let prefix = univariant_uninterned(
         cx,
         ty,
@@ -670,26 +660,28 @@ fn generator_layout<'tcx>(
     debug!("prefix = {:#?}", prefix);
     let (outer_fields, promoted_offsets, promoted_memory_index) = match prefix.fields {
         FieldsShape::Arbitrary { mut offsets, memory_index } => {
-            let mut inverse_memory_index = invert_mapping(&memory_index);
+            let mut inverse_memory_index = memory_index.invert_bijective_mapping();
 
             // "a" (`0..b_start`) and "b" (`b_start..`) correspond to
             // "outer" and "promoted" fields respectively.
-            let b_start = (tag_index + 1) as u32;
-            let offsets_b = offsets.split_off(b_start as usize);
+            let b_start = FieldIdx::from_usize(tag_index + 1);
+            let offsets_b = IndexVec::from_raw(offsets.raw.split_off(b_start.as_usize()));
             let offsets_a = offsets;
 
             // Disentangle the "a" and "b" components of `inverse_memory_index`
             // by preserving the order but keeping only one disjoint "half" each.
             // FIXME(eddyb) build a better abstraction for permutations, if possible.
-            let inverse_memory_index_b: Vec<_> =
-                inverse_memory_index.iter().filter_map(|&i| i.checked_sub(b_start)).collect();
-            inverse_memory_index.retain(|&i| i < b_start);
+            let inverse_memory_index_b: IndexVec<u32, FieldIdx> = inverse_memory_index
+                .iter()
+                .filter_map(|&i| i.as_u32().checked_sub(b_start.as_u32()).map(FieldIdx::from_u32))
+                .collect();
+            inverse_memory_index.raw.retain(|&i| i < b_start);
             let inverse_memory_index_a = inverse_memory_index;
 
             // Since `inverse_memory_index_{a,b}` each only refer to their
             // respective fields, they can be safely inverted
-            let memory_index_a = invert_mapping(&inverse_memory_index_a);
-            let memory_index_b = invert_mapping(&inverse_memory_index_b);
+            let memory_index_a = inverse_memory_index_a.invert_bijective_mapping();
+            let memory_index_b = inverse_memory_index_b.invert_bijective_mapping();
 
             let outer_fields =
                 FieldsShape::Arbitrary { offsets: offsets_a, memory_index: memory_index_a };
@@ -718,7 +710,9 @@ fn generator_layout<'tcx>(
             let mut variant = univariant_uninterned(
                 cx,
                 ty,
-                &variant_only_tys.map(|ty| cx.layout_of(ty)).collect::<Result<Vec<_>, _>>()?,
+                &variant_only_tys
+                    .map(|ty| Ok(cx.layout_of(ty)?.layout))
+                    .try_collect::<IndexVec<_, _>>()?,
                 &ReprOptions::default(),
                 StructKind::Prefixed(prefix_size, prefix_align.abi),
             )?;
@@ -737,13 +731,16 @@ fn generator_layout<'tcx>(
             // promoted fields were being used, but leave the elements not in the
             // subset as `INVALID_FIELD_IDX`, which we can filter out later to
             // obtain a valid (bijective) mapping.
-            const INVALID_FIELD_IDX: u32 = !0;
-            let mut combined_inverse_memory_index =
-                vec![INVALID_FIELD_IDX; promoted_memory_index.len() + memory_index.len()];
+            const INVALID_FIELD_IDX: FieldIdx = FieldIdx::MAX;
+            debug_assert!(variant_fields.next_index() <= INVALID_FIELD_IDX);
+
+            let mut combined_inverse_memory_index = IndexVec::from_elem_n(
+                INVALID_FIELD_IDX,
+                promoted_memory_index.len() + memory_index.len(),
+            );
             let mut offsets_and_memory_index = iter::zip(offsets, memory_index);
             let combined_offsets = variant_fields
-                .iter()
-                .enumerate()
+                .iter_enumerated()
                 .map(|(i, local)| {
                     let (offset, memory_index) = match assignments[*local] {
                         Unassigned => bug!(),
@@ -752,19 +749,19 @@ fn generator_layout<'tcx>(
                             (offset, promoted_memory_index.len() as u32 + memory_index)
                         }
                         Ineligible(field_idx) => {
-                            let field_idx = field_idx.unwrap() as usize;
+                            let field_idx = field_idx.unwrap();
                             (promoted_offsets[field_idx], promoted_memory_index[field_idx])
                         }
                     };
-                    combined_inverse_memory_index[memory_index as usize] = i as u32;
+                    combined_inverse_memory_index[memory_index] = i;
                     offset
                 })
                 .collect();
 
             // Remove the unused slots and invert the mapping to obtain the
             // combined `memory_index` (also see previous comment).
-            combined_inverse_memory_index.retain(|&i| i != INVALID_FIELD_IDX);
-            let combined_memory_index = invert_mapping(&combined_inverse_memory_index);
+            combined_inverse_memory_index.raw.retain(|&i| i != INVALID_FIELD_IDX);
+            let combined_memory_index = combined_inverse_memory_index.invert_bijective_mapping();
 
             variant.fields = FieldsShape::Arbitrary {
                 offsets: combined_offsets,
@@ -775,7 +772,7 @@ fn generator_layout<'tcx>(
             align = align.max(variant.align);
             Ok(variant)
         })
-        .collect::<Result<IndexVec<VariantIdx, _>, _>>()?;
+        .try_collect::<IndexVec<VariantIdx, _>>()?;
 
     size = size.align_to(align.abi);
 
@@ -785,7 +782,7 @@ fn generator_layout<'tcx>(
         Abi::Aggregate { sized: true }
     };
 
-    let layout = tcx.intern_layout(LayoutS {
+    let layout = tcx.mk_layout(LayoutS {
         variants: Variants::Multiple {
             tag,
             tag_encoding: TagEncoding::Direct,
@@ -970,7 +967,7 @@ fn variant_info_for_generator<'tcx>(
         })
         .collect();
 
-    let variant_infos: Vec<_> = generator
+    let mut variant_infos: Vec<_> = generator
         .variant_fields
         .iter_enumerated()
         .map(|(variant_idx, variant_def)| {
@@ -1033,6 +1030,15 @@ fn variant_info_for_generator<'tcx>(
             }
         })
         .collect();
+
+    // The first three variants are hardcoded to be `UNRESUMED`, `RETURNED` and `POISONED`.
+    // We will move the `RETURNED` and `POISONED` elements to the end so we
+    // are left with a sorting order according to the generators yield points:
+    // First `Unresumed`, then the `SuspendN` followed by `Returned` and `Panicked` (POISONED).
+    let end_states = variant_infos.drain(1..=2);
+    let end_states: Vec<_> = end_states.collect();
+    variant_infos.extend(end_states);
+
     (
         variant_infos,
         match tag_encoding {

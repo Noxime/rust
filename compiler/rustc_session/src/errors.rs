@@ -4,9 +4,9 @@ use crate::cgu_reuse_tracker::CguReuse;
 use crate::parse::ParseSess;
 use rustc_ast::token;
 use rustc_ast::util::literal::LitError;
-use rustc_errors::MultiSpan;
+use rustc_errors::{error_code, DiagnosticMessage, EmissionGuarantee, IntoDiagnostic, MultiSpan};
 use rustc_macros::Diagnostic;
-use rustc_span::{Span, Symbol};
+use rustc_span::{BytePos, Span, Symbol};
 use rustc_target::spec::{SplitDebuginfo, StackProtector, TargetTriple};
 
 #[derive(Diagnostic)]
@@ -27,12 +27,22 @@ pub struct CguNotRecorded<'a> {
     pub cgu_name: &'a str,
 }
 
-#[derive(Diagnostic)]
-#[diag(session_feature_gate_error, code = "E0658")]
-pub struct FeatureGateError<'a> {
-    #[primary_span]
+pub struct FeatureGateError {
     pub span: MultiSpan,
-    pub explain: &'a str,
+    pub explain: DiagnosticMessage,
+}
+
+impl<'a, T: EmissionGuarantee> IntoDiagnostic<'a, T> for FeatureGateError {
+    #[track_caller]
+    fn into_diagnostic(
+        self,
+        handler: &'a rustc_errors::Handler,
+    ) -> rustc_errors::DiagnosticBuilder<'a, T> {
+        let mut diag = handler.struct_diagnostic(self.explain);
+        diag.set_span(self.span);
+        diag.code(error_code!(E0658));
+        diag
+    }
 }
 
 #[derive(Subdiagnostic)]
@@ -72,6 +82,12 @@ pub struct ProfileSampleUseFileDoesNotExist<'a> {
 pub struct TargetRequiresUnwindTables;
 
 #[derive(Diagnostic)]
+#[diag(session_instrumentation_not_supported)]
+pub struct InstrumentationNotSupported {
+    pub us: String,
+}
+
+#[derive(Diagnostic)]
 #[diag(session_sanitizer_not_supported)]
 pub struct SanitizerNotSupported {
     pub us: String,
@@ -95,8 +111,24 @@ pub struct CannotMixAndMatchSanitizers {
 pub struct CannotEnableCrtStaticLinux;
 
 #[derive(Diagnostic)]
-#[diag(session_sanitizer_cfi_enabled)]
-pub struct SanitizerCfiEnabled;
+#[diag(session_sanitizer_cfi_requires_lto)]
+pub struct SanitizerCfiRequiresLto;
+
+#[derive(Diagnostic)]
+#[diag(session_sanitizer_cfi_canonical_jump_tables_requires_cfi)]
+pub struct SanitizerCfiCanonicalJumpTablesRequiresCfi;
+
+#[derive(Diagnostic)]
+#[diag(session_sanitizer_cfi_generalize_pointers_requires_cfi)]
+pub struct SanitizerCfiGeneralizePointersRequiresCfi;
+
+#[derive(Diagnostic)]
+#[diag(session_sanitizer_cfi_normalize_integers_requires_cfi)]
+pub struct SanitizerCfiNormalizeIntegersRequiresCfi;
+
+#[derive(Diagnostic)]
+#[diag(session_split_lto_unit_requires_lto)]
+pub struct SplitLtoUnitRequiresLto;
 
 #[derive(Diagnostic)]
 #[diag(session_unstable_virtual_function_elimination)]
@@ -291,6 +323,13 @@ pub(crate) struct BinaryFloatLiteralNotSupported {
     pub span: Span,
 }
 
+#[derive(Diagnostic)]
+#[diag(session_nul_in_c_str)]
+pub(crate) struct NulInCStr {
+    #[primary_span]
+    pub span: Span,
+}
+
 pub fn report_lit_error(sess: &ParseSess, err: LitError, lit: token::Lit, span: Span) {
     // Checks if `s` looks like i32 or u1234 etc.
     fn looks_like_width_suffix(first_chars: &[char], s: &str) -> bool {
@@ -316,11 +355,7 @@ pub fn report_lit_error(sess: &ParseSess, err: LitError, lit: token::Lit, span: 
                 .take_while(|c| *c != 'i' && *c != 'u')
                 .all(|c| c.to_digit(base).is_some());
 
-        if valid {
-            Some(format!("0{}{}", base_char.to_ascii_lowercase(), &suffix[1..]))
-        } else {
-            None
-        }
+        valid.then(|| format!("0{}{}", base_char.to_ascii_lowercase(), &suffix[1..]))
     }
 
     let token::Lit { kind, symbol, suffix, .. } = lit;
@@ -373,6 +408,12 @@ pub fn report_lit_error(sess: &ParseSess, err: LitError, lit: token::Lit, span: 
             };
             sess.emit_err(IntLiteralTooLarge { span, limit });
         }
+        LitError::NulInCStr(range) => {
+            let lo = BytePos(span.lo().0 + range.start as u32 + 2);
+            let hi = BytePos(span.lo().0 + range.end as u32 + 2);
+            let span = span.with_lo(lo).with_hi(hi);
+            sess.emit_err(NulInCStr { span });
+        }
     }
 }
 
@@ -380,4 +421,12 @@ pub fn report_lit_error(sess: &ParseSess, err: LitError, lit: token::Lit, span: 
 #[diag(session_optimization_fuel_exhausted)]
 pub struct OptimisationFuelExhausted {
     pub msg: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(session_incompatible_linker_flavor)]
+#[note]
+pub struct IncompatibleLinkerFlavor {
+    pub flavor: &'static str,
+    pub compatible_list: String,
 }

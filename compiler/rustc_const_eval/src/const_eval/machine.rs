@@ -2,7 +2,7 @@ use rustc_hir::def::DefKind;
 use rustc_hir::{LangItem, CRATE_HIR_ID};
 use rustc_middle::mir;
 use rustc_middle::mir::interpret::PointerArithmetic;
-use rustc_middle::ty::layout::FnAbiOf;
+use rustc_middle::ty::layout::{FnAbiOf, TyAndLayout};
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_session::lint::builtin::INVALID_ALIGNMENT;
 use std::borrow::Borrow;
@@ -16,25 +16,37 @@ use std::fmt;
 use rustc_ast::Mutability;
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir::AssertMessage;
-use rustc_session::Limit;
 use rustc_span::symbol::{sym, Symbol};
 use rustc_target::abi::{Align, Size};
 use rustc_target::spec::abi::Abi as CallAbi;
 
+use crate::errors::{LongRunning, LongRunningWarn};
 use crate::interpret::{
     self, compile_time_machine, AllocId, ConstAllocation, FnVal, Frame, ImmTy, InterpCx,
-    InterpResult, OpTy, PlaceTy, Pointer, Scalar, StackPopUnwind,
+    InterpResult, OpTy, PlaceTy, Pointer, Scalar,
 };
+use crate::{errors, fluent_generated as fluent};
 
 use super::error::*;
 
+/// When hitting this many interpreted terminators we emit a deny by default lint
+/// that notfies the user that their constant takes a long time to evaluate. If that's
+/// what they intended, they can just allow the lint.
+const LINT_TERMINATOR_LIMIT: usize = 2_000_000;
+/// The limit used by `-Z tiny-const-eval-limit`. This smaller limit is useful for internal
+/// tests not needing to run 30s or more to show some behaviour.
+const TINY_LINT_TERMINATOR_LIMIT: usize = 20;
+/// After this many interpreted terminators, we start emitting progress indicators at every
+/// power of two of interpreted terminators.
+const PROGRESS_INDICATOR_START: usize = 4_000_000;
+
 /// Extra machine state for CTFE, and the Machine instance
 pub struct CompileTimeInterpreter<'mir, 'tcx> {
-    /// For now, the number of terminators that can be evaluated before we throw a resource
-    /// exhaustion error.
+    /// The number of terminators that have been evaluated.
     ///
-    /// Setting this to `0` disables the limit and allows the interpreter to run forever.
-    pub(super) steps_remaining: usize,
+    /// This is used to produce lints informing the user that the compiler is not stuck.
+    /// Set to `usize::MAX` to never report anything.
+    pub(super) num_evaluated_steps: usize,
 
     /// The virtual call stack.
     pub(super) stack: Vec<Frame<'mir, 'tcx, AllocId, ()>>,
@@ -72,13 +84,9 @@ impl CheckAlignment {
 }
 
 impl<'mir, 'tcx> CompileTimeInterpreter<'mir, 'tcx> {
-    pub(crate) fn new(
-        const_eval_limit: Limit,
-        can_access_statics: bool,
-        check_alignment: CheckAlignment,
-    ) -> Self {
+    pub(crate) fn new(can_access_statics: bool, check_alignment: CheckAlignment) -> Self {
         CompileTimeInterpreter {
-            steps_remaining: const_eval_limit.0,
+            num_evaluated_steps: 0,
             stack: Vec::new(),
             can_access_statics,
             check_alignment,
@@ -244,10 +252,13 @@ impl<'mir, 'tcx: 'mir> CompileTimeEvalContext<'mir, 'tcx> {
         assert_eq!(args.len(), 2);
 
         let ptr = self.read_pointer(&args[0])?;
-        let target_align = self.read_scalar(&args[1])?.to_machine_usize(self)?;
+        let target_align = self.read_scalar(&args[1])?.to_target_usize(self)?;
 
         if !target_align.is_power_of_two() {
-            throw_ub_format!("`align_offset` called with non-power-of-two align: {}", target_align);
+            throw_ub_custom!(
+                fluent::const_eval_align_offset_invalid_align,
+                target_align = target_align,
+            );
         }
 
         match self.ptr_try_get_alloc_id(ptr) {
@@ -271,12 +282,12 @@ impl<'mir, 'tcx: 'mir> CompileTimeEvalContext<'mir, 'tcx> {
                         /* with_caller_location = */ false,
                         dest,
                         ret,
-                        StackPopUnwind::NotAllowed,
+                        mir::UnwindAction::Unreachable,
                     )?;
                     Ok(ControlFlow::Break(()))
                 } else {
                     // Not alignable in const, return `usize::MAX`.
-                    let usize_max = Scalar::from_machine_usize(self.machine_usize_max(), self);
+                    let usize_max = Scalar::from_target_usize(self.target_usize_max(), self);
                     self.write_scalar(usize_max, dest)?;
                     self.return_to_block(ret)?;
                     Ok(ControlFlow::Break(()))
@@ -335,8 +346,8 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
     }
 
     #[inline(always)]
-    fn enforce_validity(ecx: &InterpCx<'mir, 'tcx, Self>) -> bool {
-        ecx.tcx.sess.opts.unstable_opts.extra_const_ub_checks
+    fn enforce_validity(ecx: &InterpCx<'mir, 'tcx, Self>, layout: TyAndLayout<'tcx>) -> bool {
+        ecx.tcx.sess.opts.unstable_opts.extra_const_ub_checks || layout.abi.is_uninhabited()
     }
 
     fn alignment_check_failed(
@@ -353,15 +364,18 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
                 "`alignment_check_failed` called when no alignment check requested"
             ),
             CheckAlignment::FutureIncompat => {
-                let err = ConstEvalErr::new(ecx, err, None);
-                ecx.tcx.struct_span_lint_hir(
+                let (_, backtrace) = err.into_parts();
+                backtrace.print_backtrace();
+                let (span, frames) = super::get_span_and_frames(&ecx);
+
+                ecx.tcx.emit_spanned_lint(
                     INVALID_ALIGNMENT,
                     ecx.stack().iter().find_map(|frame| frame.lint_root()).unwrap_or(CRATE_HIR_ID),
-                    err.span,
-                    err.error.to_string(),
-                    |db| {
-                        err.decorate(db, |_| {});
-                        db
+                    span,
+                    errors::AlignmentCheckFailed {
+                        has: has.bytes(),
+                        required: required.bytes(),
+                        frames,
                     },
                 );
                 Ok(())
@@ -375,18 +389,18 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
     ) -> InterpResult<'tcx, &'tcx mir::Body<'tcx>> {
         match instance {
             ty::InstanceDef::Item(def) => {
-                if ecx.tcx.is_ctfe_mir_available(def.did) {
-                    Ok(ecx.tcx.mir_for_ctfe_opt_const_arg(def))
-                } else if ecx.tcx.def_kind(def.did) == DefKind::AssocConst {
+                if ecx.tcx.is_ctfe_mir_available(def) {
+                    Ok(ecx.tcx.mir_for_ctfe(def))
+                } else if ecx.tcx.def_kind(def) == DefKind::AssocConst {
                     let guar = ecx.tcx.sess.delay_span_bug(
                         rustc_span::DUMMY_SP,
                         "This is likely a const item that is missing from its impl",
                     );
-                    throw_inval!(AlreadyReported(guar));
+                    throw_inval!(AlreadyReported(guar.into()));
                 } else {
                     // `find_mir_or_eval_fn` checks that this is a const fn before even calling us,
                     // so this should be unreachable.
-                    let path = ecx.tcx.def_path_str(def.did);
+                    let path = ecx.tcx.def_path_str(def);
                     bug!("trying to call extern function `{path}` at compile-time");
                 }
             }
@@ -401,7 +415,7 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
         args: &[OpTy<'tcx>],
         dest: &PlaceTy<'tcx>,
         ret: Option<mir::BasicBlock>,
-        _unwind: StackPopUnwind, // unwinding is not supported in consts
+        _unwind: mir::UnwindAction, // unwinding is not supported in consts
     ) -> InterpResult<'tcx, Option<(&'mir mir::Body<'tcx>, ty::Instance<'tcx>)>> {
         debug!("find_mir_or_eval_fn: {:?}", instance);
 
@@ -410,9 +424,9 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
             // Execution might have wandered off into other crates, so we cannot do a stability-
             // sensitive check here. But we can at least rule out functions that are not const
             // at all.
-            if !ecx.tcx.is_const_fn_raw(def.did) {
+            if !ecx.tcx.is_const_fn_raw(def) {
                 // allow calling functions inside a trait marked with #[const_trait].
-                if !ecx.tcx.is_const_default_method(def.did) {
+                if !ecx.tcx.is_const_default_method(def) {
                     // We certainly do *not* want to actually call the fn
                     // though, so be sure we return here.
                     throw_unsup_format!("calling non-const function `{}`", instance)
@@ -450,7 +464,7 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
         args: &[OpTy<'tcx>],
         dest: &PlaceTy<'tcx, Self::Provenance>,
         target: Option<mir::BasicBlock>,
-        _unwind: StackPopUnwind,
+        _unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx> {
         // Shared intrinsics.
         if ecx.emulate_intrinsic(instance, args, dest, target)? {
@@ -470,12 +484,17 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
                 ecx.write_scalar(Scalar::from_u8(cmp), dest)?;
             }
             sym::const_allocate => {
-                let size = ecx.read_scalar(&args[0])?.to_machine_usize(ecx)?;
-                let align = ecx.read_scalar(&args[1])?.to_machine_usize(ecx)?;
+                let size = ecx.read_scalar(&args[0])?.to_target_usize(ecx)?;
+                let align = ecx.read_scalar(&args[1])?.to_target_usize(ecx)?;
 
                 let align = match Align::from_bytes(align) {
                     Ok(a) => a,
-                    Err(err) => throw_ub_format!("align has to be a power of 2, {}", err),
+                    Err(err) => throw_ub_custom!(
+                        fluent::const_eval_invalid_align_details,
+                        name = "const_allocate",
+                        err_kind = err.diag_ident(),
+                        align = err.align()
+                    ),
                 };
 
                 let ptr = ecx.allocate_ptr(
@@ -487,13 +506,18 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
             }
             sym::const_deallocate => {
                 let ptr = ecx.read_pointer(&args[0])?;
-                let size = ecx.read_scalar(&args[1])?.to_machine_usize(ecx)?;
-                let align = ecx.read_scalar(&args[2])?.to_machine_usize(ecx)?;
+                let size = ecx.read_scalar(&args[1])?.to_target_usize(ecx)?;
+                let align = ecx.read_scalar(&args[2])?.to_target_usize(ecx)?;
 
                 let size = Size::from_bytes(size);
                 let align = match Align::from_bytes(align) {
                     Ok(a) => a,
-                    Err(err) => throw_ub_format!("align has to be a power of 2, {}", err),
+                    Err(err) => throw_ub_custom!(
+                        fluent::const_eval_invalid_align_details,
+                        name = "const_deallocate",
+                        err_kind = err.diag_ident(),
+                        align = err.align()
+                    ),
                 };
 
                 // If an allocation is created in an another const,
@@ -526,7 +550,7 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
     fn assert_panic(
         ecx: &mut InterpCx<'mir, 'tcx, Self>,
         msg: &AssertMessage<'tcx>,
-        _unwind: Option<mir::BasicBlock>,
+        _unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx> {
         use rustc_middle::mir::AssertKind::*;
         // Convert `AssertKind<Operand>` to `AssertKind<Scalar>`.
@@ -544,6 +568,12 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
             RemainderByZero(op) => RemainderByZero(eval_to_int(op)?),
             ResumedAfterReturn(generator_kind) => ResumedAfterReturn(*generator_kind),
             ResumedAfterPanic(generator_kind) => ResumedAfterPanic(*generator_kind),
+            MisalignedPointerDereference { ref required, ref found } => {
+                MisalignedPointerDereference {
+                    required: eval_to_int(required)?,
+                    found: eval_to_int(found)?,
+                }
+            }
         };
         Err(ConstEvalErrKind::AssertFailure(err).into())
     }
@@ -563,13 +593,54 @@ impl<'mir, 'tcx> interpret::Machine<'mir, 'tcx> for CompileTimeInterpreter<'mir,
 
     fn increment_const_eval_counter(ecx: &mut InterpCx<'mir, 'tcx, Self>) -> InterpResult<'tcx> {
         // The step limit has already been hit in a previous call to `increment_const_eval_counter`.
-        if ecx.machine.steps_remaining == 0 {
-            return Ok(());
-        }
 
-        ecx.machine.steps_remaining -= 1;
-        if ecx.machine.steps_remaining == 0 {
-            throw_exhaust!(StepLimitReached)
+        if let Some(new_steps) = ecx.machine.num_evaluated_steps.checked_add(1) {
+            let (limit, start) = if ecx.tcx.sess.opts.unstable_opts.tiny_const_eval_limit {
+                (TINY_LINT_TERMINATOR_LIMIT, TINY_LINT_TERMINATOR_LIMIT)
+            } else {
+                (LINT_TERMINATOR_LIMIT, PROGRESS_INDICATOR_START)
+            };
+
+            ecx.machine.num_evaluated_steps = new_steps;
+            // By default, we have a *deny* lint kicking in after some time
+            // to ensure `loop {}` doesn't just go forever.
+            // In case that lint got reduced, in particular for `--cap-lint` situations, we also
+            // have a hard warning shown every now and then for really long executions.
+            if new_steps == limit {
+                // By default, we stop after a million steps, but the user can disable this lint
+                // to be able to run until the heat death of the universe or power loss, whichever
+                // comes first.
+                let hir_id = ecx.best_lint_scope();
+                let is_error = ecx
+                    .tcx
+                    .lint_level_at_node(
+                        rustc_session::lint::builtin::LONG_RUNNING_CONST_EVAL,
+                        hir_id,
+                    )
+                    .0
+                    .is_error();
+                let span = ecx.cur_span();
+                ecx.tcx.emit_spanned_lint(
+                    rustc_session::lint::builtin::LONG_RUNNING_CONST_EVAL,
+                    hir_id,
+                    span,
+                    LongRunning { item_span: ecx.tcx.span },
+                );
+                // If this was a hard error, don't bother continuing evaluation.
+                if is_error {
+                    let guard = ecx
+                        .tcx
+                        .sess
+                        .delay_span_bug(span, "The deny lint should have already errored");
+                    throw_inval!(AlreadyReported(guard.into()));
+                }
+            } else if new_steps > start && new_steps.is_power_of_two() {
+                // Only report after a certain number of terminators have been evaluated and the
+                // current number of evaluated terminators is a power of 2. The latter gives us a cheap
+                // way to implement exponential backoff.
+                let span = ecx.cur_span();
+                ecx.tcx.sess.emit_warning(LongRunningWarn { span, item_span: ecx.tcx.span });
+            }
         }
 
         Ok(())

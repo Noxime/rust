@@ -9,6 +9,7 @@ https://doc.rust-lang.org/stable/rustc/platform-support/fuchsia.html#aarch64-unk
 
 import argparse
 from dataclasses import dataclass
+import fcntl
 import glob
 import hashlib
 import json
@@ -146,6 +147,9 @@ class TestEnvironment:
     def zxdb_script_path(self):
         return os.path.join(self.tmp_dir(), "zxdb_script")
 
+    def pm_lockfile_path(self):
+        return os.path.join(self.tmp_dir(), "pm.lock")
+
     def log_info(self, msg):
         print(msg)
 
@@ -164,85 +168,17 @@ class TestEnvironment:
     def ffx_isolate_dir(self):
         return os.path.join(self.tmp_dir(), "ffx_isolate")
 
-    def ffx_home_dir(self):
-        return os.path.join(self.ffx_isolate_dir(), "user-home")
+    def home_dir(self):
+        return os.path.join(self.tmp_dir(), "user-home")
 
-    def ffx_tmp_dir(self):
-        return os.path.join(self.ffx_isolate_dir(), "tmp")
-
-    def ffx_log_dir(self):
-        return os.path.join(self.ffx_isolate_dir(), "log")
-
-    def ffx_user_config_dir(self):
-        return os.path.join(self.ffx_xdg_config_home(), "Fuchsia", "ffx", "config")
-
-    def ffx_user_config_path(self):
-        return os.path.join(self.ffx_user_config_dir(), "config.json")
-
-    def ffx_xdg_config_home(self):
-        if platform.system() == "Darwin":
-            return os.path.join(self.ffx_home_dir(), "Library", "Preferences")
-        return os.path.join(self.ffx_home_dir(), ".local", "share")
-
-    def ffx_ascendd_path(self):
-        return os.path.join(self.ffx_tmp_dir(), "ascendd")
 
     def start_ffx_isolation(self):
         # Most of this is translated directly from ffx's isolate library
         os.mkdir(self.ffx_isolate_dir())
-        os.mkdir(self.ffx_home_dir())
-        os.mkdir(self.ffx_tmp_dir())
-        os.mkdir(self.ffx_log_dir())
+        os.mkdir(self.home_dir())
 
-        fuchsia_dir = os.path.join(self.ffx_home_dir(), ".fuchsia")
-        os.mkdir(fuchsia_dir)
-
-        fuchsia_debug_dir = os.path.join(fuchsia_dir, "debug")
-        os.mkdir(fuchsia_debug_dir)
-
-        metrics_dir = os.path.join(fuchsia_dir, "metrics")
-        os.mkdir(metrics_dir)
-
-        analytics_path = os.path.join(metrics_dir, "analytics-status")
-        with open(analytics_path, "w", encoding="utf-8") as analytics_file:
-            print("0", file=analytics_file)
-
-        ffx_path = os.path.join(metrics_dir, "ffx")
-        with open(ffx_path, "w", encoding="utf-8") as ffx_file:
-            print("1", file=ffx_file)
-
-        os.makedirs(self.ffx_user_config_dir())
-
-        with open(
-            self.ffx_user_config_path(), "w", encoding="utf-8"
-        ) as config_json_file:
-            user_config_for_test = {
-                "log": {
-                    "enabled": True,
-                    "dir": self.ffx_log_dir(),
-                },
-                "overnet": {
-                    "socket": self.ffx_ascendd_path(),
-                },
-                "ssh": {
-                    "pub": self.ssh_authfile_path(),
-                    "priv": self.ssh_keyfile_path(),
-                },
-                "test": {
-                    "is_isolated": True,
-                    "experimental_structured_output": True,
-                },
-            }
-            print(json.dumps(user_config_for_test), file=config_json_file)
-
-        ffx_env_path = os.path.join(self.ffx_user_config_dir(), ".ffx_env")
-        with open(ffx_env_path, "w", encoding="utf-8") as ffx_env_file:
-            ffx_env_config_for_test = {
-                "user": self.ffx_user_config_path(),
-                "build": None,
-                "global": None,
-            }
-            print(json.dumps(ffx_env_config_for_test), file=ffx_env_file)
+        ffx_path = self.tool_path("ffx")
+        ffx_env = self.ffx_cmd_env()
 
         # Start ffx daemon
         # We want this to be a long-running process that persists after the script finishes
@@ -252,23 +188,54 @@ class TestEnvironment:
         ) as ffx_daemon_log_file:
             subprocess.Popen(
                 [
-                    self.tool_path("ffx"),
-                    "--config",
-                    self.ffx_user_config_path(),
+                    ffx_path,
                     "daemon",
                     "start",
                 ],
-                env=self.ffx_cmd_env(),
+                env=ffx_env,
                 stdout=ffx_daemon_log_file,
                 stderr=ffx_daemon_log_file,
             )
 
+        # Disable analytics
+        subprocess.check_call(
+            [
+                ffx_path,
+                "config",
+                "analytics",
+                "disable",
+            ],
+            env=ffx_env,
+            stdout=self.subprocess_output(),
+            stderr=self.subprocess_output(),
+        )
+
+        # Set configs
+        configs = {
+            "log.enabled": "true",
+            "ssh.pub": self.ssh_authfile_path(),
+            "ssh.priv": self.ssh_keyfile_path(),
+            "test.is_isolated": "true",
+            "test.experimental_structured_output": "true",
+        }
+        for key, value in configs.items():
+            subprocess.check_call(
+                [
+                    self.tool_path("ffx"),
+                    "config",
+                    "set",
+                    key,
+                    value,
+                ],
+                env=self.ffx_cmd_env(),
+                stdout=self.subprocess_output(),
+                stderr=self.subprocess_output(),
+            )
+
     def ffx_cmd_env(self):
-        result = {
-            "HOME": self.ffx_home_dir(),
-            "XDG_CONFIG_HOME": self.ffx_xdg_config_home(),
-            "ASCENDD": self.ffx_ascendd_path(),
-            "FUCHSIA_SSH_KEY": self.ssh_keyfile_path(),
+        return {
+            "HOME": self.home_dir(),
+            "FFX_ISOLATE_DIR": self.ffx_isolate_dir(),
             # We want to use our own specified temp directory
             "TMP": self.tmp_dir(),
             "TEMP": self.tmp_dir(),
@@ -276,14 +243,10 @@ class TestEnvironment:
             "TEMPDIR": self.tmp_dir(),
         }
 
-        return result
-
     def stop_ffx_isolation(self):
         subprocess.check_call(
             [
                 self.tool_path("ffx"),
-                "--config",
-                self.ffx_user_config_path(),
                 "daemon",
                 "stop",
             ],
@@ -460,6 +423,9 @@ class TestEnvironment:
             stderr=self.subprocess_output(),
         )
 
+        # Create lockfiles
+        open(self.pm_lockfile_path(), 'a').close()
+
         # Write to file
         self.write_to_file()
 
@@ -507,9 +473,8 @@ class TestEnvironment:
     bin/{exe_name}={bin_path}
     lib/{libstd_name}={rust_dir}/lib/rustlib/{rustlib_dir}/lib/{libstd_name}
     lib/{libtest_name}={rust_dir}/lib/rustlib/{rustlib_dir}/lib/{libtest_name}
-    lib/ld.so.1={sdk_dir}/arch/{target_arch}/sysroot/lib/libc.so
-    lib/libzircon.so={sdk_dir}/arch/{target_arch}/sysroot/lib/libzircon.so
-    lib/libfdio.so={sdk_dir}/arch/{target_arch}/lib/libfdio.so
+    lib/ld.so.1={sdk_dir}/arch/{target_arch}/sysroot/dist/lib/ld.so.1
+    lib/libfdio.so={sdk_dir}/arch/{target_arch}/dist/libfdio.so
     """
 
     TEST_ENV_VARS: ClassVar[List[str]] = [
@@ -677,19 +642,25 @@ class TestEnvironment:
             log("Publishing package to repo...")
 
             # Publish package to repo
-            subprocess.check_call(
-                [
-                    self.tool_path("pm"),
-                    "publish",
-                    "-a",
-                    "-repo",
-                    self.repo_dir(),
-                    "-f",
-                    far_path,
-                ],
-                stdout=log_file,
-                stderr=log_file,
-            )
+            with open(self.pm_lockfile_path(), 'w') as pm_lockfile:
+                fcntl.lockf(pm_lockfile.fileno(), fcntl.LOCK_EX)
+                subprocess.check_call(
+                    [
+                        self.tool_path("pm"),
+                        "publish",
+                        "-a",
+                        "-repo",
+                        self.repo_dir(),
+                        "-f",
+                        far_path,
+                    ],
+                    stdout=log_file,
+                    stderr=log_file,
+                )
+                # This lock should be released automatically when the pm
+                # lockfile is closed, but we'll be polite and unlock it now
+                # since the spec leaves some wiggle room.
+                fcntl.lockf(pm_lockfile.fileno(), fcntl.LOCK_UN)
 
             log("Running ffx test...")
 
@@ -697,8 +668,6 @@ class TestEnvironment:
             subprocess.run(
                 [
                     self.tool_path("ffx"),
-                    "--config",
-                    self.ffx_user_config_path(),
                     "test",
                     "run",
                     f"fuchsia-pkg://{self.TEST_REPO_NAME}/{package_name}#meta/{package_name}.cm",
@@ -837,30 +806,39 @@ class TestEnvironment:
     def debug(self, args):
         command = [
             self.tool_path("ffx"),
-            "--config",
-            self.ffx_user_config_path(),
             "debug",
             "connect",
             "--",
             "--build-id-dir",
             os.path.join(self.sdk_dir, ".build-id"),
-            "--build-id-dir",
-            os.path.join(self.libs_dir(), ".build-id"),
         ]
 
-        # Add rust source if it's available
-        if args.rust_src is not None:
+        libs_build_id_path = os.path.join(self.libs_dir(), ".build-id")
+        if os.path.exists(libs_build_id_path):
+            # Add .build-id symbols if installed libs have been stripped into a
+            # .build-id directory
             command += [
-                "--build-dir",
-                args.rust_src,
+                "--build-id-dir",
+                libs_build_id_path,
+            ]
+        else:
+            # If no .build-id directory is detected, then assume that the shared
+            # libs contain their debug symbols
+            command += [
+                f"--symbol-path={self.rust_dir}/lib/rustlib/{self.target}/lib",
             ]
 
+        # Add rust source if it's available
+        rust_src_map = None
+        if args.rust_src is not None:
+            # This matches the remapped prefix used by compiletest. There's no
+            # clear way that we can determine this, so it's hard coded.
+            rust_src_map = f"/rustc/FAKE_PREFIX={args.rust_src}"
+
         # Add fuchsia source if it's available
+        fuchsia_src_map = None
         if args.fuchsia_src is not None:
-            command += [
-                "--build-dir",
-                os.path.join(args.fuchsia_src, "out", "default"),
-            ]
+            fuchsia_src_map = f"./../..={args.fuchsia_src}"
 
         # Load debug symbols for the test binary and automatically attach
         if args.test is not None:
@@ -883,7 +861,28 @@ class TestEnvironment:
                 test_name,
             )
 
+            # The fake-test-src-base directory maps to the suite directory
+            # e.g. tests/ui/foo.rs has a path of rust/fake-test-src-base/foo.rs
+            fake_test_src_base = os.path.join(
+                args.rust_src,
+                "fake-test-src-base",
+            )
+            real_test_src_base = os.path.join(
+                args.rust_src,
+                "tests",
+                args.test.split(os.path.sep)[0],
+            )
+            test_src_map = f"{fake_test_src_base}={real_test_src_base}"
+
             with open(self.zxdb_script_path(), mode="w", encoding="utf-8") as f:
+                print(f"set source-map += {test_src_map}", file=f)
+
+                if rust_src_map is not None:
+                    print(f"set source-map += {rust_src_map}", file=f)
+
+                if fuchsia_src_map is not None:
+                    print(f"set source-map += {fuchsia_src_map}", file=f)
+
                 print(f"attach {test_name[:31]}", file=f)
 
             command += [
@@ -899,6 +898,18 @@ class TestEnvironment:
 
         # Connect to the running emulator with zxdb
         subprocess.run(command, env=self.ffx_cmd_env(), check=False)
+
+    def syslog(self, args):
+        subprocess.run(
+            [
+                self.tool_path("ffx"),
+                "log",
+                "--since",
+                "now",
+            ],
+            env=self.ffx_cmd_env(),
+            check=False,
+        )
 
 
 def start(args):
@@ -930,6 +941,12 @@ def delete_tmp(args):
 def debug(args):
     test_env = TestEnvironment.read_from_file()
     test_env.debug(args)
+    return 0
+
+
+def syslog(args):
+    test_env = TestEnvironment.read_from_file()
+    test_env.syslog(args)
     return 0
 
 
@@ -1027,6 +1044,11 @@ def main():
         help="any additional arguments to pass to zxdb",
     )
     debug_parser.set_defaults(func=debug)
+
+    syslog_parser = subparsers.add_parser(
+        "syslog", help="prints the device syslog"
+    )
+    syslog_parser.set_defaults(func=syslog)
 
     args = parser.parse_args()
     return args.func(args)

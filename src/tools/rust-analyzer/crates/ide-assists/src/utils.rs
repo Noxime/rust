@@ -9,8 +9,8 @@ use stdx::format_to;
 use syntax::{
     ast::{
         self,
-        edit::{self, AstNodeEdit},
-        edit_in_place::{AttrsOwnerEdit, Removable},
+        edit::{AstNodeEdit, IndentLevel},
+        edit_in_place::{AttrsOwnerEdit, Indent, Removable},
         make, HasArgList, HasAttrs, HasGenericParams, HasName, HasTypeBounds, Whitespace,
     },
     ted, AstNode, AstToken, Direction, SourceFile,
@@ -139,9 +139,11 @@ pub fn add_trait_assoc_items_to_impl(
 
     let transform = PathTransform::trait_impl(&target_scope, &source_scope, trait_, impl_.clone());
 
+    let new_indent_level = IndentLevel::from_node(impl_.syntax()) + 1;
     let items = items.into_iter().map(|assoc_item| {
         transform.apply(assoc_item.syntax());
         assoc_item.remove_attrs_and_docs();
+        assoc_item.reindent_to(new_indent_level);
         assoc_item
     });
 
@@ -153,8 +155,10 @@ pub fn add_trait_assoc_items_to_impl(
         first_item.get_or_insert_with(|| item.clone());
         match &item {
             ast::AssocItem::Fn(fn_) if fn_.body().is_none() => {
-                let body = make::block_expr(None, Some(make::ext::expr_todo()))
-                    .indent(edit::IndentLevel(1));
+                let body = AstNodeEdit::indent(
+                    &make::block_expr(None, Some(make::ext::expr_todo())),
+                    new_indent_level,
+                );
                 ted::replace(fn_.get_or_create_body().syntax(), body.clone_for_update().syntax())
             }
             ast::AssocItem::TypeAlias(type_alias) => {
@@ -206,23 +210,6 @@ pub(crate) fn render_snippet(_cap: SnippetCap, node: &SyntaxNode, cursor: Cursor
         stdx::replace(buf, '}', r"\}");
         stdx::replace(buf, '$', r"\$");
     }
-}
-
-/// Escapes text that should be rendered as-is, typically those that we're copy-pasting what the
-/// users wrote.
-///
-/// This function should only be used when the text doesn't contain snippet **AND** the text
-/// wouldn't be included in a snippet.
-pub(crate) fn escape_non_snippet(text: &mut String) {
-    // While we *can* escape `}`, we don't really have to in this specific case. We only need to
-    // escape it inside `${}` to disambiguate it from the ending token of the syntax, but after we
-    // escape every occurrence of `$`, we wouldn't have `${}` in the first place.
-    //
-    // This will break if the text contains snippet or it will be included in a snippet (hence doc
-    // comment). Compare `fn escape(buf)` in `render_snippet()` above, where the escaped text is
-    // included in a snippet.
-    stdx::replace(text, '\\', r"\\");
-    stdx::replace(text, '$', r"\$");
 }
 
 pub(crate) fn vis_offset(node: &SyntaxNode) -> TextSize {
@@ -355,7 +342,12 @@ fn calc_depth(pat: &ast::Pat, depth: usize) -> usize {
 
 /// `find_struct_impl` looks for impl of a struct, but this also has additional feature
 /// where it takes a list of function names and check if they exist inside impl_, if
-/// even one match is found, it returns None
+/// even one match is found, it returns None.
+///
+/// That means this function can have 3 potential return values:
+///  - `None`: an impl exists, but one of the function names within the impl matches one of the provided names.
+///  - `Some(None)`: no impl exists.
+///  - `Some(Some(_))`: an impl exists, with no matching function names.
 pub(crate) fn find_struct_impl(
     ctx: &AssistContext<'_>,
     adt: &ast::Adt,
@@ -757,4 +749,25 @@ pub(crate) fn convert_param_list_to_arg_list(list: ast::ParamList) -> ast::ArgLi
         }
     }
     make::arg_list(args)
+}
+
+/// Calculate the number of hashes required for a raw string containing `s`
+pub(crate) fn required_hashes(s: &str) -> usize {
+    let mut res = 0usize;
+    for idx in s.match_indices('"').map(|(i, _)| i) {
+        let (_, sub) = s.split_at(idx + 1);
+        let n_hashes = sub.chars().take_while(|c| *c == '#').count();
+        res = res.max(n_hashes + 1)
+    }
+    res
+}
+#[test]
+fn test_required_hashes() {
+    assert_eq!(0, required_hashes("abc"));
+    assert_eq!(0, required_hashes("###"));
+    assert_eq!(1, required_hashes("\""));
+    assert_eq!(2, required_hashes("\"#abc"));
+    assert_eq!(0, required_hashes("#abc"));
+    assert_eq!(3, required_hashes("#ab\"##c"));
+    assert_eq!(5, required_hashes("#ab\"##\"####c"));
 }

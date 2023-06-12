@@ -35,19 +35,19 @@ use std::ops::Index;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, TyDecodable, TyEncodable)]
 #[derive(HashStable, TypeFoldable, TypeVisitable, Lift)]
 pub struct Canonical<'tcx, V> {
+    pub value: V,
     pub max_universe: ty::UniverseIndex,
     pub variables: CanonicalVarInfos<'tcx>,
-    pub value: V,
 }
 
 pub type CanonicalVarInfos<'tcx> = &'tcx List<CanonicalVarInfo<'tcx>>;
 
-impl<'tcx> ty::TypeFoldable<'tcx> for CanonicalVarInfos<'tcx> {
-    fn try_fold_with<F: ty::FallibleTypeFolder<'tcx>>(
+impl<'tcx> ty::TypeFoldable<TyCtxt<'tcx>> for CanonicalVarInfos<'tcx> {
+    fn try_fold_with<F: ty::FallibleTypeFolder<TyCtxt<'tcx>>>(
         self,
         folder: &mut F,
     ) -> Result<Self, F::Error> {
-        ty::util::fold_list(self, folder, |tcx, v| tcx.intern_canonical_var_infos(v))
+        ty::util::fold_list(self, folder, |tcx, v| tcx.mk_canonical_var_infos(v))
     }
 }
 
@@ -72,6 +72,18 @@ impl CanonicalVarValues<'_> {
             ty::GenericArgKind::Lifetime(r) => {
                 matches!(*r, ty::ReLateBound(ty::INNERMOST, br) if br.var.as_usize() == bv)
             }
+            ty::GenericArgKind::Type(ty) => {
+                matches!(*ty.kind(), ty::Bound(ty::INNERMOST, bt) if bt.var.as_usize() == bv)
+            }
+            ty::GenericArgKind::Const(ct) => {
+                matches!(ct.kind(), ty::ConstKind::Bound(ty::INNERMOST, bc) if bc.as_usize() == bv)
+            }
+        })
+    }
+
+    pub fn is_identity_modulo_regions(&self) -> bool {
+        self.var_values.iter().enumerate().all(|(bv, arg)| match arg.unpack() {
+            ty::GenericArgKind::Lifetime(_) => true,
             ty::GenericArgKind::Type(ty) => {
                 matches!(*ty.kind(), ty::Bound(ty::INNERMOST, bt) if bt.var.as_usize() == bv)
             }
@@ -123,6 +135,11 @@ impl<'tcx> CanonicalVarInfo<'tcx> {
         self.kind.universe()
     }
 
+    #[must_use]
+    pub fn with_updated_universe(self, ui: ty::UniverseIndex) -> CanonicalVarInfo<'tcx> {
+        CanonicalVarInfo { kind: self.kind.with_updated_universe(ui) }
+    }
+
     pub fn is_existential(&self) -> bool {
         match self.kind {
             CanonicalVarKind::Ty(_) => true,
@@ -131,6 +148,28 @@ impl<'tcx> CanonicalVarInfo<'tcx> {
             CanonicalVarKind::PlaceholderRegion(..) => false,
             CanonicalVarKind::Const(..) => true,
             CanonicalVarKind::PlaceholderConst(_, _) => false,
+        }
+    }
+
+    pub fn is_region(&self) -> bool {
+        match self.kind {
+            CanonicalVarKind::Region(_) | CanonicalVarKind::PlaceholderRegion(_) => true,
+            CanonicalVarKind::Ty(_)
+            | CanonicalVarKind::PlaceholderTy(_)
+            | CanonicalVarKind::Const(_, _)
+            | CanonicalVarKind::PlaceholderConst(_, _) => false,
+        }
+    }
+
+    pub fn expect_placeholder_index(self) -> usize {
+        match self.kind {
+            CanonicalVarKind::Ty(_)
+            | CanonicalVarKind::Region(_)
+            | CanonicalVarKind::Const(_, _) => bug!("expected placeholder: {self:?}"),
+
+            CanonicalVarKind::PlaceholderRegion(placeholder) => placeholder.bound.var.as_usize(),
+            CanonicalVarKind::PlaceholderTy(placeholder) => placeholder.bound.var.as_usize(),
+            CanonicalVarKind::PlaceholderConst(placeholder, _) => placeholder.bound.as_usize(),
         }
     }
 }
@@ -177,6 +216,38 @@ impl<'tcx> CanonicalVarKind<'tcx> {
             CanonicalVarKind::PlaceholderConst(placeholder, _) => placeholder.universe,
         }
     }
+
+    /// Replaces the universe of this canonical variable with `ui`.
+    ///
+    /// In case this is a float or int variable, this causes an ICE if
+    /// the updated universe is not the root.
+    pub fn with_updated_universe(self, ui: ty::UniverseIndex) -> CanonicalVarKind<'tcx> {
+        match self {
+            CanonicalVarKind::Ty(kind) => match kind {
+                CanonicalTyVarKind::General(_) => {
+                    CanonicalVarKind::Ty(CanonicalTyVarKind::General(ui))
+                }
+                CanonicalTyVarKind::Int | CanonicalTyVarKind::Float => {
+                    assert_eq!(ui, ty::UniverseIndex::ROOT);
+                    CanonicalVarKind::Ty(kind)
+                }
+            },
+            CanonicalVarKind::PlaceholderTy(placeholder) => {
+                CanonicalVarKind::PlaceholderTy(ty::Placeholder { universe: ui, ..placeholder })
+            }
+            CanonicalVarKind::Region(_) => CanonicalVarKind::Region(ui),
+            CanonicalVarKind::PlaceholderRegion(placeholder) => {
+                CanonicalVarKind::PlaceholderRegion(ty::Placeholder { universe: ui, ..placeholder })
+            }
+            CanonicalVarKind::Const(_, ty) => CanonicalVarKind::Const(ui, ty),
+            CanonicalVarKind::PlaceholderConst(placeholder, ty) => {
+                CanonicalVarKind::PlaceholderConst(
+                    ty::Placeholder { universe: ui, ..placeholder },
+                    ty,
+                )
+            }
+        }
+    }
 }
 
 /// Rust actually has more than one category of type variables;
@@ -209,11 +280,12 @@ pub struct QueryResponse<'tcx, R> {
     /// should get its hidden type inferred. So we bubble the opaque type
     /// and the type it was compared against upwards and let the query caller
     /// handle it.
-    pub opaque_types: Vec<(Ty<'tcx>, Ty<'tcx>)>,
+    pub opaque_types: Vec<(ty::OpaqueTypeKey<'tcx>, Ty<'tcx>)>,
     pub value: R,
 }
 
-#[derive(Clone, Debug, Default, HashStable, TypeFoldable, TypeVisitable, Lift)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(HashStable, TypeFoldable, TypeVisitable, Lift)]
 pub struct QueryRegionConstraints<'tcx> {
     pub outlives: Vec<QueryOutlivesConstraint<'tcx>>,
     pub member_constraints: Vec<MemberConstraint<'tcx>>,
@@ -276,14 +348,6 @@ impl<'tcx, R> Canonical<'tcx, QueryResponse<'tcx, R>> {
     }
 }
 
-impl<'tcx, R> Canonical<'tcx, ty::ParamEnvAnd<'tcx, R>> {
-    #[inline]
-    pub fn without_const(mut self) -> Self {
-        self.value = self.value.without_const();
-        self
-    }
-}
-
 impl<'tcx, V> Canonical<'tcx, V> {
     /// Allows you to map the `value` of a canonical while keeping the
     /// same set of bound variables.
@@ -324,16 +388,12 @@ impl<'tcx, V> Canonical<'tcx, V> {
     }
 }
 
-pub type QueryOutlivesConstraint<'tcx> = (
-    ty::Binder<'tcx, ty::OutlivesPredicate<GenericArg<'tcx>, Region<'tcx>>>,
-    ConstraintCategory<'tcx>,
-);
+pub type QueryOutlivesConstraint<'tcx> =
+    (ty::OutlivesPredicate<GenericArg<'tcx>, Region<'tcx>>, ConstraintCategory<'tcx>);
 
 TrivialTypeTraversalAndLiftImpls! {
-    for <'tcx> {
-        crate::infer::canonical::Certainty,
-        crate::infer::canonical::CanonicalTyVarKind,
-    }
+    crate::infer::canonical::Certainty,
+    crate::infer::canonical::CanonicalTyVarKind,
 }
 
 impl<'tcx> CanonicalVarValues<'tcx> {
@@ -344,18 +404,18 @@ impl<'tcx> CanonicalVarValues<'tcx> {
         infos: CanonicalVarInfos<'tcx>,
     ) -> CanonicalVarValues<'tcx> {
         CanonicalVarValues {
-            var_values: tcx.mk_substs(infos.iter().enumerate().map(
+            var_values: tcx.mk_substs_from_iter(infos.iter().enumerate().map(
                 |(i, info)| -> ty::GenericArg<'tcx> {
                     match info.kind {
-                        CanonicalVarKind::Ty(_) | CanonicalVarKind::PlaceholderTy(_) => tcx
-                            .mk_ty(ty::Bound(ty::INNERMOST, ty::BoundVar::from_usize(i).into()))
-                            .into(),
+                        CanonicalVarKind::Ty(_) | CanonicalVarKind::PlaceholderTy(_) => {
+                            tcx.mk_bound(ty::INNERMOST, ty::BoundVar::from_usize(i).into()).into()
+                        }
                         CanonicalVarKind::Region(_) | CanonicalVarKind::PlaceholderRegion(_) => {
                             let br = ty::BoundRegion {
                                 var: ty::BoundVar::from_usize(i),
-                                kind: ty::BrAnon(i as u32, None),
+                                kind: ty::BrAnon(None),
                             };
-                            tcx.mk_region(ty::ReLateBound(ty::INNERMOST, br)).into()
+                            ty::Region::new_late_bound(tcx, ty::INNERMOST, br).into()
                         }
                         CanonicalVarKind::Const(_, ty)
                         | CanonicalVarKind::PlaceholderConst(_, ty) => tcx

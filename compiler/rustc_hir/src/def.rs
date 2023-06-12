@@ -2,6 +2,8 @@ use crate::hir;
 
 use rustc_ast as ast;
 use rustc_ast::NodeId;
+use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::stable_hasher::ToStableHashKey;
 use rustc_macros::HashStable_Generic;
 use rustc_span::def_id::{DefId, LocalDefId};
 use rustc_span::hygiene::MacroKind;
@@ -114,12 +116,19 @@ pub enum DefKind {
     LifetimeParam,
     /// A use of `global_asm!`.
     GlobalAsm,
-    Impl,
+    Impl {
+        of_trait: bool,
+    },
     Closure,
     Generator,
 }
 
 impl DefKind {
+    /// Get an English description for the item's kind.
+    ///
+    /// If you have access to `TyCtxt`, use `TyCtxt::def_descr` or
+    /// `TyCtxt::def_kind_descr` instead, because they give better
+    /// information for generators and associated functions.
     pub fn descr(self, def_id: DefId) -> &'static str {
         match self {
             DefKind::Fn => "function",
@@ -153,7 +162,7 @@ impl DefKind {
             DefKind::AnonConst => "constant expression",
             DefKind::InlineConst => "inline constant",
             DefKind::Field => "field",
-            DefKind::Impl => "implementation",
+            DefKind::Impl { .. } => "implementation",
             DefKind::Closure => "closure",
             DefKind::Generator => "generator",
             DefKind::ExternCrate => "extern crate",
@@ -162,6 +171,10 @@ impl DefKind {
     }
 
     /// Gets an English article for the definition.
+    ///
+    /// If you have access to `TyCtxt`, use `TyCtxt::def_descr_article` or
+    /// `TyCtxt::def_kind_descr_article` instead, because they give better
+    /// information for generators and associated functions.
     pub fn article(&self) -> &'static str {
         match *self {
             DefKind::AssocTy
@@ -169,7 +182,7 @@ impl DefKind {
             | DefKind::AssocFn
             | DefKind::Enum
             | DefKind::OpaqueTy
-            | DefKind::Impl
+            | DefKind::Impl { .. }
             | DefKind::Use
             | DefKind::InlineConst
             | DefKind::ExternCrate => "an",
@@ -214,17 +227,14 @@ impl DefKind {
             | DefKind::Use
             | DefKind::ForeignMod
             | DefKind::GlobalAsm
-            | DefKind::Impl
+            | DefKind::Impl { .. }
             | DefKind::ImplTraitPlaceholder => None,
         }
     }
 
     #[inline]
     pub fn is_fn_like(self) -> bool {
-        match self {
-            DefKind::Fn | DefKind::AssocFn | DefKind::Closure | DefKind::Generator => true,
-            _ => false,
-        }
+        matches!(self, DefKind::Fn | DefKind::AssocFn | DefKind::Closure | DefKind::Generator)
     }
 
     /// Whether `query get_codegen_attrs` should be used with this definition.
@@ -253,7 +263,7 @@ impl DefKind {
             | DefKind::ForeignMod
             | DefKind::OpaqueTy
             | DefKind::ImplTraitPlaceholder
-            | DefKind::Impl
+            | DefKind::Impl { .. }
             | DefKind::Field
             | DefKind::TyParam
             | DefKind::ConstParam
@@ -472,7 +482,8 @@ impl PartialRes {
 
 /// Different kinds of symbols can coexist even if they share the same textual name.
 /// Therefore, they each have a separate universe (known as a "namespace").
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Encodable, Decodable)]
+#[derive(HashStable_Generic)]
 pub enum Namespace {
     /// The type namespace includes `struct`s, `enum`s, `union`s, `trait`s, and `mod`s
     /// (and, by extension, crates).
@@ -496,6 +507,15 @@ impl Namespace {
             Self::ValueNS => "value",
             Self::MacroNS => "macro",
         }
+    }
+}
+
+impl<CTX: crate::HashStableContext> ToStableHashKey<CTX> for Namespace {
+    type KeyType = Namespace;
+
+    #[inline]
+    fn to_stable_hash_key(&self, _: &CTX) -> Namespace {
+        *self
     }
 }
 
@@ -760,3 +780,5 @@ pub enum LifetimeRes {
     /// HACK: This is used to recover the NodeId of an elided lifetime.
     ElidedAnchor { start: NodeId, end: NodeId },
 }
+
+pub type DocLinkResMap = FxHashMap<(Symbol, Namespace), Option<Res<NodeId>>>;

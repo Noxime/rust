@@ -321,7 +321,6 @@ impl<'a, 'tcx> Visitor<'tcx> for SigDropHelper<'a, 'tcx> {
                     self.has_significant_drop = true;
                 }
             }
-            ExprKind::Box(..) |
             ExprKind::Array(..) |
             ExprKind::Call(..) |
             ExprKind::Unary(..) |
@@ -341,8 +340,9 @@ impl<'a, 'tcx> Visitor<'tcx> for SigDropHelper<'a, 'tcx> {
             ExprKind::ConstBlock(_) |
             ExprKind::Continue(_) |
             ExprKind::DropTemps(_) |
-            ExprKind::Err |
+            ExprKind::Err(_) |
             ExprKind::InlineAsm(_) |
+            ExprKind::OffsetOf(_, _) |
             ExprKind::Let(_) |
             ExprKind::Lit(_) |
             ExprKind::Loop(_, _, _, _) |

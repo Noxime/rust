@@ -54,7 +54,9 @@ impl<'tcx> ExplicitPredicatesMap<'tcx> {
 
                     ty::PredicateKind::Clause(ty::Clause::Trait(..))
                     | ty::PredicateKind::Clause(ty::Clause::Projection(..))
+                    | ty::PredicateKind::Clause(ty::Clause::ConstArgHasType(..))
                     | ty::PredicateKind::WellFormed(..)
+                    | ty::PredicateKind::AliasRelate(..)
                     | ty::PredicateKind::ObjectSafe(..)
                     | ty::PredicateKind::ClosureKind(..)
                     | ty::PredicateKind::Subtype(..)
@@ -66,7 +68,7 @@ impl<'tcx> ExplicitPredicatesMap<'tcx> {
                 }
             }
 
-            ty::EarlyBinder(required_predicates)
+            ty::EarlyBinder::bind(required_predicates)
         })
     }
 }

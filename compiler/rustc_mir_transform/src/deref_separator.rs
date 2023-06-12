@@ -1,5 +1,5 @@
 use crate::MirPass;
-use rustc_index::vec::IndexVec;
+use rustc_index::IndexVec;
 use rustc_middle::mir::patch::MirPatch;
 use rustc_middle::mir::visit::NonUseContext::VarDebugInfo;
 use rustc_middle::mir::visit::{MutVisitor, PlaceContext};
@@ -40,7 +40,7 @@ impl<'tcx> MutVisitor<'tcx> for DerefChecker<'tcx> {
                     let temp = self.patcher.new_internal_with_info(
                         ty,
                         self.local_decls[p_ref.local].source_info.span,
-                        Some(Box::new(LocalInfo::DerefTemp)),
+                        LocalInfo::DerefTemp,
                     );
 
                     // We are adding current p_ref's projections to our

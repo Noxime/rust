@@ -9,7 +9,7 @@ use rustc_hir as hir;
 use rustc_middle::ty::{ParamEnv, TyCtxt};
 use rustc_middle::{
     hir::place::{PlaceBase, Projection, ProjectionKind},
-    ty::TypeVisitable,
+    ty::TypeVisitableExt,
 };
 
 pub(super) fn find_consumed_and_borrowed<'a, 'tcx>(
@@ -202,10 +202,10 @@ impl<'tcx> expr_use_visitor::Delegate<'tcx> for ExprUseDelegate<'tcx> {
         // If the type being assigned needs dropped, then the mutation counts as a borrow
         // since it is essentially doing `Drop::drop(&mut x); x = new_value;`.
         let ty = self.tcx.erase_regions(assignee_place.place.base_ty);
-        if ty.needs_infer() {
+        if ty.has_infer() {
             self.tcx.sess.delay_span_bug(
                 self.tcx.hir().span(assignee_place.hir_id),
-                &format!("inference variables in {ty}"),
+                format!("inference variables in {ty}"),
             );
         } else if ty.needs_drop(self.tcx, self.param_env) {
             self.places

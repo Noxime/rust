@@ -1,5 +1,5 @@
 use crate::ty::context::TyCtxt;
-use crate::ty::{self, DefId, DefIdTree, ParamEnv, Ty};
+use crate::ty::{self, DefId, ParamEnv, Ty};
 
 /// Represents whether some type is inhabited in a given context.
 /// Examples of uninhabited types are `!`, `enum Void {}`, or a struct
@@ -57,7 +57,7 @@ impl<'tcx> InhabitedPredicate<'tcx> {
         match self {
             Self::False => Ok(false),
             Self::True => Ok(true),
-            Self::ConstIsZero(const_) => match const_.try_eval_usize(tcx, param_env) {
+            Self::ConstIsZero(const_) => match const_.try_eval_target_usize(tcx, param_env) {
                 None | Some(0) => Ok(true),
                 Some(1..) => Ok(false),
             },
@@ -158,8 +158,8 @@ impl<'tcx> InhabitedPredicate<'tcx> {
     fn subst_opt(self, tcx: TyCtxt<'tcx>, substs: ty::SubstsRef<'tcx>) -> Option<Self> {
         match self {
             Self::ConstIsZero(c) => {
-                let c = ty::EarlyBinder(c).subst(tcx, substs);
-                let pred = match c.kind().try_to_machine_usize(tcx) {
+                let c = ty::EarlyBinder::bind(c).subst(tcx, substs);
+                let pred = match c.kind().try_to_target_usize(tcx) {
                     Some(0) => Self::True,
                     Some(1..) => Self::False,
                     None => Self::ConstIsZero(c),
@@ -167,7 +167,7 @@ impl<'tcx> InhabitedPredicate<'tcx> {
                 Some(pred)
             }
             Self::GenericType(t) => {
-                Some(ty::EarlyBinder(t).subst(tcx, substs).inhabited_predicate(tcx))
+                Some(ty::EarlyBinder::bind(t).subst(tcx, substs).inhabited_predicate(tcx))
             }
             Self::And(&[a, b]) => match a.subst_opt(tcx, substs) {
                 None => b.subst_opt(tcx, substs).map(|b| a.and(tcx, b)),

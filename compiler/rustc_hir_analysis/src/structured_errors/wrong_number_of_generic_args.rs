@@ -395,7 +395,7 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
     ) -> String {
         let fn_sig = self.tcx.hir().get_if_local(self.def_id).and_then(hir::Node::fn_sig);
         let is_used_in_input = |def_id| {
-            fn_sig.map_or(false, |fn_sig| {
+            fn_sig.is_some_and(|fn_sig| {
                 fn_sig.decl.inputs.iter().any(|ty| match ty.kind {
                     hir::TyKind::Path(hir::QPath::Resolved(
                         None,
@@ -423,7 +423,7 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
 
     fn get_unbound_associated_types(&self) -> Vec<String> {
         if self.tcx.is_trait(self.def_id) {
-            let items: &AssocItems<'_> = self.tcx.associated_items(self.def_id);
+            let items: &AssocItems = self.tcx.associated_items(self.def_id);
             items
                 .in_definition_order()
                 .filter(|item| item.kind == AssocKind::Type)
@@ -439,7 +439,7 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
 
     fn create_error_message(&self) -> String {
         let def_path = self.tcx.def_path_str(self.def_id);
-        let def_kind = self.tcx.def_kind(self.def_id).descr(self.def_id);
+        let def_kind = self.tcx.def_descr(self.def_id);
         let (quantifier, bound) = self.get_quantifier_and_bound();
         let kind = self.kind();
         let provided_lt_args = self.num_provided_lifetime_args();
@@ -462,7 +462,7 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
 
         if self.gen_args.span_ext().is_some() {
             format!(
-                "this {} takes {}{} {} argument{} but {} {} supplied",
+                "{} takes {}{} {} argument{} but {} {} supplied",
                 def_kind,
                 quantifier,
                 bound,
@@ -480,7 +480,7 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
         let span = self.path_segment.ident.span;
         let msg = self.create_error_message();
 
-        self.tcx.sess.struct_span_err_with_code(span, &msg, self.code())
+        self.tcx.sess.struct_span_err_with_code(span, msg, self.code())
     }
 
     /// Builds the `expected 1 type argument / supplied 2 type arguments` message.
@@ -565,7 +565,7 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
     /// type Map = HashMap<String>;
     /// ```
     fn suggest_adding_args(&self, err: &mut Diagnostic) {
-        if self.gen_args.parenthesized {
+        if self.gen_args.parenthesized != hir::GenericArgsParentheses::No {
             return;
         }
 
@@ -602,7 +602,7 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
 
                 err.span_suggestion_verbose(
                     span.shrink_to_hi(),
-                    &msg,
+                    msg,
                     sugg,
                     Applicability::HasPlaceholders,
                 );
@@ -625,7 +625,7 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
                 let sugg = format!("{}{}{}", sugg_prefix, suggested_args, sugg_suffix);
                 debug!("sugg: {:?}", sugg);
 
-                err.span_suggestion_verbose(sugg_span, &msg, sugg, Applicability::HasPlaceholders);
+                err.span_suggestion_verbose(sugg_span, msg, sugg, Applicability::HasPlaceholders);
             }
             AngleBrackets::Implied => {
                 // We never encounter missing lifetimes in situations in which lifetimes are elided
@@ -652,7 +652,7 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
 
                 err.span_suggestion_verbose(
                     span.shrink_to_hi(),
-                    &msg,
+                    msg,
                     sugg,
                     Applicability::HasPlaceholders,
                 );
@@ -683,7 +683,7 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
                 let sugg = format!("{}{}{}", sugg_prefix, suggested_args, sugg_suffix);
                 debug!("sugg: {:?}", sugg);
 
-                err.span_suggestion_verbose(sugg_span, &msg, sugg, Applicability::HasPlaceholders);
+                err.span_suggestion_verbose(sugg_span, msg, sugg, Applicability::HasPlaceholders);
             }
         }
     }
@@ -885,7 +885,7 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
 
             err.span_suggestion(
                 span_redundant_lt_args,
-                &msg_lifetimes,
+                msg_lifetimes,
                 "",
                 Applicability::MaybeIncorrect,
             );
@@ -927,7 +927,7 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
 
             err.span_suggestion(
                 span_redundant_type_or_const_args,
-                &msg_types_or_consts,
+                msg_types_or_consts,
                 "",
                 Applicability::MaybeIncorrect,
             );
@@ -943,7 +943,7 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
 
             if !suggestions.is_empty() {
                 err.multipart_suggestion_verbose(
-                    &format!(
+                    format!(
                         "replace the generic bound{s} with the associated type{s}",
                         s = pluralize!(unbound_types.len())
                     ),
@@ -962,10 +962,14 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
 
             let msg = format!(
                 "remove these {}generics",
-                if self.gen_args.parenthesized { "parenthetical " } else { "" },
+                if self.gen_args.parenthesized == hir::GenericArgsParentheses::ParenSugar {
+                    "parenthetical "
+                } else {
+                    ""
+                },
             );
 
-            err.span_suggestion(span, &msg, "", Applicability::MaybeIncorrect);
+            err.span_suggestion(span, msg, "", Applicability::MaybeIncorrect);
         } else if redundant_lifetime_args && redundant_type_or_const_args {
             remove_lifetime_args(err);
             remove_type_or_const_args(err);
@@ -990,7 +994,7 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
         };
 
         let msg = {
-            let def_kind = self.tcx.def_kind(self.def_id).descr(self.def_id);
+            let def_kind = self.tcx.def_descr(self.def_id);
             let (quantifier, bound) = self.get_quantifier_and_bound();
 
             let params = if bound == 0 {
@@ -1025,7 +1029,7 @@ impl<'a, 'tcx> WrongNumberOfGenericArgs<'a, 'tcx> {
             )
         };
 
-        err.span_note(spans, &msg);
+        err.span_note(spans, msg);
     }
 
     /// Add note if `impl Trait` is explicitly specified.

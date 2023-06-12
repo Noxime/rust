@@ -12,7 +12,7 @@ use rustc_span::{
     symbol::{sym, Ident, Symbol},
     Span,
 };
-use thin_vec::thin_vec;
+use thin_vec::{thin_vec, ThinVec};
 
 pub(super) struct Context<'cx, 'a> {
     // An optimization.
@@ -83,12 +83,12 @@ impl<'cx, 'a> Context<'cx, 'a> {
 
         let Self { best_case_captures, capture_decls, cx, local_bind_decls, span, .. } = self;
 
-        let mut assert_then_stmts = Vec::with_capacity(2);
+        let mut assert_then_stmts = ThinVec::with_capacity(2);
         assert_then_stmts.extend(best_case_captures);
         assert_then_stmts.push(self.cx.stmt_expr(panic));
         let assert_then = self.cx.block(span, assert_then_stmts);
 
-        let mut stmts = Vec::with_capacity(4);
+        let mut stmts = ThinVec::with_capacity(4);
         stmts.push(initial_imports);
         stmts.extend(capture_decls.into_iter().map(|c| c.decl));
         stmts.extend(local_bind_decls);
@@ -120,7 +120,7 @@ impl<'cx, 'a> Context<'cx, 'a> {
                 thin_vec![self.cx.attr_nested_word(sym::allow, sym::unused_imports, self.span)],
                 ItemKind::Use(UseTree {
                     prefix: self.cx.path(self.span, self.cx.std_path(&[sym::asserting])),
-                    kind: UseTreeKind::Nested(vec![
+                    kind: UseTreeKind::Nested(thin_vec![
                         nested_tree(self, sym::TryCaptureGeneric),
                         nested_tree(self, sym::TryCapturePrintable),
                     ]),
@@ -136,7 +136,7 @@ impl<'cx, 'a> Context<'cx, 'a> {
         self.cx.expr_call(
             self.span,
             self.cx.expr_path(self.cx.path(self.span, unlikely_path)),
-            vec![self.cx.expr(self.span, ExprKind::Unary(UnOp::Not, cond_expr))],
+            thin_vec![self.cx.expr(self.span, ExprKind::Unary(UnOp::Not, cond_expr))],
         )
     }
 
@@ -182,7 +182,6 @@ impl<'cx, 'a> Context<'cx, 'a> {
                     delim: MacDelimiter::Parenthesis,
                     tokens: initial.into_iter().chain(captures).collect::<TokenStream>(),
                 }),
-                prior_type_ascription: None,
             })),
         )
     }
@@ -234,9 +233,18 @@ impl<'cx, 'a> Context<'cx, 'a> {
             ExprKind::Cast(local_expr, _) => {
                 self.manage_cond_expr(local_expr);
             }
+            ExprKind::If(local_expr, _, _) => {
+                self.manage_cond_expr(local_expr);
+            }
             ExprKind::Index(prefix, suffix) => {
                 self.manage_cond_expr(prefix);
                 self.manage_cond_expr(suffix);
+            }
+            ExprKind::Let(_, local_expr, _) => {
+                self.manage_cond_expr(local_expr);
+            }
+            ExprKind::Match(local_expr, _) => {
+                self.manage_cond_expr(local_expr);
             }
             ExprKind::MethodCall(call) => {
                 for arg in &mut call.args {
@@ -287,26 +295,23 @@ impl<'cx, 'a> Context<'cx, 'a> {
             // sync with the `rfc-2011-nicer-assert-messages/all-expr-kinds.rs` test.
             ExprKind::Assign(_, _, _)
             | ExprKind::AssignOp(_, _, _)
-            | ExprKind::Async(_, _, _)
-            | ExprKind::Await(_)
+            | ExprKind::Async(_, _)
+            | ExprKind::Await(_, _)
             | ExprKind::Block(_, _)
-            | ExprKind::Box(_)
             | ExprKind::Break(_, _)
             | ExprKind::Closure(_)
             | ExprKind::ConstBlock(_)
             | ExprKind::Continue(_)
             | ExprKind::Err
             | ExprKind::Field(_, _)
-            | ExprKind::FormatArgs(_)
             | ExprKind::ForLoop(_, _, _, _)
-            | ExprKind::If(_, _, _)
+            | ExprKind::FormatArgs(_)
             | ExprKind::IncludedBytes(..)
             | ExprKind::InlineAsm(_)
-            | ExprKind::Let(_, _, _)
             | ExprKind::Lit(_)
             | ExprKind::Loop(_, _, _)
             | ExprKind::MacCall(_)
-            | ExprKind::Match(_, _)
+            | ExprKind::OffsetOf(_, _)
             | ExprKind::Path(_, _)
             | ExprKind::Ret(_)
             | ExprKind::Try(_)
@@ -339,7 +344,7 @@ impl<'cx, 'a> Context<'cx, 'a> {
         let init = self.cx.expr_call(
             self.span,
             self.cx.expr_path(self.cx.path(self.span, init_std_path)),
-            vec![],
+            ThinVec::new(),
         );
         let capture = Capture { decl: self.cx.stmt_let(self.span, true, ident, init), ident };
         self.capture_decls.push(capture);
@@ -366,7 +371,7 @@ impl<'cx, 'a> Context<'cx, 'a> {
             self.cx.expr_path(
                 self.cx.path(self.span, self.cx.std_path(&[sym::asserting, sym::Wrapper])),
             ),
-            vec![self.cx.expr_path(Path::from_ident(local_bind))],
+            thin_vec![self.cx.expr_path(Path::from_ident(local_bind))],
         );
         let try_capture_call = self
             .cx
@@ -378,7 +383,7 @@ impl<'cx, 'a> Context<'cx, 'a> {
                     ident: Ident::new(sym::try_capture, self.span),
                 },
                 expr_paren(self.cx, self.span, self.cx.expr_addr_of(self.span, wrapper)),
-                vec![expr_addr_of_mut(
+                thin_vec![expr_addr_of_mut(
                     self.cx,
                     self.span,
                     self.cx.expr_path(Path::from_ident(capture)),
@@ -389,7 +394,7 @@ impl<'cx, 'a> Context<'cx, 'a> {
         let local_bind_path = self.cx.expr_path(Path::from_ident(local_bind));
         let rslt = if self.is_consumed {
             let ret = self.cx.stmt_expr(local_bind_path);
-            self.cx.expr_block(self.cx.block(self.span, vec![try_capture_call, ret]))
+            self.cx.expr_block(self.cx.block(self.span, thin_vec![try_capture_call, ret]))
         } else {
             self.best_case_captures.push(try_capture_call);
             local_bind_path
@@ -441,7 +446,7 @@ fn expr_method_call(
     cx: &ExtCtxt<'_>,
     seg: PathSegment,
     receiver: P<Expr>,
-    args: Vec<P<Expr>>,
+    args: ThinVec<P<Expr>>,
     span: Span,
 ) -> P<Expr> {
     cx.expr(span, ExprKind::MethodCall(Box::new(MethodCall { seg, receiver, args, span })))

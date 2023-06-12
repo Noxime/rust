@@ -2,7 +2,7 @@ use std::fmt;
 
 use ast::HasName;
 use cfg::CfgExpr;
-use hir::{AsAssocItem, HasAttrs, HasSource, HirDisplay, Semantics};
+use hir::{AsAssocItem, HasAttrs, HasSource, Semantics};
 use ide_assists::utils::test_related_attribute;
 use ide_db::{
     base_db::{FilePosition, FileRange},
@@ -195,14 +195,13 @@ pub(crate) fn runnables(db: &RootDatabase, file_id: FileId) -> Vec<Runnable> {
 //
 // Provides a sneak peek of all tests where the current item is used.
 //
-// The simplest way to use this feature is via the context menu:
-//  - Right-click on the selected item. The context menu opens.
-//  - Select **Peek related tests**
+// The simplest way to use this feature is via the context menu. Right-click on
+// the selected item. The context menu opens. Select **Peek Related Tests**.
 //
 // |===
 // | Editor  | Action Name
 //
-// | VS Code | **rust-analyzer: Peek related tests**
+// | VS Code | **rust-analyzer: Peek Related Tests**
 // |===
 pub(crate) fn related_tests(
     db: &RootDatabase,
@@ -350,8 +349,13 @@ pub(crate) fn runnable_mod(
     if !has_test_function_or_multiple_test_submodules(sema, &def) {
         return None;
     }
-    let path =
-        def.path_to_root(sema.db).into_iter().rev().filter_map(|it| it.name(sema.db)).join("::");
+    let path = def
+        .path_to_root(sema.db)
+        .into_iter()
+        .rev()
+        .filter_map(|it| it.name(sema.db))
+        .map(|it| it.display(sema.db).to_string())
+        .join("::");
 
     let attrs = def.attrs(sema.db);
     let cfg = attrs.cfg();
@@ -371,13 +375,13 @@ pub(crate) fn runnable_impl(
     let nav = def.try_to_nav(sema.db)?;
     let ty = def.self_ty(sema.db);
     let adt_name = ty.as_adt()?.name(sema.db);
-    let mut ty_args = ty.type_arguments().peekable();
+    let mut ty_args = ty.generic_parameters(sema.db).peekable();
     let params = if ty_args.peek().is_some() {
-        format!("<{}>", ty_args.format_with(",", |ty, cb| cb(&ty.display(sema.db))))
+        format!("<{}>", ty_args.format_with(",", |ty, cb| cb(&ty)))
     } else {
         String::new()
     };
-    let mut test_id = format!("{adt_name}{params}");
+    let mut test_id = format!("{}{params}", adt_name.display(sema.db));
     test_id.retain(|c| c != ' ');
     let test_id = TestId::Path(test_id);
 
@@ -392,8 +396,13 @@ fn runnable_mod_outline_definition(
     if !has_test_function_or_multiple_test_submodules(sema, &def) {
         return None;
     }
-    let path =
-        def.path_to_root(sema.db).into_iter().rev().filter_map(|it| it.name(sema.db)).join("::");
+    let path = def
+        .path_to_root(sema.db)
+        .into_iter()
+        .rev()
+        .filter_map(|it| it.name(sema.db))
+        .map(|it| it.display(sema.db).to_string())
+        .join("::");
 
     let attrs = def.attrs(sema.db);
     let cfg = attrs.cfg();
@@ -417,6 +426,7 @@ fn module_def_doctest(db: &RootDatabase, def: Definition) -> Option<Runnable> {
         Definition::Const(it) => it.attrs(db),
         Definition::Static(it) => it.attrs(db),
         Definition::Trait(it) => it.attrs(db),
+        Definition::TraitAlias(it) => it.attrs(db),
         Definition::TypeAlias(it) => it.attrs(db),
         Definition::Macro(it) => it.attrs(db),
         Definition::SelfType(it) => it.attrs(db),
@@ -430,29 +440,25 @@ fn module_def_doctest(db: &RootDatabase, def: Definition) -> Option<Runnable> {
         let mut path = String::new();
         def.canonical_module_path(db)?
             .flat_map(|it| it.name(db))
-            .for_each(|name| format_to!(path, "{}::", name));
+            .for_each(|name| format_to!(path, "{}::", name.display(db)));
         // This probably belongs to canonical_path?
         if let Some(assoc_item) = def.as_assoc_item(db) {
             if let hir::AssocItemContainer::Impl(imp) = assoc_item.container(db) {
                 let ty = imp.self_ty(db);
                 if let Some(adt) = ty.as_adt() {
                     let name = adt.name(db);
-                    let mut ty_args = ty.type_arguments().peekable();
-                    format_to!(path, "{}", name);
+                    let mut ty_args = ty.generic_parameters(db).peekable();
+                    format_to!(path, "{}", name.display(db));
                     if ty_args.peek().is_some() {
-                        format_to!(
-                            path,
-                            "<{}>",
-                            ty_args.format_with(",", |ty, cb| cb(&ty.display(db)))
-                        );
+                        format_to!(path, "<{}>", ty_args.format_with(",", |ty, cb| cb(&ty)));
                     }
-                    format_to!(path, "::{}", def_name);
+                    format_to!(path, "::{}", def_name.display(db));
                     path.retain(|c| c != ' ');
                     return Some(path);
                 }
             }
         }
-        format_to!(path, "{}", def_name);
+        format_to!(path, "{}", def_name.display(db));
         Some(path)
     })();
 
@@ -1000,6 +1006,221 @@ impl Data {
         );
     }
 
+    #[test]
+    fn test_runnables_doc_test_in_impl_with_lifetime() {
+        check(
+            r#"
+//- /lib.rs
+$0
+fn main() {}
+
+struct Data<'a>;
+impl Data<'a> {
+    /// ```
+    /// let x = 5;
+    /// ```
+    fn foo() {}
+}
+"#,
+            &[Bin, DocTest],
+            expect![[r#"
+                [
+                    Runnable {
+                        use_name_in_title: false,
+                        nav: NavigationTarget {
+                            file_id: FileId(
+                                0,
+                            ),
+                            full_range: 1..13,
+                            focus_range: 4..8,
+                            name: "main",
+                            kind: Function,
+                        },
+                        kind: Bin,
+                        cfg: None,
+                    },
+                    Runnable {
+                        use_name_in_title: false,
+                        nav: NavigationTarget {
+                            file_id: FileId(
+                                0,
+                            ),
+                            full_range: 52..106,
+                            name: "foo",
+                        },
+                        kind: DocTest {
+                            test_id: Path(
+                                "Data<'a>::foo",
+                            ),
+                        },
+                        cfg: None,
+                    },
+                ]
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_runnables_doc_test_in_impl_with_lifetime_and_types() {
+        check(
+            r#"
+//- /lib.rs
+$0
+fn main() {}
+
+struct Data<'a, T, U>;
+impl<T, U> Data<'a, T, U> {
+    /// ```
+    /// let x = 5;
+    /// ```
+    fn foo() {}
+}
+"#,
+            &[Bin, DocTest],
+            expect![[r#"
+                [
+                    Runnable {
+                        use_name_in_title: false,
+                        nav: NavigationTarget {
+                            file_id: FileId(
+                                0,
+                            ),
+                            full_range: 1..13,
+                            focus_range: 4..8,
+                            name: "main",
+                            kind: Function,
+                        },
+                        kind: Bin,
+                        cfg: None,
+                    },
+                    Runnable {
+                        use_name_in_title: false,
+                        nav: NavigationTarget {
+                            file_id: FileId(
+                                0,
+                            ),
+                            full_range: 70..124,
+                            name: "foo",
+                        },
+                        kind: DocTest {
+                            test_id: Path(
+                                "Data<'a,T,U>::foo",
+                            ),
+                        },
+                        cfg: None,
+                    },
+                ]
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_runnables_doc_test_in_impl_with_const() {
+        check(
+            r#"
+//- /lib.rs
+$0
+fn main() {}
+
+struct Data<const N: usize>;
+impl<const N: usize> Data<N> {
+    /// ```
+    /// let x = 5;
+    /// ```
+    fn foo() {}
+}
+"#,
+            &[Bin, DocTest],
+            expect![[r#"
+                [
+                    Runnable {
+                        use_name_in_title: false,
+                        nav: NavigationTarget {
+                            file_id: FileId(
+                                0,
+                            ),
+                            full_range: 1..13,
+                            focus_range: 4..8,
+                            name: "main",
+                            kind: Function,
+                        },
+                        kind: Bin,
+                        cfg: None,
+                    },
+                    Runnable {
+                        use_name_in_title: false,
+                        nav: NavigationTarget {
+                            file_id: FileId(
+                                0,
+                            ),
+                            full_range: 79..133,
+                            name: "foo",
+                        },
+                        kind: DocTest {
+                            test_id: Path(
+                                "Data<N>::foo",
+                            ),
+                        },
+                        cfg: None,
+                    },
+                ]
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_runnables_doc_test_in_impl_with_lifetime_types_and_const() {
+        check(
+            r#"
+//- /lib.rs
+$0
+fn main() {}
+
+struct Data<'a, T, const N: usize>;
+impl<'a, T, const N: usize> Data<'a, T, N> {
+    /// ```
+    /// let x = 5;
+    /// ```
+    fn foo() {}
+}
+"#,
+            &[Bin, DocTest],
+            expect![[r#"
+                [
+                    Runnable {
+                        use_name_in_title: false,
+                        nav: NavigationTarget {
+                            file_id: FileId(
+                                0,
+                            ),
+                            full_range: 1..13,
+                            focus_range: 4..8,
+                            name: "main",
+                            kind: Function,
+                        },
+                        kind: Bin,
+                        cfg: None,
+                    },
+                    Runnable {
+                        use_name_in_title: false,
+                        nav: NavigationTarget {
+                            file_id: FileId(
+                                0,
+                            ),
+                            full_range: 100..154,
+                            name: "foo",
+                        },
+                        kind: DocTest {
+                            test_id: Path(
+                                "Data<'a,T,N>::foo",
+                            ),
+                        },
+                        cfg: None,
+                    },
+                ]
+            "#]],
+        );
+    }
     #[test]
     fn test_runnables_module() {
         check(
@@ -2021,6 +2242,27 @@ mod tests {
                             file_id: FileId(
                                 0,
                             ),
+                            full_range: 121..185,
+                            focus_range: 136..145,
+                            name: "foo2_test",
+                            kind: Function,
+                        },
+                        kind: Test {
+                            test_id: Path(
+                                "tests::foo2_test",
+                            ),
+                            attr: TestAttr {
+                                ignore: false,
+                            },
+                        },
+                        cfg: None,
+                    },
+                    Runnable {
+                        use_name_in_title: false,
+                        nav: NavigationTarget {
+                            file_id: FileId(
+                                0,
+                            ),
                             full_range: 52..115,
                             focus_range: 67..75,
                             name: "foo_test",
@@ -2036,24 +2278,56 @@ mod tests {
                         },
                         cfg: None,
                     },
+                ]
+            "#]],
+        );
+    }
+
+    #[test]
+    fn test_runnables_doc_test_in_impl_with_lifetime_type_const_value() {
+        check(
+            r#"
+//- /lib.rs
+$0
+fn main() {}
+
+struct Data<'a, A, const B: usize, C, const D: u32>;
+impl<A, C, const D: u32> Data<'a, A, 12, C, D> {
+    /// ```
+    /// ```
+    fn foo() {}
+}
+"#,
+            &[Bin, DocTest],
+            expect![[r#"
+                [
                     Runnable {
                         use_name_in_title: false,
                         nav: NavigationTarget {
                             file_id: FileId(
                                 0,
                             ),
-                            full_range: 121..185,
-                            focus_range: 136..145,
-                            name: "foo2_test",
+                            full_range: 1..13,
+                            focus_range: 4..8,
+                            name: "main",
                             kind: Function,
                         },
-                        kind: Test {
-                            test_id: Path(
-                                "tests::foo2_test",
+                        kind: Bin,
+                        cfg: None,
+                    },
+                    Runnable {
+                        use_name_in_title: false,
+                        nav: NavigationTarget {
+                            file_id: FileId(
+                                0,
                             ),
-                            attr: TestAttr {
-                                ignore: false,
-                            },
+                            full_range: 121..156,
+                            name: "foo",
+                        },
+                        kind: DocTest {
+                            test_id: Path(
+                                "Data<'a,A,12,C,D>::foo",
+                            ),
                         },
                         cfg: None,
                     },
@@ -2315,6 +2589,7 @@ mod r#mod {
                             ),
                             full_range: 47..84,
                             name: "r#for",
+                            container_name: "r#mod",
                         },
                         kind: DocTest {
                             test_id: Path(
@@ -2331,6 +2606,7 @@ mod r#mod {
                             ),
                             full_range: 90..146,
                             name: "r#struct",
+                            container_name: "r#mod",
                         },
                         kind: DocTest {
                             test_id: Path(

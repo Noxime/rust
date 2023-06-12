@@ -1,5 +1,5 @@
 // Checking the colors of the codeblocks tooltips.
-goto: "file://" + |DOC_PATH| + "/test_docs/fn.foo.html"
+go-to: "file://" + |DOC_PATH| + "/test_docs/fn.foo.html"
 show-text: true
 
 define-function: (
@@ -7,7 +7,7 @@ define-function: (
     (theme, background, color, border),
     block {
         // Setting the theme.
-        local-storage: {"rustdoc-theme": |theme|, "rustdoc-use-system-theme": "false"}
+        set-local-storage: {"rustdoc-theme": |theme|, "rustdoc-use-system-theme": "false"}
         reload:
 
         // compile_fail block
@@ -30,24 +30,17 @@ define-function: (
             ".docblock .example-wrap.compile_fail",
             {"border-left": "2px solid rgb(255, 0, 0)"},
         )
-        assert-css: (
-            ".docblock .example-wrap.compile_fail .tooltip::after",
-            {
-                "content": '"This example deliberately fails to compile"',
-                "padding": "5px 3px 3px",
-                "background-color": |background|,
-                "color": |color|,
-                "border": "1px solid " + |border|,
-            },
+        click: ".docblock .example-wrap.compile_fail .tooltip"
+        assert-text: (
+            ".popover.tooltip",
+            "This example deliberately fails to compile"
         )
-        assert-css: (
-            ".docblock .example-wrap.compile_fail .tooltip::before",
-            {
-                "border-width": "5px",
-                "border-style": "solid",
-                "border-color": "rgba(0, 0, 0, 0) " + |background| + " rgba(0, 0, 0, 0) rgba(0, 0, 0, 0)",
-            },
-        )
+        assert-css: (".popover.tooltip", {
+            "color": |color|,
+            "background-color": |background|,
+            "border-color": |border|,
+        })
+        click: ".docblock .example-wrap.compile_fail .tooltip"
 
         // should_panic block
         assert-css: (
@@ -69,24 +62,17 @@ define-function: (
             ".docblock .example-wrap.should_panic",
             {"border-left": "2px solid rgb(255, 0, 0)"},
         )
-        assert-css: (
-            ".docblock .example-wrap.should_panic .tooltip::after",
-            {
-                "content": '"This example panics"',
-                "padding": "5px 3px 3px",
-                "background-color": |background|,
-                "color": |color|,
-                "border": "1px solid " + |border|,
-            },
+        click: ".docblock .example-wrap.should_panic .tooltip"
+        assert-text: (
+            ".popover.tooltip",
+            "This example panics"
         )
-        assert-css: (
-            ".docblock .example-wrap.should_panic .tooltip::before",
-            {
-                "border-width": "5px",
-                "border-style": "solid",
-                "border-color": "rgba(0, 0, 0, 0) " + |background| + " rgba(0, 0, 0, 0) rgba(0, 0, 0, 0)",
-            },
-        )
+        assert-css: (".popover.tooltip", {
+            "color": |color|,
+            "background-color": |background|,
+            "border-color": |border|,
+        })
+        click: ".docblock .example-wrap.should_panic .tooltip"
 
         // ignore block
         assert-css: (
@@ -108,42 +94,36 @@ define-function: (
             ".docblock .example-wrap.ignore",
             {"border-left": "2px solid rgb(255, 142, 0)"},
         )
-        assert-css: (
-            ".docblock .example-wrap.ignore .tooltip::after",
-            {
-                "content": '"This example is not tested"',
-                "padding": "5px 3px 3px",
-                "background-color": |background|,
-                "color": |color|,
-                "border": "1px solid " + |border|,
-            },
+        click: ".docblock .example-wrap.ignore .tooltip"
+        assert-text: (
+            ".popover.tooltip",
+            "This example is not tested"
         )
-        assert-css: (
-            ".docblock .example-wrap.ignore .tooltip::before",
-            {
-                "border-width": "5px",
-                "border-style": "solid",
-                "border-color": "rgba(0, 0, 0, 0) " + |background| + " rgba(0, 0, 0, 0) rgba(0, 0, 0, 0)",
-            },
-        )
+        assert-css: (".popover.tooltip", {
+            "color": |color|,
+            "background-color": |background|,
+            "border-color": |border|,
+        })
+        click: ".docblock .example-wrap.ignore .tooltip"
+        assert-false: ".popover.tooltip"
     },
 )
 
 call-function: ("check-colors", {
     "theme": "ayu",
-    "background": "rgb(49, 69, 89)",
-    "color": "rgb(197, 197, 197)",
-    "border": "rgb(92, 103, 115)",
+    "background": "#0f1419",
+    "color": "#c5c5c5",
+    "border": "#5c6773",
 })
 call-function: ("check-colors", {
     "theme": "dark",
-    "background": "rgb(0, 0, 0)",
-    "color": "rgb(255, 255, 255)",
-    "border": "rgb(224, 224, 224)",
+    "background": "#353535",
+    "color": "#ddd",
+    "border": "#e0e0e0",
 })
 call-function: ("check-colors", {
     "theme": "light",
-    "background": "rgb(0, 0, 0)",
-    "color": "rgb(255, 255, 255)",
-    "border": "rgb(224, 224, 224)",
+    "background": "white",
+    "color": "black",
+    "border": "#e0e0e0",
 })

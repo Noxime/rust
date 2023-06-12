@@ -1,4 +1,5 @@
 mod _impl;
+mod adjust_fulfillment_errors;
 mod arg_matrix;
 mod checks;
 mod suggestions;
@@ -16,8 +17,7 @@ use rustc_infer::infer;
 use rustc_infer::infer::error_reporting::TypeErrCtxt;
 use rustc_infer::infer::type_variable::{TypeVariableOrigin, TypeVariableOriginKind};
 use rustc_middle::infer::unify_key::{ConstVariableOrigin, ConstVariableOriginKind};
-use rustc_middle::ty::subst::GenericArgKind;
-use rustc_middle::ty::{self, Const, Ty, TyCtxt, TypeVisitable};
+use rustc_middle::ty::{self, Const, Ty, TyCtxt, TypeVisitableExt};
 use rustc_session::Session;
 use rustc_span::symbol::Ident;
 use rustc_span::{self, Span, DUMMY_SP};
@@ -168,7 +168,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         ocx.normalize(&ObligationCause::dummy(), self.param_env, fn_sig);
                     if ocx.select_all_or_error().is_empty() {
                         let normalized_fn_sig = self.resolve_vars_if_possible(normalized_fn_sig);
-                        if !normalized_fn_sig.needs_infer() {
+                        if !normalized_fn_sig.has_infer() {
                             return normalized_fn_sig;
                         }
                     }
@@ -210,13 +210,13 @@ impl<'a, 'tcx> AstConv<'tcx> for FnCtxt<'a, 'tcx> {
     fn get_type_parameter_bounds(
         &self,
         _: Span,
-        def_id: DefId,
+        def_id: LocalDefId,
         _: Ident,
     ) -> ty::GenericPredicates<'tcx> {
         let tcx = self.tcx;
-        let item_def_id = tcx.hir().ty_param_owner(def_id.expect_local());
+        let item_def_id = tcx.hir().ty_param_owner(def_id);
         let generics = tcx.generics_of(item_def_id);
-        let index = generics.param_def_id_to_index[&def_id];
+        let index = generics.param_def_id_to_index[&def_id.to_def_id()];
         ty::GenericPredicates {
             parent: None,
             predicates: tcx.arena.alloc_from_iter(
@@ -249,16 +249,12 @@ impl<'a, 'tcx> AstConv<'tcx> for FnCtxt<'a, 'tcx> {
     }
 
     fn ty_infer(&self, param: Option<&ty::GenericParamDef>, span: Span) -> Ty<'tcx> {
-        if let Some(param) = param {
-            if let GenericArgKind::Type(ty) = self.var_for_def(span, param).unpack() {
-                return ty;
-            }
-            unreachable!()
-        } else {
-            self.next_ty_var(TypeVariableOrigin {
+        match param {
+            Some(param) => self.var_for_def(span, param).as_type().unwrap(),
+            None => self.next_ty_var(TypeVariableOrigin {
                 kind: TypeVariableOriginKind::TypeInference,
                 span,
-            })
+            }),
         }
     }
 
@@ -268,16 +264,12 @@ impl<'a, 'tcx> AstConv<'tcx> for FnCtxt<'a, 'tcx> {
         param: Option<&ty::GenericParamDef>,
         span: Span,
     ) -> Const<'tcx> {
-        if let Some(param) = param {
-            if let GenericArgKind::Const(ct) = self.var_for_def(span, param).unpack() {
-                return ct;
-            }
-            unreachable!()
-        } else {
-            self.next_const_var(
+        match param {
+            Some(param) => self.var_for_def(span, param).as_const().unwrap(),
+            None => self.next_const_var(
                 ty,
                 ConstVariableOrigin { kind: ConstVariableOriginKind::ConstInference, span },
-            )
+            ),
         }
     }
 
@@ -288,7 +280,7 @@ impl<'a, 'tcx> AstConv<'tcx> for FnCtxt<'a, 'tcx> {
         item_segment: &hir::PathSegment<'_>,
         poly_trait_ref: ty::PolyTraitRef<'tcx>,
     ) -> Ty<'tcx> {
-        let trait_ref = self.replace_bound_vars_with_fresh_vars(
+        let trait_ref = self.instantiate_binder_with_fresh_vars(
             span,
             infer::LateBoundRegionConversionTime::AssocTypeProjection(item_def_id),
             poly_trait_ref,
@@ -308,7 +300,7 @@ impl<'a, 'tcx> AstConv<'tcx> for FnCtxt<'a, 'tcx> {
         match ty.kind() {
             ty::Adt(adt_def, _) => Some(*adt_def),
             // FIXME(#104767): Should we handle bound regions here?
-            ty::Alias(ty::Projection, _) if !ty.has_escaping_bound_vars() => {
+            ty::Alias(ty::Projection | ty::Inherent, _) if !ty.has_escaping_bound_vars() => {
                 self.normalize(span, ty).ty_adt_def()
             }
             _ => None,

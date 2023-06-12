@@ -1,12 +1,11 @@
 use super::IsMethodCall;
 use crate::astconv::{
-    CreateSubstsForGenericArgsCtxt, ExplicitLateBound, GenericArgCountMismatch,
-    GenericArgCountResult, GenericArgPosition,
+    errors::prohibit_assoc_ty_binding, CreateSubstsForGenericArgsCtxt, ExplicitLateBound,
+    GenericArgCountMismatch, GenericArgCountResult, GenericArgPosition,
 };
-use crate::errors::AssocTypeBindingNotAllowed;
 use crate::structured_errors::{GenericArgsInfo, StructuredDiagnostic, WrongNumberOfGenericArgs};
 use rustc_ast::ast::ParamKindOrd;
-use rustc_errors::{struct_span_err, Applicability, Diagnostic, MultiSpan};
+use rustc_errors::{struct_span_err, Applicability, Diagnostic, ErrorGuaranteed, MultiSpan};
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
@@ -25,8 +24,8 @@ fn generic_arg_mismatch_err(
     arg: &GenericArg<'_>,
     param: &GenericParamDef,
     possible_ordering_error: bool,
-    help: Option<&str>,
-) {
+    help: Option<String>,
+) -> ErrorGuaranteed {
     let sess = tcx.sess;
     let mut err = struct_span_err!(
         sess,
@@ -70,18 +69,18 @@ fn generic_arg_mismatch_err(
         ) => match path.res {
             Res::Err => {
                 add_braces_suggestion(arg, &mut err);
-                err.set_primary_message("unresolved item provided when a constant was expected")
+                return err
+                    .set_primary_message("unresolved item provided when a constant was expected")
                     .emit();
-                return;
             }
             Res::Def(DefKind::TyParam, src_def_id) => {
                 if let Some(param_local_id) = param.def_id.as_local() {
                     let param_name = tcx.hir().ty_param_name(param_local_id);
-                    let param_type = tcx.type_of(param.def_id);
+                    let param_type = tcx.type_of(param.def_id).subst_identity();
                     if param_type.is_suggestable(tcx, false) {
                         err.span_suggestion(
                             tcx.def_span(src_def_id),
-                            "consider changing this type parameter to be a `const` generic",
+                            "consider changing this type parameter to a const parameter",
                             format!("const {}: {}", param_name, param_type),
                             Applicability::MaybeIncorrect,
                         );
@@ -97,7 +96,7 @@ fn generic_arg_mismatch_err(
         (
             GenericArg::Type(hir::Ty { kind: hir::TyKind::Array(_, len), .. }),
             GenericParamDefKind::Const { .. },
-        ) if tcx.type_of(param.def_id) == tcx.types.usize => {
+        ) if tcx.type_of(param.def_id).skip_binder() == tcx.types.usize => {
             let snippet = sess.source_map().span_to_snippet(tcx.hir().span(len.hir_id()));
             if let Ok(snippet) = snippet {
                 err.span_suggestion(
@@ -113,7 +112,7 @@ fn generic_arg_mismatch_err(
             if let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = body.value.kind
             {
                 if let Res::Def(DefKind::Fn { .. }, id) = path.res {
-                    err.help(&format!("`{}` is a function item, not a type", tcx.item_name(id)));
+                    err.help(format!("`{}` is a function item, not a type", tcx.item_name(id)));
                     err.help("function item types cannot be named directly");
                 }
             }
@@ -131,13 +130,13 @@ fn generic_arg_mismatch_err(
         } else {
             (arg.descr(), param.kind.descr())
         };
-        err.note(&format!("{} arguments must be provided before {} arguments", first, last));
+        err.note(format!("{} arguments must be provided before {} arguments", first, last));
         if let Some(help) = help {
             err.help(help);
         }
     }
 
-    err.emit();
+    err.emit()
 }
 
 /// Creates the relevant generic argument substitutions
@@ -301,7 +300,7 @@ pub fn create_substs_for_generic_args<'tcx, 'a>(
                                     arg,
                                     param,
                                     !args_iter.clone().is_sorted_by_key(|arg| arg.to_ord()),
-                                    Some(&format!(
+                                    Some(format!(
                                         "reorder the arguments: {}: `<{}>`",
                                         param_types_present
                                             .into_iter()
@@ -370,7 +369,7 @@ pub fn create_substs_for_generic_args<'tcx, 'a>(
         }
     }
 
-    tcx.intern_substs(&substs)
+    tcx.mk_substs(&substs)
 }
 
 /// Checks that the correct number of generic arguments have been provided.
@@ -433,7 +432,7 @@ pub(crate) fn check_generic_arg_count(
         (gen_pos != GenericArgPosition::Type || infer_args) && !gen_args.has_lifetime_params();
 
     if gen_pos != GenericArgPosition::Type && let Some(b) = gen_args.bindings.first() {
-            prohibit_assoc_ty_binding(tcx, b.span);
+             prohibit_assoc_ty_binding(tcx, b.span, None);
         }
 
     let explicit_late_bound =
@@ -589,11 +588,6 @@ pub(crate) fn check_generic_arg_count(
     }
 }
 
-/// Emits an error regarding forbidden type binding associations
-pub fn prohibit_assoc_ty_binding(tcx: TyCtxt<'_>, span: Span) {
-    tcx.sess.emit_err(AssocTypeBindingNotAllowed { span });
-}
-
 /// Prohibits explicit lifetime arguments if late-bound lifetime parameters
 /// are present. This is used both for datatypes and function calls.
 pub(crate) fn prohibit_explicit_late_bound_lifetimes(
@@ -618,7 +612,7 @@ pub(crate) fn prohibit_explicit_late_bound_lifetimes(
         if position == GenericArgPosition::Value
             && args.num_lifetime_params() != param_counts.lifetimes
         {
-            let mut err = tcx.sess.struct_span_err(span, msg);
+            let mut err = struct_span_err!(tcx.sess, span, E0794, "{}", msg);
             err.span_note(span_late, note);
             err.emit();
         } else {

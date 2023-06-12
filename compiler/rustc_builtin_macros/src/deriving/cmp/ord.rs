@@ -15,7 +15,6 @@ pub fn expand_deriving_ord(
     push: &mut dyn FnMut(Annotatable),
     is_const: bool,
 ) {
-    let attrs = thin_vec![cx.attr_word(sym::inline, span)];
     let trait_def = TraitDef {
         span,
         path: path_std!(cmp::Ord),
@@ -29,7 +28,7 @@ pub fn expand_deriving_ord(
             explicit_self: true,
             nonself_args: vec![(self_ref(), sym::other)],
             ret_ty: Path(path_std!(cmp::Ordering)),
-            attributes: attrs,
+            attributes: thin_vec![cx.attr_word(sym::inline, span)],
             fieldless_variants_strategy: FieldlessVariantsStrategy::Unify,
             combine_substructure: combine_substructure(Box::new(|a, b, c| cs_cmp(a, b, c))),
         }],
@@ -64,14 +63,14 @@ pub fn cs_cmp(cx: &mut ExtCtxt<'_>, span: Span, substr: &Substructure<'_>) -> Bl
                 let [other_expr] = &field.other_selflike_exprs[..] else {
                         cx.span_bug(field.span, "not exactly 2 arguments in `derive(Ord)`");
                     };
-                let args = vec![field.self_expr.clone(), other_expr.clone()];
+                let args = thin_vec![field.self_expr.clone(), other_expr.clone()];
                 cx.expr_call_global(field.span, cmp_path.clone(), args)
             }
             CsFold::Combine(span, expr1, expr2) => {
                 let eq_arm = cx.arm(span, cx.pat_path(span, equal_path.clone()), expr1);
                 let neq_arm =
                     cx.arm(span, cx.pat_ident(span, test_id), cx.expr_ident(span, test_id));
-                cx.expr_match(span, expr2, vec![eq_arm, neq_arm])
+                cx.expr_match(span, expr2, thin_vec![eq_arm, neq_arm])
             }
             CsFold::Fieldless => cx.expr_path(equal_path.clone()),
         },

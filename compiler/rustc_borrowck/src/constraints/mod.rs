@@ -2,7 +2,7 @@
 #![deny(rustc::diagnostic_outside_of_impl)]
 
 use rustc_data_structures::graph::scc::Sccs;
-use rustc_index::vec::IndexVec;
+use rustc_index::{IndexSlice, IndexVec};
 use rustc_middle::mir::ConstraintCategory;
 use rustc_middle::ty::{RegionVid, VarianceDiagInfo};
 use rustc_span::Span;
@@ -17,7 +17,7 @@ pub(crate) mod graph;
 /// constraints of the form `R1: R2`. Each constraint is identified by
 /// a unique `OutlivesConstraintIndex` and you can index into the set
 /// (`constraint_set[i]`) to access the constraint details.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct OutlivesConstraintSet<'tcx> {
     outlives: IndexVec<OutlivesConstraintIndex, OutlivesConstraint<'tcx>>,
 }
@@ -60,7 +60,9 @@ impl<'tcx> OutlivesConstraintSet<'tcx> {
         Sccs::new(region_graph)
     }
 
-    pub(crate) fn outlives(&self) -> &IndexVec<OutlivesConstraintIndex, OutlivesConstraint<'tcx>> {
+    pub(crate) fn outlives(
+        &self,
+    ) -> &IndexSlice<OutlivesConstraintIndex, OutlivesConstraint<'tcx>> {
         &self.outlives
     }
 }

@@ -1,8 +1,10 @@
 error[E0700]: hidden type for `impl PlusOne` captures lifetime that does not appear in bounds
-  --> $DIR/imply_bounds_from_bounds_param.rs:24:5
+  --> $DIR/imply_bounds_from_bounds_param.rs:26:5
    |
 LL | fn test<'a>(y: &'a mut i32) -> impl PlusOne {
-   |         -- hidden type `<&'a mut i32 as Callable>::Output` captures the lifetime `'a` as defined here
+   |         --                     ------------ opaque type defined here
+   |         |
+   |         hidden type `<&'a mut i32 as Callable>::Output` captures the lifetime `'a` as defined here
 LL |     <&'a mut i32 as Callable>::call(y)
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
    |

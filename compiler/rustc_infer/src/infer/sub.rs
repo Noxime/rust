@@ -1,10 +1,9 @@
-use super::combine::{CombineFields, RelationDir};
-use super::SubregionOrigin;
+use super::combine::CombineFields;
+use super::{DefineOpaqueTypes, ObligationEmittingRelation, SubregionOrigin};
 
-use crate::infer::combine::ConstEquateRelation;
-use crate::traits::Obligation;
+use crate::traits::{Obligation, PredicateObligations};
 use rustc_middle::ty::relate::{Cause, Relate, RelateResult, TypeRelation};
-use rustc_middle::ty::visit::TypeVisitable;
+use rustc_middle::ty::visit::TypeVisitableExt;
 use rustc_middle::ty::TyVar;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use std::mem;
@@ -36,10 +35,6 @@ impl<'tcx> TypeRelation<'tcx> for Sub<'_, '_, 'tcx> {
         "Sub"
     }
 
-    fn intercrate(&self) -> bool {
-        self.fields.infcx.intercrate
-    }
-
     fn tcx(&self) -> TyCtxt<'tcx> {
         self.fields.infcx.tcx
     }
@@ -50,10 +45,6 @@ impl<'tcx> TypeRelation<'tcx> for Sub<'_, '_, 'tcx> {
 
     fn a_is_expected(&self) -> bool {
         self.a_is_expected
-    }
-
-    fn mark_ambiguous(&mut self) {
-        self.fields.mark_ambiguous()
     }
 
     fn with_cause<F, R>(&mut self, cause: Cause, f: F) -> R
@@ -117,17 +108,17 @@ impl<'tcx> TypeRelation<'tcx> for Sub<'_, '_, 'tcx> {
                 Ok(a)
             }
             (&ty::Infer(TyVar(a_id)), _) => {
-                self.fields.instantiate(b, RelationDir::SupertypeOf, a_id, !self.a_is_expected)?;
+                self.fields.instantiate(b, ty::Contravariant, a_id, !self.a_is_expected)?;
                 Ok(a)
             }
             (_, &ty::Infer(TyVar(b_id))) => {
-                self.fields.instantiate(a, RelationDir::SubtypeOf, b_id, self.a_is_expected)?;
+                self.fields.instantiate(a, ty::Covariant, b_id, self.a_is_expected)?;
                 Ok(a)
             }
 
             (&ty::Error(e), _) | (_, &ty::Error(e)) => {
                 infcx.set_tainted_by_errors(e);
-                Ok(self.tcx().ty_error_with_guaranteed(e))
+                Ok(self.tcx().ty_error(e))
             }
 
             (
@@ -139,7 +130,9 @@ impl<'tcx> TypeRelation<'tcx> for Sub<'_, '_, 'tcx> {
             }
             (&ty::Alias(ty::Opaque, ty::AliasTy { def_id, .. }), _)
             | (_, &ty::Alias(ty::Opaque, ty::AliasTy { def_id, .. }))
-                if self.fields.define_opaque_types && def_id.is_local() =>
+                if self.fields.define_opaque_types == DefineOpaqueTypes::Yes
+                    && def_id.is_local()
+                    && !self.fields.infcx.next_trait_solver() =>
             {
                 self.fields.obligations.extend(
                     infcx
@@ -161,7 +154,7 @@ impl<'tcx> TypeRelation<'tcx> for Sub<'_, '_, 'tcx> {
                 let a_types = infcx.tcx.anonymize_bound_vars(a_types);
                 let b_types = infcx.tcx.anonymize_bound_vars(b_types);
                 if a_types.bound_vars() == b_types.bound_vars() {
-                    let (a_types, b_types) = infcx.replace_bound_vars_with_placeholders(
+                    let (a_types, b_types) = infcx.instantiate_binder_with_placeholders(
                         a_types.map_bound(|a_types| (a_types, b_types.skip_binder())),
                     );
                     for (a, b) in std::iter::zip(a_types, b_types) {
@@ -218,7 +211,7 @@ impl<'tcx> TypeRelation<'tcx> for Sub<'_, '_, 'tcx> {
     where
         T: Relate<'tcx>,
     {
-        // A binder is always a subtype of itself if it's structually equal to itself
+        // A binder is always a subtype of itself if it's structurally equal to itself
         if a == b {
             return Ok(a);
         }
@@ -228,8 +221,16 @@ impl<'tcx> TypeRelation<'tcx> for Sub<'_, '_, 'tcx> {
     }
 }
 
-impl<'tcx> ConstEquateRelation<'tcx> for Sub<'_, '_, 'tcx> {
-    fn const_equate_obligation(&mut self, a: ty::Const<'tcx>, b: ty::Const<'tcx>) {
-        self.fields.add_const_equate_obligation(self.a_is_expected, a, b);
+impl<'tcx> ObligationEmittingRelation<'tcx> for Sub<'_, '_, 'tcx> {
+    fn register_predicates(&mut self, obligations: impl IntoIterator<Item: ty::ToPredicate<'tcx>>) {
+        self.fields.register_predicates(obligations);
+    }
+
+    fn register_obligations(&mut self, obligations: PredicateObligations<'tcx>) {
+        self.fields.register_obligations(obligations);
+    }
+
+    fn alias_relate_direction(&self) -> ty::AliasRelationDirection {
+        ty::AliasRelationDirection::Subtype
     }
 }

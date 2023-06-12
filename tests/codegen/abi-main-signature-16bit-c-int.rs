@@ -17,7 +17,7 @@
 // ignore-wasm32
 // ignore-x86
 // ignore-x86_64
-// ignore-xcore
+// ignore-loongarch64
 
 fn main() {
 }

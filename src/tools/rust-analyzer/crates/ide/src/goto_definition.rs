@@ -113,6 +113,7 @@ fn try_lookup_include_path(
         file_id,
         full_range: TextRange::new(0.into(), size),
         name: path.into(),
+        alias: None,
         focus_range: None,
         kind: None,
         container_name: None,
@@ -766,6 +767,13 @@ trait Foo$0 { }
 
         check(
             r#"
+trait Foo$0 = ;
+    //^^^
+"#,
+        );
+
+        check(
+            r#"
 mod bar$0 { }
   //^^^
 "#,
@@ -826,8 +834,7 @@ fn test() {
 #[rustc_builtin_macro]
 macro_rules! include {}
 
-  include!("foo.rs");
-//^^^^^^^^^^^^^^^^^^^
+include!("foo.rs");
 
 fn f() {
     foo$0();
@@ -839,6 +846,33 @@ mod confuse_index {
 
 //- /foo.rs
 fn foo() {}
+ //^^^
+        "#,
+        );
+    }
+
+    #[test]
+    fn goto_through_included_file_struct_with_doc_comment() {
+        check(
+            r#"
+//- /main.rs
+#[rustc_builtin_macro]
+macro_rules! include {}
+
+include!("foo.rs");
+
+fn f() {
+    let x = Foo$0;
+}
+
+mod confuse_index {
+    pub struct Foo;
+}
+
+//- /foo.rs
+/// This is a doc comment
+pub struct Foo;
+         //^^^
         "#,
         );
     }
@@ -1063,6 +1097,23 @@ trait Sub: Super {}
 fn f() -> impl Sub<Item$0 = u8> {}
 "#,
         );
+    }
+
+    #[test]
+    fn goto_def_for_module_declaration_in_path_if_types_and_values_same_name() {
+        check(
+            r#"
+mod bar {
+    pub struct Foo {}
+             //^^^
+    pub fn Foo() {}
+}
+
+fn baz() {
+    let _foo_enum: bar::Foo$0 = bar::Foo {};
+}
+        "#,
+        )
     }
 
     #[test]
@@ -1406,7 +1457,6 @@ include!("included.rs$0");
         );
     }
 
-    #[cfg(test)]
     mod goto_impl_of_trait_fn {
         use super::check;
         #[test]
@@ -1443,6 +1493,29 @@ impl Twait for Stwuct {
 fn f() {
     let s = Stwuct;
     s.a$0();
+}
+        "#,
+            );
+        }
+        #[test]
+        fn method_call_inside_block() {
+            check(
+                r#"
+trait Twait {
+    fn a(&self);
+}
+
+fn outer() {
+    struct Stwuct;
+
+    impl Twait for Stwuct {
+        fn a(&self){}
+         //^
+    }
+    fn f() {
+        let s = Stwuct;
+        s.a$0();
+    }
 }
         "#,
             );
@@ -1915,5 +1988,69 @@ fn main() {
 }
 "#,
         )
+    }
+
+    #[test]
+    fn query_impls_in_nearest_block() {
+        check(
+            r#"
+struct S1;
+impl S1 {
+    fn e() -> () {}
+}
+fn f1() {
+    struct S1;
+    impl S1 {
+        fn e() -> () {}
+         //^
+    }
+    fn f2() {
+        fn f3() {
+            S1::e$0();
+        }
+    }
+}
+"#,
+        );
+
+        check(
+            r#"
+struct S1;
+impl S1 {
+    fn e() -> () {}
+}
+fn f1() {
+    struct S1;
+    impl S1 {
+        fn e() -> () {}
+         //^
+    }
+    fn f2() {
+        struct S2;
+        S1::e$0();
+    }
+}
+fn f12() {
+    struct S1;
+    impl S1 {
+        fn e() -> () {}
+    }
+}
+"#,
+        );
+
+        check(
+            r#"
+struct S1;
+impl S1 {
+    fn e() -> () {}
+     //^
+}
+fn f2() {
+    struct S2;
+    S1::e$0();
+}
+"#,
+        );
     }
 }

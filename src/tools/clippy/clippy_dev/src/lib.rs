@@ -1,5 +1,5 @@
+#![feature(lazy_cell)]
 #![feature(let_chains)]
-#![feature(once_cell)]
 #![feature(rustc_private)]
 #![cfg_attr(feature = "deny-warnings", deny(warnings))]
 // warn on lints, that are included in `rust-lang/rust`s bootstrap
@@ -10,7 +10,9 @@
 extern crate rustc_driver;
 extern crate rustc_lexer;
 
+use std::io;
 use std::path::PathBuf;
+use std::process::{self, ExitStatus};
 
 pub mod bless;
 pub mod dogfood;
@@ -57,4 +59,15 @@ pub fn clippy_project_root() -> PathBuf {
         }
     }
     panic!("error: Can't determine root of project. Please run inside a Clippy working dir.");
+}
+
+pub fn exit_if_err(status: io::Result<ExitStatus>) {
+    match status.expect("failed to run command").code() {
+        Some(0) => {},
+        Some(n) => process::exit(n),
+        None => {
+            eprintln!("Killed by signal");
+            process::exit(1);
+        },
+    }
 }

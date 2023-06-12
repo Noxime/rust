@@ -11,11 +11,9 @@ use rustc_middle::mir::AssertKind::BoundsCheck;
 use rustc_middle::mir::*;
 use rustc_middle::thir::*;
 use rustc_middle::ty::AdtDef;
-use rustc_middle::ty::{self, CanonicalUserTypeAnnotation, Ty, TyCtxt, Variance};
+use rustc_middle::ty::{self, CanonicalUserTypeAnnotation, Ty, Variance};
 use rustc_span::Span;
-use rustc_target::abi::VariantIdx;
-
-use rustc_index::vec::Idx;
+use rustc_target::abi::{FieldIdx, VariantIdx, FIRST_VARIANT};
 
 use std::assert_matches::assert_matches;
 use std::iter;
@@ -91,8 +89,8 @@ fn convert_to_hir_projections_and_truncate_for_capture(
         let hir_projection = match mir_projection {
             ProjectionElem::Deref => HirProjectionKind::Deref,
             ProjectionElem::Field(field, _) => {
-                let variant = variant.unwrap_or(VariantIdx::new(0));
-                HirProjectionKind::Field(field.index() as u32, variant)
+                let variant = variant.unwrap_or(FIRST_VARIANT);
+                HirProjectionKind::Field(*field, variant)
             }
             ProjectionElem::Downcast(.., idx) => {
                 // We don't expect to see multi-variant enums here, as earlier
@@ -183,7 +181,7 @@ fn to_upvars_resolved_place_builder<'tcx>(
             &projection,
         ) else {
         let closure_span = cx.tcx.def_span(closure_def_id);
-        if !enable_precise_capture(cx.tcx, closure_span) {
+        if !enable_precise_capture(closure_span) {
             bug!(
                 "No associated capture found for {:?}[{:#?}] even though \
                     capture_disjoint_fields isn't enabled",
@@ -263,7 +261,7 @@ impl<'tcx> PlaceBuilder<'tcx> {
         let resolved = self.resolve_upvar(cx);
         let builder = resolved.as_ref().unwrap_or(self);
         let PlaceBase::Local(local) = builder.base else { return None };
-        let projection = cx.tcx.intern_place_elems(&builder.projection);
+        let projection = cx.tcx.mk_place_elems(&builder.projection);
         Some(Place { local, projection })
     }
 
@@ -295,7 +293,7 @@ impl<'tcx> PlaceBuilder<'tcx> {
         &self.projection
     }
 
-    pub(crate) fn field(self, f: Field, ty: Ty<'tcx>) -> Self {
+    pub(crate) fn field(self, f: FieldIdx, ty: Ty<'tcx>) -> Self {
         self.project(PlaceElem::Field(f, ty))
     }
 
@@ -559,6 +557,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | ExprKind::ConstBlock { .. }
             | ExprKind::StaticRef { .. }
             | ExprKind::InlineAsm { .. }
+            | ExprKind::OffsetOf { .. }
             | ExprKind::Yield { .. }
             | ExprKind::ThreadLocalRef(_)
             | ExprKind::Call { .. } => {
@@ -692,7 +691,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                             tcx.mk_imm_ref(tcx.lifetimes.re_erased, fake_borrow_deref_ty);
                         let fake_borrow_temp =
                             self.local_decls.push(LocalDecl::new(fake_borrow_ty, expr_span));
-                        let projection = tcx.intern_place_elems(&base_place.projection[..idx]);
+                        let projection = tcx.mk_place_elems(&base_place.projection[..idx]);
                         self.cfg.push_assign(
                             block,
                             source_info,
@@ -745,8 +744,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     }
 }
 
-/// Precise capture is enabled if the feature gate `capture_disjoint_fields` is enabled or if
-/// user is using Rust Edition 2021 or higher.
-fn enable_precise_capture(tcx: TyCtxt<'_>, closure_span: Span) -> bool {
-    tcx.features().capture_disjoint_fields || closure_span.rust_2021()
+/// Precise capture is enabled if user is using Rust Edition 2021 or higher.
+fn enable_precise_capture(closure_span: Span) -> bool {
+    closure_span.rust_2021()
 }

@@ -31,6 +31,7 @@ use rustc_span::symbol::sym;
 use rustc_span::InnerSpan;
 use rustc_target::spec::{CodeModel, RelocModel, SanitizerSet, SplitDebuginfo};
 
+use crate::llvm::diagnostic::OptimizationDiagnosticKind;
 use libc::{c_char, c_int, c_uint, c_void, size_t};
 use std::ffi::CString;
 use std::fs;
@@ -214,6 +215,8 @@ pub fn target_machine_factory(
 
     let path_mapping = sess.source_map().path_mapping().clone();
 
+    let force_emulated_tls = sess.target.force_emulated_tls;
+
     Arc::new(move |config: TargetMachineFactoryConfig| {
         let split_dwarf_file =
             path_mapping.map_prefix(config.split_dwarf_file.unwrap_or_default()).0;
@@ -239,6 +242,7 @@ pub fn target_machine_factory(
                 relax_elf_relocations,
                 use_init_array,
                 split_dwarf_file.as_ptr(),
+                force_emulated_tls,
             )
         };
 
@@ -360,6 +364,15 @@ unsafe extern "C" fn diagnostic_handler(info: &DiagnosticInfo, user: *mut c_void
                     line: opt.line,
                     column: opt.column,
                     pass_name: &opt.pass_name,
+                    kind: match opt.kind {
+                        OptimizationDiagnosticKind::OptimizationRemark => "success",
+                        OptimizationDiagnosticKind::OptimizationMissed
+                        | OptimizationDiagnosticKind::OptimizationFailure => "missed",
+                        OptimizationDiagnosticKind::OptimizationAnalysis
+                        | OptimizationDiagnosticKind::OptimizationAnalysisFPCommute
+                        | OptimizationDiagnosticKind::OptimizationAnalysisAliasing => "analysis",
+                        OptimizationDiagnosticKind::OptimizationRemarkOther => "other",
+                    },
                     message: &opt.message,
                 });
             }
@@ -412,11 +425,7 @@ fn get_pgo_sample_use_path(config: &ModuleConfig) -> Option<CString> {
 }
 
 fn get_instr_profile_output_path(config: &ModuleConfig) -> Option<CString> {
-    if config.instrument_coverage {
-        Some(CString::new("default_%m_%p.profraw").unwrap())
-    } else {
-        None
-    }
+    config.instrument_coverage.then(|| CString::new("default_%m_%p.profraw").unwrap())
 }
 
 pub(crate) unsafe fn llvm_optimize(
@@ -446,16 +455,19 @@ pub(crate) unsafe fn llvm_optimize(
             sanitize_thread: config.sanitizer.contains(SanitizerSet::THREAD),
             sanitize_hwaddress: config.sanitizer.contains(SanitizerSet::HWADDRESS),
             sanitize_hwaddress_recover: config.sanitizer_recover.contains(SanitizerSet::HWADDRESS),
+            sanitize_kernel_address: config.sanitizer.contains(SanitizerSet::KERNELADDRESS),
+            sanitize_kernel_address_recover: config
+                .sanitizer_recover
+                .contains(SanitizerSet::KERNELADDRESS),
         })
     } else {
         None
     };
 
-    let mut llvm_profiler = if cgcx.prof.llvm_recording_enabled() {
-        Some(LlvmSelfProfiler::new(cgcx.prof.get_self_profiler().unwrap()))
-    } else {
-        None
-    };
+    let mut llvm_profiler = cgcx
+        .prof
+        .llvm_recording_enabled()
+        .then(|| LlvmSelfProfiler::new(cgcx.prof.get_self_profiler().unwrap()));
 
     let llvm_selfprofiler =
         llvm_profiler.as_mut().map(|s| s as *mut _ as *mut c_void).unwrap_or(std::ptr::null_mut());
@@ -762,6 +774,7 @@ pub(crate) unsafe fn codegen(
             EmitObj::None => {}
         }
 
+        record_llvm_cgu_instructions_stats(&cgcx.prof, llmod);
         drop(handlers);
     }
 
@@ -878,11 +891,11 @@ unsafe fn embed_bitcode(
         let llglobal = llvm::LLVMAddGlobal(
             llmod,
             common::val_ty(llconst),
-            "rustc.embedded.module\0".as_ptr().cast(),
+            c"rustc.embedded.module".as_ptr().cast(),
         );
         llvm::LLVMSetInitializer(llglobal, llconst);
 
-        let section = if is_apple { "__LLVM,__bitcode\0" } else { ".llvmbc\0" };
+        let section = if is_apple { c"__LLVM,__bitcode" } else { c".llvmbc" };
         llvm::LLVMSetSection(llglobal, section.as_ptr().cast());
         llvm::LLVMRustSetLinkage(llglobal, llvm::Linkage::PrivateLinkage);
         llvm::LLVMSetGlobalConstant(llglobal, llvm::True);
@@ -891,19 +904,19 @@ unsafe fn embed_bitcode(
         let llglobal = llvm::LLVMAddGlobal(
             llmod,
             common::val_ty(llconst),
-            "rustc.embedded.cmdline\0".as_ptr().cast(),
+            c"rustc.embedded.cmdline".as_ptr().cast(),
         );
         llvm::LLVMSetInitializer(llglobal, llconst);
-        let section = if is_apple { "__LLVM,__cmdline\0" } else { ".llvmcmd\0" };
+        let section = if is_apple { c"__LLVM,__cmdline" } else { c".llvmcmd" };
         llvm::LLVMSetSection(llglobal, section.as_ptr().cast());
         llvm::LLVMRustSetLinkage(llglobal, llvm::Linkage::PrivateLinkage);
     } else {
         // We need custom section flags, so emit module-level inline assembly.
         let section_flags = if cgcx.is_pe_coff { "n" } else { "e" };
         let asm = create_section_with_flags_asm(".llvmbc", section_flags, bitcode);
-        llvm::LLVMRustAppendModuleInlineAsm(llmod, asm.as_ptr().cast(), asm.len());
+        llvm::LLVMAppendModuleInlineAsm(llmod, asm.as_ptr().cast(), asm.len());
         let asm = create_section_with_flags_asm(".llvmcmd", section_flags, cmdline.as_bytes());
-        llvm::LLVMRustAppendModuleInlineAsm(llmod, asm.as_ptr().cast(), asm.len());
+        llvm::LLVMAppendModuleInlineAsm(llmod, asm.as_ptr().cast(), asm.len());
     }
 }
 
@@ -974,4 +987,24 @@ fn record_artifact_size(
         let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         self_profiler_ref.artifact_size(artifact_kind, artifact_name.to_string_lossy(), file_size);
     }
+}
+
+fn record_llvm_cgu_instructions_stats(prof: &SelfProfilerRef, llmod: &llvm::Module) {
+    if !prof.enabled() {
+        return;
+    }
+
+    let raw_stats =
+        llvm::build_string(|s| unsafe { llvm::LLVMRustModuleInstructionStats(&llmod, s) })
+            .expect("cannot get module instruction stats");
+
+    #[derive(serde::Deserialize)]
+    struct InstructionsStats {
+        module: String,
+        total: u64,
+    }
+
+    let InstructionsStats { module, total } =
+        serde_json::from_str(&raw_stats).expect("cannot parse llvm cgu instructions stats");
+    prof.artifact_size("cgu_instructions", module, total);
 }

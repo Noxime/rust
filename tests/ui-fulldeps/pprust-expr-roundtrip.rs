@@ -41,7 +41,7 @@ use rustc_session::parse::ParseSess;
 use rustc_span::source_map::FilePathMapping;
 use rustc_span::source_map::{FileName, Spanned, DUMMY_SP};
 use rustc_span::symbol::Ident;
-use thin_vec::thin_vec;
+use thin_vec::{thin_vec, ThinVec};
 
 fn parse_expr(ps: &ParseSess, src: &str) -> Option<P<Expr>> {
     let src_as_string = src.to_string();
@@ -73,45 +73,44 @@ fn iter_exprs(depth: usize, f: &mut dyn FnMut(P<Expr>)) {
 
     let mut g = |e| f(expr(e));
 
-    for kind in 0..=19 {
+    for kind in 0..=18 {
         match kind {
-            0 => iter_exprs(depth - 1, &mut |e| g(ExprKind::Box(e))),
-            1 => iter_exprs(depth - 1, &mut |e| g(ExprKind::Call(e, vec![]))),
-            2 => {
+            0 => iter_exprs(depth - 1, &mut |e| g(ExprKind::Call(e, thin_vec![]))),
+            1 => {
                 let seg = PathSegment::from_ident(Ident::from_str("x"));
                 iter_exprs(depth - 1, &mut |e| {
                     g(ExprKind::MethodCall(Box::new(MethodCall {
-                        seg: seg.clone(), receiver: e, args: vec![make_x()], span: DUMMY_SP
+                        seg: seg.clone(), receiver: e, args: thin_vec![make_x()], span: DUMMY_SP
                     }))
                 )});
                 iter_exprs(depth - 1, &mut |e| {
                     g(ExprKind::MethodCall(Box::new(MethodCall {
-                        seg: seg.clone(), receiver: make_x(), args: vec![e], span: DUMMY_SP
+                        seg: seg.clone(), receiver: make_x(), args: thin_vec![e], span: DUMMY_SP
                     }))
                 )});
             }
-            3..=8 => {
+            2..=7 => {
                 let op = Spanned {
                     span: DUMMY_SP,
                     node: match kind {
-                        3 => BinOpKind::Add,
-                        4 => BinOpKind::Mul,
-                        5 => BinOpKind::Shl,
-                        6 => BinOpKind::And,
-                        7 => BinOpKind::Or,
-                        8 => BinOpKind::Lt,
+                        2 => BinOpKind::Add,
+                        3 => BinOpKind::Mul,
+                        4 => BinOpKind::Shl,
+                        5 => BinOpKind::And,
+                        6 => BinOpKind::Or,
+                        7 => BinOpKind::Lt,
                         _ => unreachable!(),
                     },
                 };
                 iter_exprs(depth - 1, &mut |e| g(ExprKind::Binary(op, e, make_x())));
                 iter_exprs(depth - 1, &mut |e| g(ExprKind::Binary(op, make_x(), e)));
             }
-            9 => {
+            8 => {
                 iter_exprs(depth - 1, &mut |e| g(ExprKind::Unary(UnOp::Deref, e)));
             }
-            10 => {
+            9 => {
                 let block = P(Block {
-                    stmts: Vec::new(),
+                    stmts: ThinVec::new(),
                     id: DUMMY_NODE_ID,
                     rules: BlockCheckMode::Default,
                     span: DUMMY_SP,
@@ -120,8 +119,8 @@ fn iter_exprs(depth: usize, f: &mut dyn FnMut(P<Expr>)) {
                 });
                 iter_exprs(depth - 1, &mut |e| g(ExprKind::If(e, block.clone(), None)));
             }
-            11 => {
-                let decl = P(FnDecl { inputs: vec![], output: FnRetTy::Default(DUMMY_SP) });
+            10 => {
+                let decl = P(FnDecl { inputs: thin_vec![], output: FnRetTy::Default(DUMMY_SP) });
                 iter_exprs(depth - 1, &mut |e| {
                     g(ExprKind::Closure(Box::new(Closure {
                         binder: ClosureBinder::NotPresent,
@@ -136,14 +135,14 @@ fn iter_exprs(depth: usize, f: &mut dyn FnMut(P<Expr>)) {
                     })))
                 });
             }
-            12 => {
+            11 => {
                 iter_exprs(depth - 1, &mut |e| g(ExprKind::Assign(e, make_x(), DUMMY_SP)));
                 iter_exprs(depth - 1, &mut |e| g(ExprKind::Assign(make_x(), e, DUMMY_SP)));
             }
-            13 => {
+            12 => {
                 iter_exprs(depth - 1, &mut |e| g(ExprKind::Field(e, Ident::from_str("f"))));
             }
-            14 => {
+            13 => {
                 iter_exprs(depth - 1, &mut |e| {
                     g(ExprKind::Range(Some(e), Some(make_x()), RangeLimits::HalfOpen))
                 });
@@ -151,28 +150,28 @@ fn iter_exprs(depth: usize, f: &mut dyn FnMut(P<Expr>)) {
                     g(ExprKind::Range(Some(make_x()), Some(e), RangeLimits::HalfOpen))
                 });
             }
-            15 => {
+            14 => {
                 iter_exprs(depth - 1, &mut |e| {
                     g(ExprKind::AddrOf(BorrowKind::Ref, Mutability::Not, e))
                 });
             }
-            16 => {
+            15 => {
                 g(ExprKind::Ret(None));
                 iter_exprs(depth - 1, &mut |e| g(ExprKind::Ret(Some(e))));
             }
-            17 => {
+            16 => {
                 let path = Path::from_ident(Ident::from_str("S"));
                 g(ExprKind::Struct(P(StructExpr {
                     qself: None,
                     path,
-                    fields: vec![],
+                    fields: thin_vec![],
                     rest: StructRest::Base(make_x()),
                 })));
             }
-            18 => {
+            17 => {
                 iter_exprs(depth - 1, &mut |e| g(ExprKind::Try(e)));
             }
-            19 => {
+            18 => {
                 let pat =
                     P(Pat { id: DUMMY_NODE_ID, kind: PatKind::Wild, span: DUMMY_SP, tokens: None });
                 iter_exprs(depth - 1, &mut |e| g(ExprKind::Let(pat.clone(), e, DUMMY_SP)))
@@ -220,7 +219,7 @@ fn main() {
 }
 
 fn run() {
-    let ps = ParseSess::new(FilePathMapping::empty());
+    let ps = ParseSess::new(vec![rustc_parse::DEFAULT_LOCALE_RESOURCE], FilePathMapping::empty());
 
     iter_exprs(2, &mut |mut e| {
         // If the pretty printer is correct, then `parse(print(e))` should be identical to `e`,

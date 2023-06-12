@@ -125,7 +125,7 @@ impl FlagComputation {
                 self.bound_computation(ts, |flags, ts| flags.add_tys(ts));
             }
 
-            &ty::GeneratorWitnessMIR(_, ref substs) => {
+            ty::GeneratorWitnessMIR(_, substs) => {
                 let should_remove_further_specializable =
                     !self.flags.contains(TypeFlags::STILL_FURTHER_SPECIALIZABLE);
                 self.add_substs(substs);
@@ -176,14 +176,14 @@ impl FlagComputation {
                 self.add_substs(substs);
             }
 
-            &ty::Alias(ty::Projection, data) => {
-                self.add_flags(TypeFlags::HAS_TY_PROJECTION);
-                self.add_projection_ty(data);
-            }
+            &ty::Alias(kind, data) => {
+                self.add_flags(match kind {
+                    ty::Projection => TypeFlags::HAS_TY_PROJECTION,
+                    ty::Inherent => TypeFlags::HAS_TY_INHERENT,
+                    ty::Opaque => TypeFlags::HAS_TY_OPAQUE,
+                });
 
-            &ty::Alias(ty::Opaque, ty::AliasTy { substs, .. }) => {
-                self.add_flags(TypeFlags::HAS_TY_OPAQUE);
-                self.add_substs(substs);
+                self.add_alias_ty(data);
             }
 
             &ty::Dynamic(obj, r, _) => {
@@ -251,6 +251,10 @@ impl FlagComputation {
                 self.add_ty(ty);
                 self.add_region(region);
             }
+            ty::PredicateKind::Clause(ty::Clause::ConstArgHasType(ct, ty)) => {
+                self.add_const(ct);
+                self.add_ty(ty);
+            }
             ty::PredicateKind::Subtype(ty::SubtypePredicate { a_is_expected: _, a, b }) => {
                 self.add_ty(a);
                 self.add_ty(b);
@@ -263,11 +267,8 @@ impl FlagComputation {
                 projection_ty,
                 term,
             })) => {
-                self.add_projection_ty(projection_ty);
-                match term.unpack() {
-                    ty::TermKind::Ty(ty) => self.add_ty(ty),
-                    ty::TermKind::Const(c) => self.add_const(c),
-                }
+                self.add_alias_ty(projection_ty);
+                self.add_term(term);
             }
             ty::PredicateKind::WellFormed(arg) => {
                 self.add_substs(slice::from_ref(&arg));
@@ -287,6 +288,10 @@ impl FlagComputation {
                 self.add_ty(ty);
             }
             ty::PredicateKind::Ambiguous => {}
+            ty::PredicateKind::AliasRelate(t1, t2, _) => {
+                self.add_term(t1);
+                self.add_term(t2);
+            }
         }
     }
 
@@ -367,8 +372,8 @@ impl FlagComputation {
         }
     }
 
-    fn add_projection_ty(&mut self, projection_ty: ty::AliasTy<'_>) {
-        self.add_substs(projection_ty.substs);
+    fn add_alias_ty(&mut self, alias_ty: ty::AliasTy<'_>) {
+        self.add_substs(alias_ty.substs);
     }
 
     fn add_substs(&mut self, substs: &[GenericArg<'_>]) {
@@ -378,6 +383,13 @@ impl FlagComputation {
                 GenericArgKind::Lifetime(lt) => self.add_region(lt),
                 GenericArgKind::Const(ct) => self.add_const(ct),
             }
+        }
+    }
+
+    fn add_term(&mut self, term: ty::Term<'_>) {
+        match term.unpack() {
+            ty::TermKind::Ty(ty) => self.add_ty(ty),
+            ty::TermKind::Const(ct) => self.add_const(ct),
         }
     }
 }

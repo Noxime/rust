@@ -203,7 +203,7 @@ impl<'a> ArchiveBuilder<'a> for ArArchiveBuilder<'a> {
             }
         }
 
-        self.src_archives.push((archive_path.to_owned(), archive_map));
+        self.src_archives.push((archive_path, archive_map));
         Ok(())
     }
 
@@ -233,6 +233,7 @@ impl<'a> ArArchiveBuilder<'a> {
             "bsd" => ArchiveKind::Bsd,
             "darwin" => ArchiveKind::Darwin,
             "coff" => ArchiveKind::Coff,
+            "aix_big" => ArchiveKind::AixBig,
             kind => {
                 self.sess.emit_fatal(UnknownArchiveKind { kind });
             }

@@ -54,12 +54,22 @@ pub(crate) fn codegen_tls_ref<'tcx>(
     def_id: DefId,
     layout: TyAndLayout<'tcx>,
 ) -> CValue<'tcx> {
-    let data_id = data_id_for_static(fx.tcx, fx.module, def_id, false);
-    let local_data_id = fx.module.declare_data_in_func(data_id, &mut fx.bcx.func);
-    if fx.clif_comments.enabled() {
-        fx.add_comment(local_data_id, format!("tls {:?}", def_id));
-    }
-    let tls_ptr = fx.bcx.ins().tls_value(fx.pointer_type, local_data_id);
+    let tls_ptr = if !def_id.is_local() && fx.tcx.needs_thread_local_shim(def_id) {
+        let instance = ty::Instance {
+            def: ty::InstanceDef::ThreadLocalShim(def_id),
+            substs: ty::InternalSubsts::empty(),
+        };
+        let func_ref = fx.get_function_ref(instance);
+        let call = fx.bcx.ins().call(func_ref, &[]);
+        fx.bcx.func.dfg.first_result(call)
+    } else {
+        let data_id = data_id_for_static(fx.tcx, fx.module, def_id, false);
+        let local_data_id = fx.module.declare_data_in_func(data_id, &mut fx.bcx.func);
+        if fx.clif_comments.enabled() {
+            fx.add_comment(local_data_id, format!("tls {:?}", def_id));
+        }
+        fx.bcx.ins().tls_value(fx.pointer_type, local_data_id)
+    };
     CValue::by_val(tls_ptr, layout)
 }
 
@@ -81,7 +91,7 @@ pub(crate) fn eval_mir_constant<'tcx>(
             ),
         },
         ConstantKind::Unevaluated(mir::UnevaluatedConst { def, .. }, _)
-            if fx.tcx.is_static(def.did) =>
+            if fx.tcx.is_static(def) =>
         {
             span_bug!(constant.span, "MIR constant refers to static");
         }
@@ -149,6 +159,8 @@ pub(crate) fn codegen_const_value<'tcx>(
                         _ => unreachable!(),
                     };
 
+                    // FIXME avoid this extra copy to the stack and directly write to the final
+                    // destination
                     let place = CPlace::new_stack_slot(fx, layout);
                     place.to_ptr().store(fx, val, MemFlags::trusted());
                     place.to_cvalue(fx)
@@ -290,13 +302,13 @@ fn data_id_for_static(
         };
 
         let data_id = match module.declare_data(
-            &*symbol_name,
+            symbol_name,
             linkage,
             is_mutable,
             attrs.flags.contains(CodegenFnAttrFlags::THREAD_LOCAL),
         ) {
             Ok(data_id) => data_id,
-            Err(ModuleError::IncompatibleDeclaration(_)) => tcx.sess.fatal(&format!(
+            Err(ModuleError::IncompatibleDeclaration(_)) => tcx.sess.fatal(format!(
                 "attempt to declare `{symbol_name}` as static, but it was already declared as function"
             )),
             Err(err) => Err::<_, _>(err).unwrap(),
@@ -338,13 +350,13 @@ fn data_id_for_static(
     };
 
     let data_id = match module.declare_data(
-        &*symbol_name,
+        symbol_name,
         linkage,
         is_mutable,
         attrs.flags.contains(CodegenFnAttrFlags::THREAD_LOCAL),
     ) {
         Ok(data_id) => data_id,
-        Err(ModuleError::IncompatibleDeclaration(_)) => tcx.sess.fatal(&format!(
+        Err(ModuleError::IncompatibleDeclaration(_)) => tcx.sess.fatal(format!(
             "attempt to declare `{symbol_name}` as static, but it was already declared as function"
         )),
         Err(err) => Err::<_, _>(err).unwrap(),
@@ -392,7 +404,7 @@ fn define_all_allocs(tcx: TyCtxt<'_>, module: &mut dyn Module, cx: &mut Constant
                 if let Some(names) = section_name.split_once(',') {
                     names
                 } else {
-                    tcx.sess.fatal(&format!(
+                    tcx.sess.fatal(format!(
                         "#[link_section = \"{}\"] is not valid for macos target: must be segment and section separated by comma",
                         section_name
                     ));
@@ -437,7 +449,7 @@ fn define_all_allocs(tcx: TyCtxt<'_>, module: &mut dyn Module, cx: &mut Constant
                 GlobalAlloc::Static(def_id) => {
                     if tcx.codegen_fn_attrs(def_id).flags.contains(CodegenFnAttrFlags::THREAD_LOCAL)
                     {
-                        tcx.sess.fatal(&format!(
+                        tcx.sess.fatal(format!(
                             "Allocation {:?} contains reference to TLS value {:?}",
                             alloc_id, def_id
                         ));
@@ -529,6 +541,7 @@ pub(crate) fn mir_operand_get_const_val<'tcx>(
                         | StatementKind::StorageDead(_)
                         | StatementKind::Retag(_, _)
                         | StatementKind::AscribeUserType(_, _)
+                        | StatementKind::PlaceMention(..)
                         | StatementKind::Coverage(_)
                         | StatementKind::ConstEvalCounter
                         | StatementKind::Nop => {}
@@ -538,13 +551,12 @@ pub(crate) fn mir_operand_get_const_val<'tcx>(
                     TerminatorKind::Goto { .. }
                     | TerminatorKind::SwitchInt { .. }
                     | TerminatorKind::Resume
-                    | TerminatorKind::Abort
+                    | TerminatorKind::Terminate
                     | TerminatorKind::Return
                     | TerminatorKind::Unreachable
                     | TerminatorKind::Drop { .. }
                     | TerminatorKind::Assert { .. } => {}
-                    TerminatorKind::DropAndReplace { .. }
-                    | TerminatorKind::Yield { .. }
+                    TerminatorKind::Yield { .. }
                     | TerminatorKind::GeneratorDrop
                     | TerminatorKind::FalseEdge { .. }
                     | TerminatorKind::FalseUnwind { .. } => unreachable!(),

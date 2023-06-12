@@ -11,6 +11,8 @@ mod tests;
 
 pub const ASAN_SUPPORTED_TARGETS: &[&str] = &[
     "aarch64-apple-darwin",
+    "aarch64-apple-ios",
+    "aarch64-apple-ios-sim",
     "aarch64-unknown-fuchsia",
     "aarch64-linux-android",
     "aarch64-unknown-linux-gnu",
@@ -19,6 +21,7 @@ pub const ASAN_SUPPORTED_TARGETS: &[&str] = &[
     "i686-linux-android",
     "i686-unknown-linux-gnu",
     "x86_64-apple-darwin",
+    "x86_64-apple-ios",
     "x86_64-unknown-fuchsia",
     "x86_64-linux-android",
     "x86_64-unknown-freebsd",
@@ -45,6 +48,13 @@ pub const CFI_SUPPORTED_TARGETS: &[&str] = &[
 
 pub const KCFI_SUPPORTED_TARGETS: &[&str] = &["aarch64-linux-none", "x86_64-linux-none"];
 
+pub const KASAN_SUPPORTED_TARGETS: &[&str] = &[
+    "aarch64-unknown-none",
+    "riscv64gc-unknown-none-elf",
+    "riscv64imac-unknown-none-elf",
+    "x86_64-unknown-none",
+];
+
 pub const LSAN_SUPPORTED_TARGETS: &[&str] = &[
     // FIXME: currently broken, see #88132
     // "aarch64-apple-darwin",
@@ -63,8 +73,11 @@ pub const MSAN_SUPPORTED_TARGETS: &[&str] = &[
 
 pub const TSAN_SUPPORTED_TARGETS: &[&str] = &[
     "aarch64-apple-darwin",
+    "aarch64-apple-ios",
+    "aarch64-apple-ios-sim",
     "aarch64-unknown-linux-gnu",
     "x86_64-apple-darwin",
+    "x86_64-apple-ios",
     "x86_64-unknown-freebsd",
     "x86_64-unknown-linux-gnu",
     "s390x-unknown-linux-gnu",
@@ -77,6 +90,21 @@ pub const MEMTAG_SUPPORTED_TARGETS: &[&str] =
     &["aarch64-linux-android", "aarch64-unknown-linux-gnu"];
 
 pub const SHADOWCALLSTACK_SUPPORTED_TARGETS: &[&str] = &["aarch64-linux-android"];
+
+pub const XRAY_SUPPORTED_TARGETS: &[&str] = &[
+    "aarch64-linux-android",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-unknown-linux-musl",
+    "x86_64-linux-android",
+    "x86_64-unknown-freebsd",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "x86_64-unknown-netbsd",
+    "x86_64-unknown-none-linuxkernel",
+    "x86_64-unknown-openbsd",
+];
+
+pub const SAFESTACK_SUPPORTED_TARGETS: &[&str] = &["x86_64-unknown-linux-gnu"];
 
 pub fn make_new_path(path: &str) -> String {
     assert!(cfg!(windows));
@@ -130,6 +158,8 @@ pub fn dylib_env_var() -> &'static str {
         "DYLD_LIBRARY_PATH"
     } else if cfg!(target_os = "haiku") {
         "LIBRARY_PATH"
+    } else if cfg!(target_os = "aix") {
+        "LIBPATH"
     } else {
         "LD_LIBRARY_PATH"
     }

@@ -79,36 +79,33 @@ fn position(
     position_encoding: &PositionEncoding,
     span: &DiagnosticSpan,
     line_offset: usize,
-    column_offset: usize,
+    column_offset_utf32: usize,
 ) -> lsp_types::Position {
     let line_index = line_offset - span.line_start;
 
-    let mut true_column_offset = column_offset;
-    if let Some(line) = span.text.get(line_index) {
-        if line.text.chars().count() == line.text.len() {
-            // all one byte utf-8 char
-            return lsp_types::Position {
-                line: (line_offset as u32).saturating_sub(1),
-                character: (column_offset as u32).saturating_sub(1),
-            };
-        }
-        let mut char_offset = 0;
-        let len_func = match position_encoding {
-            PositionEncoding::Utf8 => char::len_utf8,
-            PositionEncoding::Utf16 => char::len_utf16,
-        };
-        for c in line.text.chars() {
-            char_offset += 1;
-            if char_offset > column_offset {
-                break;
+    let column_offset_encoded = match span.text.get(line_index) {
+        // Fast path.
+        Some(line) if line.text.is_ascii() => column_offset_utf32,
+        Some(line) => {
+            let line_prefix_len = line
+                .text
+                .char_indices()
+                .take(column_offset_utf32)
+                .last()
+                .map(|(pos, c)| pos + c.len_utf8())
+                .unwrap_or(0);
+            let line_prefix = &line.text[..line_prefix_len];
+            match position_encoding {
+                PositionEncoding::Utf8 => line_prefix.len(),
+                PositionEncoding::Wide(enc) => enc.measure(line_prefix),
             }
-            true_column_offset += len_func(c) - 1;
         }
-    }
+        None => column_offset_utf32,
+    };
 
     lsp_types::Position {
         line: (line_offset as u32).saturating_sub(1),
-        character: (true_column_offset as u32).saturating_sub(1),
+        character: (column_offset_encoded as u32).saturating_sub(1),
     }
 }
 
@@ -534,7 +531,7 @@ mod tests {
         let (sender, _) = crossbeam_channel::unbounded();
         let state = GlobalState::new(
             sender,
-            Config::new(workspace_root.to_path_buf(), ClientCapabilities::default()),
+            Config::new(workspace_root.to_path_buf(), ClientCapabilities::default(), Vec::new()),
         );
         let snap = state.snapshot();
         let mut actual = map_rust_diagnostic_to_lsp(&config, &diagnostic, workspace_root, &snap);

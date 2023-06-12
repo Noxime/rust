@@ -3,10 +3,9 @@
 
 #![feature(io_error_more)]
 #![feature(io_error_uncategorized)]
-#![feature(is_terminal)]
 
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{c_char, OsString};
 use std::fs::{
     canonicalize, create_dir, read_dir, read_link, remove_dir, remove_dir_all, remove_file, rename,
     File, OpenOptions,
@@ -39,7 +38,11 @@ fn host_to_target_path(path: String) -> PathBuf {
 
     unsafe {
         extern "Rust" {
-            fn miri_host_to_target_path(path: *const i8, out: *mut i8, out_size: usize) -> usize;
+            fn miri_host_to_target_path(
+                path: *const c_char,
+                out: *mut c_char,
+                out_size: usize,
+            ) -> usize;
         }
         let ret = miri_host_to_target_path(path.as_ptr(), out.as_mut_ptr(), out.capacity());
         assert_eq!(ret, 0);
@@ -362,7 +365,7 @@ fn test_directory() {
 
     // Deleting the directory should succeed.
     remove_dir(&dir_path).unwrap();
-    // Reading the metadata of a non-existent directory should fail with a "not found" error.
+    // Reading the metadata of a nonexistent directory should fail with a "not found" error.
     assert_eq!(ErrorKind::NotFound, check_metadata(&[], &dir_path).unwrap_err().kind());
 
     // To test remove_dir_all, re-create the directory with a file and a directory in it.

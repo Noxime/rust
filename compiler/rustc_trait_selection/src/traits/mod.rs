@@ -4,7 +4,7 @@
 
 pub mod auto_trait;
 mod chalk_fulfill;
-mod coherence;
+pub(crate) mod coherence;
 pub mod const_evaluatable;
 mod engine;
 pub mod error_reporting;
@@ -14,9 +14,12 @@ mod object_safety;
 pub mod outlives_bounds;
 mod project;
 pub mod query;
+#[cfg_attr(not(bootstrap), allow(hidden_glob_reexports))]
 mod select;
 mod specialize;
 mod structural_match;
+mod structural_normalize;
+#[cfg_attr(not(bootstrap), allow(hidden_glob_reexports))]
 mod util;
 mod vtable;
 pub mod wf;
@@ -26,11 +29,12 @@ use crate::infer::{InferCtxt, TyCtxtInferExt};
 use crate::traits::error_reporting::TypeErrCtxtExt as _;
 use crate::traits::query::evaluate_obligation::InferCtxtExt as _;
 use rustc_errors::ErrorGuaranteed;
+use rustc_middle::query::Providers;
 use rustc_middle::ty::fold::TypeFoldable;
-use rustc_middle::ty::visit::TypeVisitable;
-use rustc_middle::ty::{self, DefIdTree, ToPredicate, Ty, TyCtxt, TypeSuperVisitable};
+use rustc_middle::ty::visit::{TypeVisitable, TypeVisitableExt};
+use rustc_middle::ty::{self, ToPredicate, Ty, TyCtxt, TypeFolder, TypeSuperVisitable};
 use rustc_middle::ty::{InternalSubsts, SubstsRef};
-use rustc_span::def_id::{DefId, CRATE_DEF_ID};
+use rustc_span::def_id::DefId;
 use rustc_span::Span;
 
 use std::fmt::Debug;
@@ -49,26 +53,23 @@ pub use self::object_safety::astconv_object_safety_violations;
 pub use self::object_safety::is_vtable_safe_method;
 pub use self::object_safety::MethodViolationCode;
 pub use self::object_safety::ObjectSafetyViolation;
-pub use self::project::{normalize_projection_type, NormalizeExt};
+pub use self::project::NormalizeExt;
+pub use self::project::{normalize_inherent_projection, normalize_projection_type};
 pub use self::select::{EvaluationCache, SelectionCache, SelectionContext};
 pub use self::select::{EvaluationResult, IntercrateAmbiguityCause, OverflowError};
 pub use self::specialize::specialization_graph::FutureCompatOverlapError;
 pub use self::specialize::specialization_graph::FutureCompatOverlapErrorKind;
-pub use self::specialize::{specialization_graph, translate_substs, OverlapError};
-pub use self::structural_match::{
-    search_for_adt_const_param_violation, search_for_structural_match_violation,
+pub use self::specialize::{
+    specialization_graph, translate_substs, translate_substs_with_cause, OverlapError,
 };
-pub use self::util::{
-    elaborate_obligations, elaborate_predicates, elaborate_predicates_with_span,
-    elaborate_trait_ref, elaborate_trait_refs,
-};
+pub use self::structural_match::search_for_structural_match_violation;
+pub use self::structural_normalize::StructurallyNormalizeExt;
+pub use self::util::elaborate;
 pub use self::util::{expand_trait_aliases, TraitAliasExpander};
+pub use self::util::{get_vtable_index_of_object_method, impl_item_is_final, upcast_choices};
 pub use self::util::{
-    get_vtable_index_of_object_method, impl_item_is_final, predicate_for_trait_def, upcast_choices,
-};
-pub use self::util::{
-    supertrait_def_ids, supertraits, transitive_bounds, transitive_bounds_that_define_assoc_type,
-    SupertraitDefIds, Supertraits,
+    supertrait_def_ids, supertraits, transitive_bounds, transitive_bounds_that_define_assoc_item,
+    SupertraitDefIds,
 };
 
 pub use self::chalk_fulfill::FulfillmentContext as ChalkFulfillmentContext;
@@ -131,55 +132,51 @@ pub fn type_known_to_meet_bound_modulo_regions<'tcx>(
     param_env: ty::ParamEnv<'tcx>,
     ty: Ty<'tcx>,
     def_id: DefId,
-    span: Span,
 ) -> bool {
-    let trait_ref = ty::Binder::dummy(infcx.tcx.mk_trait_ref(def_id, [ty]));
-    pred_known_to_hold_modulo_regions(infcx, param_env, trait_ref.without_const(), span)
+    let trait_ref = ty::TraitRef::new(infcx.tcx, def_id, [ty]);
+    pred_known_to_hold_modulo_regions(infcx, param_env, trait_ref.without_const())
 }
 
-#[instrument(level = "debug", skip(infcx, param_env, span, pred), ret)]
+/// FIXME(@lcnr): this function doesn't seem right and shouldn't exist?
+///
+/// Ping me on zulip if you want to use this method and need help with finding
+/// an appropriate replacement.
+#[instrument(level = "debug", skip(infcx, param_env, pred), ret)]
 fn pred_known_to_hold_modulo_regions<'tcx>(
     infcx: &InferCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
-    pred: impl ToPredicate<'tcx> + TypeVisitable<'tcx>,
-    span: Span,
+    pred: impl ToPredicate<'tcx>,
 ) -> bool {
-    let has_non_region_infer = pred.has_non_region_infer();
-    let obligation = Obligation {
-        param_env,
-        // We can use a dummy node-id here because we won't pay any mind
-        // to region obligations that arise (there shouldn't really be any
-        // anyhow).
-        cause: ObligationCause::misc(span, CRATE_DEF_ID),
-        recursion_depth: 0,
-        predicate: pred.to_predicate(infcx.tcx),
-    };
+    let obligation = Obligation::new(infcx.tcx, ObligationCause::dummy(), param_env, pred);
 
-    let result = infcx.predicate_must_hold_modulo_regions(&obligation);
+    let result = infcx.evaluate_obligation_no_overflow(&obligation);
     debug!(?result);
 
-    if result && has_non_region_infer {
-        // Because of inference "guessing", selection can sometimes claim
-        // to succeed while the success requires a guess. To ensure
-        // this function's result remains infallible, we must confirm
-        // that guess. While imperfect, I believe this is sound.
+    if result.must_apply_modulo_regions() {
+        true
+    } else if result.may_apply() {
+        // Sometimes obligations are ambiguous because the recursive evaluator
+        // is not smart enough, so we fall back to fulfillment when we're not certain
+        // that an obligation holds or not. Even still, we must make sure that
+        // the we do no inference in the process of checking this obligation.
+        let goal = infcx.resolve_vars_if_possible((obligation.predicate, obligation.param_env));
+        infcx.probe(|_| {
+            let ocx = ObligationCtxt::new_in_snapshot(infcx);
+            ocx.register_obligation(obligation);
 
-        // FIXME(@lcnr): this function doesn't seem right.
-        //
-        // The handling of regions in this area of the code is terrible,
-        // see issue #29149. We should be able to improve on this with
-        // NLL.
-        let errors = fully_solve_obligation(infcx, obligation);
+            let errors = ocx.select_all_or_error();
+            match errors.as_slice() {
+                // Only known to hold if we did no inference.
+                [] => infcx.shallow_resolve(goal) == goal,
 
-        match &errors[..] {
-            [] => true,
-            errors => {
-                debug!(?errors);
-                false
+                errors => {
+                    debug!(?errors);
+                    false
+                }
             }
-        }
+        })
     } else {
-        result
+        false
     }
 }
 
@@ -208,12 +205,12 @@ fn do_normalize_predicates<'tcx>(
     let predicates = match fully_normalize(&infcx, cause, elaborated_env, predicates) {
         Ok(predicates) => predicates,
         Err(errors) => {
-            let reported = infcx.err_ctxt().report_fulfillment_errors(&errors, None);
+            let reported = infcx.err_ctxt().report_fulfillment_errors(&errors);
             return Err(reported);
         }
     };
 
-    debug!("do_normalize_predictes: normalized predicates = {:?}", predicates);
+    debug!("do_normalize_predicates: normalized predicates = {:?}", predicates);
 
     // We can use the `elaborated_env` here; the region code only
     // cares about declarations like `'a: 'b`.
@@ -273,15 +270,67 @@ pub fn normalize_param_env_or_error<'tcx>(
     // parameter environments once for every fn as it goes,
     // and errors will get reported then; so outside of type inference we
     // can be sure that no errors should occur.
-    let mut predicates: Vec<_> =
-        util::elaborate_predicates(tcx, unnormalized_env.caller_bounds().into_iter())
-            .map(|obligation| obligation.predicate)
-            .collect();
+    let mut predicates: Vec<_> = util::elaborate(
+        tcx,
+        unnormalized_env.caller_bounds().into_iter().map(|predicate| {
+            if tcx.features().generic_const_exprs {
+                return predicate;
+            }
+
+            struct ConstNormalizer<'tcx>(TyCtxt<'tcx>);
+
+            impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ConstNormalizer<'tcx> {
+                fn interner(&self) -> TyCtxt<'tcx> {
+                    self.0
+                }
+
+                fn fold_const(&mut self, c: ty::Const<'tcx>) -> ty::Const<'tcx> {
+                    // While it is pretty sus to be evaluating things with an empty param env, it
+                    // should actually be okay since without `feature(generic_const_exprs)` the only
+                    // const arguments that have a non-empty param env are array repeat counts. These
+                    // do not appear in the type system though.
+                    c.eval(self.0, ty::ParamEnv::empty())
+                }
+            }
+
+            // This whole normalization step is a hack to work around the fact that
+            // `normalize_param_env_or_error` is fundamentally broken from using an
+            // unnormalized param env with a trait solver that expects the param env
+            // to be normalized.
+            //
+            // When normalizing the param env we can end up evaluating obligations
+            // that have been normalized but can only be proven via a where clause
+            // which is still in its unnormalized form. example:
+            //
+            // Attempting to prove `T: Trait<<u8 as Identity>::Assoc>` in a param env
+            // with a `T: Trait<<u8 as Identity>::Assoc>` where clause will fail because
+            // we first normalize obligations before proving them so we end up proving
+            // `T: Trait<u8>`. Since lazy normalization is not implemented equating `u8`
+            // with `<u8 as Identity>::Assoc` fails outright so we incorrectly believe that
+            // we cannot prove `T: Trait<u8>`.
+            //
+            // The same thing is true for const generics- attempting to prove
+            // `T: Trait<ConstKind::Unevaluated(...)>` with the same thing as a where clauses
+            // will fail. After normalization we may be attempting to prove `T: Trait<4>` with
+            // the unnormalized where clause `T: Trait<ConstKind::Unevaluated(...)>`. In order
+            // for the obligation to hold `4` must be equal to `ConstKind::Unevaluated(...)`
+            // but as we do not have lazy norm implemented, equating the two consts fails outright.
+            //
+            // Ideally we would not normalize consts here at all but it is required for backwards
+            // compatibility. Eventually when lazy norm is implemented this can just be removed.
+            // We do not normalize types here as there is no backwards compatibility requirement
+            // for us to do so.
+            //
+            // FIXME(-Ztrait-solver=next): remove this hack since we have deferred projection equality
+            predicate.fold_with(&mut ConstNormalizer(tcx))
+        }),
+    )
+    .collect();
 
     debug!("normalize_param_env_or_error: elaborated-predicates={:?}", predicates);
 
     let elaborated_env = ty::ParamEnv::new(
-        tcx.intern_predicates(&predicates),
+        tcx.mk_predicates(&predicates),
         unnormalized_env.reveal(),
         unnormalized_env.constness(),
     );
@@ -333,10 +382,9 @@ pub fn normalize_param_env_or_error<'tcx>(
     // Not sure whether it is better to include the unnormalized TypeOutlives predicates
     // here. I believe they should not matter, because we are ignoring TypeOutlives param-env
     // predicates here anyway. Keeping them here anyway because it seems safer.
-    let outlives_env: Vec<_> =
-        non_outlives_predicates.iter().chain(&outlives_predicates).cloned().collect();
+    let outlives_env = non_outlives_predicates.iter().chain(&outlives_predicates).cloned();
     let outlives_env = ty::ParamEnv::new(
-        tcx.intern_predicates(&outlives_env),
+        tcx.mk_predicates_from_iter(outlives_env),
         unnormalized_env.reveal(),
         unnormalized_env.constness(),
     );
@@ -356,7 +404,7 @@ pub fn normalize_param_env_or_error<'tcx>(
     predicates.extend(outlives_predicates);
     debug!("normalize_param_env_or_error: final predicates={:?}", predicates);
     ty::ParamEnv::new(
-        tcx.intern_predicates(&predicates),
+        tcx.mk_predicates(&predicates),
         unnormalized_env.reveal(),
         unnormalized_env.constness(),
     )
@@ -371,7 +419,7 @@ pub fn fully_normalize<'tcx, T>(
     value: T,
 ) -> Result<T, Vec<FulfillmentError<'tcx>>>
 where
-    T: TypeFoldable<'tcx>,
+    T: TypeFoldable<TyCtxt<'tcx>>,
 {
     let ocx = ObligationCtxt::new(infcx);
     debug!(?value);
@@ -386,43 +434,6 @@ where
     let resolved_value = infcx.resolve_vars_if_possible(normalized_value);
     debug!(?resolved_value);
     Ok(resolved_value)
-}
-
-/// Process an obligation (and any nested obligations that come from it) to
-/// completion, returning any errors
-pub fn fully_solve_obligation<'tcx>(
-    infcx: &InferCtxt<'tcx>,
-    obligation: PredicateObligation<'tcx>,
-) -> Vec<FulfillmentError<'tcx>> {
-    fully_solve_obligations(infcx, [obligation])
-}
-
-/// Process a set of obligations (and any nested obligations that come from them)
-/// to completion
-pub fn fully_solve_obligations<'tcx>(
-    infcx: &InferCtxt<'tcx>,
-    obligations: impl IntoIterator<Item = PredicateObligation<'tcx>>,
-) -> Vec<FulfillmentError<'tcx>> {
-    let ocx = ObligationCtxt::new(infcx);
-    ocx.register_obligations(obligations);
-    ocx.select_all_or_error()
-}
-
-/// Process a bound (and any nested obligations that come from it) to completion.
-/// This is a convenience function for traits that have no generic arguments, such
-/// as auto traits, and builtin traits like Copy or Sized.
-pub fn fully_solve_bound<'tcx>(
-    infcx: &InferCtxt<'tcx>,
-    cause: ObligationCause<'tcx>,
-    param_env: ty::ParamEnv<'tcx>,
-    ty: Ty<'tcx>,
-    bound: DefId,
-) -> Vec<FulfillmentError<'tcx>> {
-    let tcx = infcx.tcx;
-    let trait_ref = tcx.mk_trait_ref(bound, [ty]);
-    let obligation = Obligation::new(tcx, cause, param_env, ty::Binder::dummy(trait_ref));
-
-    fully_solve_obligation(infcx, obligation)
 }
 
 /// Normalizes the predicates and checks whether they hold in an empty environment. If this
@@ -464,7 +475,7 @@ fn subst_and_check_impossible_predicates<'tcx>(
         predicates.push(ty::Binder::dummy(trait_ref).to_predicate(tcx));
     }
 
-    predicates.retain(|predicate| !predicate.needs_subst());
+    predicates.retain(|predicate| !predicate.has_param());
     let result = impossible_predicates(tcx, predicates);
 
     debug!("subst_and_check_impossible_predicates(key={:?}) = {:?}", key, result);
@@ -481,7 +492,7 @@ fn is_impossible_method(tcx: TyCtxt<'_>, (impl_def_id, trait_item_def_id): (DefI
         generics: &'tcx ty::Generics,
         trait_item_def_id: DefId,
     }
-    impl<'tcx> ty::TypeVisitor<'tcx> for ReferencesOnlyParentGenerics<'tcx> {
+    impl<'tcx> ty::TypeVisitor<TyCtxt<'tcx>> for ReferencesOnlyParentGenerics<'tcx> {
         type BreakTy = ();
         fn visit_ty(&mut self, t: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
             // If this is a parameter from the trait item's own generics, then bail
@@ -500,7 +511,7 @@ fn is_impossible_method(tcx: TyCtxt<'_>, (impl_def_id, trait_item_def_id): (DefI
             {
                 return ControlFlow::Break(());
             }
-            r.super_visit_with(self)
+            ControlFlow::Continue(())
         }
         fn visit_const(&mut self, ct: ty::Const<'tcx>) -> ControlFlow<Self::BreakTy> {
             if let ty::ConstKind::Param(param) = ct.kind()
@@ -523,16 +534,14 @@ fn is_impossible_method(tcx: TyCtxt<'_>, (impl_def_id, trait_item_def_id): (DefI
 
     let mut visitor = ReferencesOnlyParentGenerics { tcx, generics, trait_item_def_id };
     let predicates_for_trait = predicates.predicates.iter().filter_map(|(pred, span)| {
-        if pred.visit_with(&mut visitor).is_continue() {
-            Some(Obligation::new(
+        pred.visit_with(&mut visitor).is_continue().then(|| {
+            Obligation::new(
                 tcx,
                 ObligationCause::dummy_with_span(*span),
                 param_env,
-                ty::EarlyBinder(*pred).subst(tcx, impl_trait_ref.substs),
-            ))
-        } else {
-            None
-        }
+                ty::EarlyBinder::bind(*pred).subst(tcx, impl_trait_ref.substs),
+            )
+        })
     });
 
     let infcx = tcx.infer_ctxt().ignoring_regions().build();
@@ -547,13 +556,14 @@ fn is_impossible_method(tcx: TyCtxt<'_>, (impl_def_id, trait_item_def_id): (DefI
     false
 }
 
-pub fn provide(providers: &mut ty::query::Providers) {
+pub fn provide(providers: &mut Providers) {
     object_safety::provide(providers);
     vtable::provide(providers);
-    *providers = ty::query::Providers {
+    *providers = Providers {
         specialization_graph_of: specialize::specialization_graph_provider,
         specializes: specialize::specializes,
         subst_and_check_impossible_predicates,
+        check_tys_might_be_eq: misc::check_tys_might_be_eq,
         is_impossible_method,
         ..*providers
     };

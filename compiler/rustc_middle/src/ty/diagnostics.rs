@@ -1,11 +1,12 @@
 //! Diagnostics related methods for `Ty`.
 
+use std::borrow::Cow;
 use std::ops::ControlFlow;
 
 use crate::ty::{
-    visit::TypeVisitable, AliasTy, Const, ConstKind, DefIdTree, FallibleTypeFolder, InferConst,
-    InferTy, Opaque, PolyTraitPredicate, Projection, Ty, TyCtxt, TypeFoldable, TypeSuperFoldable,
-    TypeSuperVisitable, TypeVisitor,
+    AliasTy, Const, ConstKind, FallibleTypeFolder, InferConst, InferTy, Opaque, PolyTraitPredicate,
+    Projection, Ty, TyCtxt, TypeFoldable, TypeSuperFoldable, TypeSuperVisitable, TypeVisitable,
+    TypeVisitor,
 };
 
 use rustc_data_structures::fx::FxHashMap;
@@ -94,7 +95,7 @@ pub trait IsSuggestable<'tcx>: Sized {
 
 impl<'tcx, T> IsSuggestable<'tcx> for T
 where
-    T: TypeVisitable<'tcx> + TypeFoldable<'tcx>,
+    T: TypeVisitable<TyCtxt<'tcx>> + TypeFoldable<TyCtxt<'tcx>>,
 {
     fn is_suggestable(self, tcx: TyCtxt<'tcx>, infer_suggestable: bool) -> bool {
         self.visit_with(&mut IsSuggestableVisitor { tcx, infer_suggestable }).is_continue()
@@ -117,7 +118,7 @@ pub fn suggest_arbitrary_trait_bound<'tcx>(
     }
 
     let param_name = trait_pred.skip_binder().self_ty().to_string();
-    let mut constraint = trait_pred.print_modifiers_and_trait_path().to_string();
+    let mut constraint = trait_pred.to_string();
 
     if let Some((name, term)) = associated_ty {
         // FIXME: this case overlaps with code in TyCtxt::note_and_explain_type_err.
@@ -139,12 +140,12 @@ pub fn suggest_arbitrary_trait_bound<'tcx>(
     // Suggest a where clause bound for a non-type parameter.
     err.span_suggestion_verbose(
         generics.tail_span_for_predicate_suggestion(),
-        &format!(
+        format!(
             "consider {} `where` clause, but there might be an alternative better way to express \
              this requirement",
             if generics.where_clause_span.is_empty() { "introducing a" } else { "extending the" },
         ),
-        format!("{} {}: {}", generics.add_where_or_trailing_comma(), param_name, constraint),
+        format!("{} {constraint}", generics.add_where_or_trailing_comma()),
         Applicability::MaybeIncorrect,
     );
     true
@@ -193,6 +194,9 @@ fn suggest_removing_unsized_bound(
 }
 
 /// Suggest restricting a type param with a new bound.
+///
+/// If `span_to_replace` is provided, then that span will be replaced with the
+/// `constraint`. If one wasn't provided, then the full bound will be suggested.
 pub fn suggest_constraining_type_param(
     tcx: TyCtxt<'_>,
     generics: &hir::Generics<'_>,
@@ -200,12 +204,14 @@ pub fn suggest_constraining_type_param(
     param_name: &str,
     constraint: &str,
     def_id: Option<DefId>,
+    span_to_replace: Option<Span>,
 ) -> bool {
     suggest_constraining_type_params(
         tcx,
         generics,
         err,
         [(param_name, constraint, def_id)].into_iter(),
+        span_to_replace,
     )
 }
 
@@ -215,6 +221,7 @@ pub fn suggest_constraining_type_params<'a>(
     generics: &hir::Generics<'_>,
     err: &mut Diagnostic,
     param_names_and_constraints: impl Iterator<Item = (&'a str, &'a str, Option<DefId>)>,
+    span_to_replace: Option<Span>,
 ) -> bool {
     let mut grouped = FxHashMap::default();
     param_names_and_constraints.for_each(|(param_name, constraint, def_id)| {
@@ -236,7 +243,7 @@ pub fn suggest_constraining_type_params<'a>(
 
                 err.span_label(
                     param.span,
-                    &format!("this type parameter needs to be `{}`", constraint),
+                    format!("this type parameter needs to be `{}`", constraint),
                 );
                 suggest_removing_unsized_bound(generics, &mut suggestions, param, def_id);
             }
@@ -253,7 +260,9 @@ pub fn suggest_constraining_type_params<'a>(
         let mut suggest_restrict = |span, bound_list_non_empty| {
             suggestions.push((
                 span,
-                if bound_list_non_empty {
+                if span_to_replace.is_some() {
+                    constraint.clone()
+                } else if bound_list_non_empty {
                     format!(" + {}", constraint)
                 } else {
                     format!(" {}", constraint)
@@ -261,6 +270,11 @@ pub fn suggest_constraining_type_params<'a>(
                 SuggestChangingConstraintsMessage::RestrictBoundFurther,
             ))
         };
+
+        if let Some(span) = span_to_replace {
+            suggest_restrict(span, true);
+            continue;
+        }
 
         // When the type parameter has been provided bounds
         //
@@ -371,22 +385,18 @@ pub fn suggest_constraining_type_params<'a>(
 
     if suggestions.len() == 1 {
         let (span, suggestion, msg) = suggestions.pop().unwrap();
-
-        let s;
         let msg = match msg {
             SuggestChangingConstraintsMessage::RestrictBoundFurther => {
-                "consider further restricting this bound"
+                Cow::from("consider further restricting this bound")
             }
             SuggestChangingConstraintsMessage::RestrictType { ty } => {
-                s = format!("consider restricting type parameter `{}`", ty);
-                &s
+                Cow::from(format!("consider restricting type parameter `{}`", ty))
             }
             SuggestChangingConstraintsMessage::RestrictTypeFurther { ty } => {
-                s = format!("consider further restricting type parameter `{}`", ty);
-                &s
+                Cow::from(format!("consider further restricting type parameter `{}`", ty))
             }
             SuggestChangingConstraintsMessage::RemovingQSized => {
-                "consider removing the `?Sized` bound to make the type parameter `Sized`"
+                Cow::from("consider removing the `?Sized` bound to make the type parameter `Sized`")
             }
         };
 
@@ -447,7 +457,7 @@ pub struct IsSuggestableVisitor<'tcx> {
     infer_suggestable: bool,
 }
 
-impl<'tcx> TypeVisitor<'tcx> for IsSuggestableVisitor<'tcx> {
+impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for IsSuggestableVisitor<'tcx> {
     type BreakTy = ();
 
     fn visit_ty(&mut self, t: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
@@ -467,8 +477,9 @@ impl<'tcx> TypeVisitor<'tcx> for IsSuggestableVisitor<'tcx> {
 
             Alias(Opaque, AliasTy { def_id, .. }) => {
                 let parent = self.tcx.parent(def_id);
+                let parent_ty = self.tcx.type_of(parent).subst_identity();
                 if let DefKind::TyAlias | DefKind::AssocTy = self.tcx.def_kind(parent)
-                    && let Alias(Opaque, AliasTy { def_id: parent_opaque_def_id, .. }) = *self.tcx.type_of(parent).kind()
+                    && let Alias(Opaque, AliasTy { def_id: parent_opaque_def_id, .. }) = *parent_ty.kind()
                     && parent_opaque_def_id == def_id
                 {
                     // Okay
@@ -522,10 +533,10 @@ pub struct MakeSuggestableFolder<'tcx> {
     infer_suggestable: bool,
 }
 
-impl<'tcx> FallibleTypeFolder<'tcx> for MakeSuggestableFolder<'tcx> {
+impl<'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for MakeSuggestableFolder<'tcx> {
     type Error = ();
 
-    fn tcx(&self) -> TyCtxt<'tcx> {
+    fn interner(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
 
@@ -550,8 +561,9 @@ impl<'tcx> FallibleTypeFolder<'tcx> for MakeSuggestableFolder<'tcx> {
 
             Alias(Opaque, AliasTy { def_id, .. }) => {
                 let parent = self.tcx.parent(def_id);
+                let parent_ty = self.tcx.type_of(parent).subst_identity();
                 if let hir::def::DefKind::TyAlias | hir::def::DefKind::AssocTy = self.tcx.def_kind(parent)
-                    && let Alias(Opaque, AliasTy { def_id: parent_opaque_def_id, .. }) = *self.tcx.type_of(parent).kind()
+                    && let Alias(Opaque, AliasTy { def_id: parent_opaque_def_id, .. }) = *parent_ty.kind()
                     && parent_opaque_def_id == def_id
                 {
                     t
@@ -595,4 +607,12 @@ impl<'tcx> FallibleTypeFolder<'tcx> for MakeSuggestableFolder<'tcx> {
 
         c.try_super_fold_with(self)
     }
+}
+
+#[derive(Diagnostic)]
+#[diag(middle_const_not_used_in_type_alias)]
+pub(super) struct ConstNotUsedTraitAlias {
+    pub ct: String,
+    #[primary_span]
+    pub span: Span,
 }

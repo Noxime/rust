@@ -32,6 +32,7 @@ pub(super) fn check_fn<'a, 'tcx>(
     fn_def_id: LocalDefId,
     body: &'tcx hir::Body<'tcx>,
     can_be_generator: Option<hir::Movability>,
+    params_can_be_unsized: bool,
 ) -> Option<GeneratorTypes<'tcx>> {
     let fn_id = fcx.tcx.hir().local_def_id_to_hir_id(fn_def_id);
 
@@ -74,15 +75,13 @@ pub(super) fn check_fn<'a, 'tcx>(
 
     // C-variadic fns also have a `VaList` input that's not listed in `fn_sig`
     // (as it's created inside the body itself, not passed in from outside).
-    let maybe_va_list = if fn_sig.c_variadic {
+    let maybe_va_list = fn_sig.c_variadic.then(|| {
         let span = body.params.last().unwrap().span;
         let va_list_did = tcx.require_lang_item(LangItem::VaList, Some(span));
         let region = fcx.next_region_var(RegionVariableOrigin::MiscVariable(span));
 
-        Some(tcx.bound_type_of(va_list_did).subst(tcx, &[region.into()]))
-    } else {
-        None
-    };
+        tcx.type_of(va_list_did).subst(tcx, &[region.into()])
+    });
 
     // Add formal parameters.
     let inputs_hir = hir.fn_decl_by_hir_id(fn_id).map(|decl| &decl.inputs);
@@ -90,14 +89,26 @@ pub(super) fn check_fn<'a, 'tcx>(
     for (idx, (param_ty, param)) in inputs_fn.chain(maybe_va_list).zip(body.params).enumerate() {
         // Check the pattern.
         let ty_span = try { inputs_hir?.get(idx)?.span };
-        fcx.check_pat_top(&param.pat, param_ty, ty_span, false);
+        fcx.check_pat_top(&param.pat, param_ty, ty_span, None);
 
         // Check that argument is Sized.
         // The check for a non-trivial pattern is a hack to avoid duplicate warnings
         // for simple cases like `fn foo(x: Trait)`,
         // where we would error once on the parameter as a whole, and once on the binding `x`.
-        if param.pat.simple_ident().is_none() && !tcx.features().unsized_fn_params {
-            fcx.require_type_is_sized(param_ty, param.pat.span, traits::SizedArgumentType(ty_span));
+        if param.pat.simple_ident().is_none() && !params_can_be_unsized {
+            fcx.require_type_is_sized(
+                param_ty,
+                param.pat.span,
+                // ty_span == binding_span iff this is a closure parameter with no type ascription,
+                // or if it's an implicit `self` parameter
+                traits::SizedArgumentType(
+                    if ty_span == Some(param.span) && tcx.is_closure(fn_def_id.into()) {
+                        None
+                    } else {
+                        ty_span
+                    },
+                ),
+            );
         }
 
         fcx.write_ty(param.hir_id, param_ty);
@@ -105,24 +116,8 @@ pub(super) fn check_fn<'a, 'tcx>(
 
     fcx.typeck_results.borrow_mut().liberated_fn_sigs_mut().insert(fn_id, fn_sig);
 
-    if let ty::Dynamic(_, _, ty::Dyn) = declared_ret_ty.kind() {
-        // FIXME: We need to verify that the return type is `Sized` after the return expression has
-        // been evaluated so that we have types available for all the nodes being returned, but that
-        // requires the coerced evaluated type to be stored. Moving `check_return_expr` before this
-        // causes unsized errors caused by the `declared_ret_ty` to point at the return expression,
-        // while keeping the current ordering we will ignore the tail expression's type because we
-        // don't know it yet. We can't do `check_expr_kind` while keeping `check_return_expr`
-        // because we will trigger "unreachable expression" lints unconditionally.
-        // Because of all of this, we perform a crude check to know whether the simplest `!Sized`
-        // case that a newcomer might make, returning a bare trait, and in that case we populate
-        // the tail expression's type so that the suggestion will be correct, but ignore all other
-        // possible cases.
-        fcx.check_expr(&body.value);
-        fcx.require_type_is_sized(declared_ret_ty, decl.output.span(), traits::SizedReturnType);
-    } else {
-        fcx.require_type_is_sized(declared_ret_ty, decl.output.span(), traits::SizedReturnType);
-        fcx.check_return_expr(&body.value, false);
-    }
+    fcx.require_type_is_sized(declared_ret_ty, decl.output.span(), traits::SizedReturnType);
+    fcx.check_return_expr(&body.value, false);
 
     // We insert the deferred_generator_interiors entry after visiting the body.
     // This ensures that all nested generators appear before the entry of this generator.
@@ -264,11 +259,9 @@ fn check_lang_start_fn<'tcx>(
         // for example `start`'s generic should be a type parameter
         let generics = tcx.generics_of(def_id);
         let fn_generic = generics.param_at(0, tcx);
-        let generic_tykind =
-            ty::Param(ty::ParamTy { index: fn_generic.index, name: fn_generic.name });
-        let generic_ty = tcx.mk_ty(generic_tykind);
+        let generic_ty = tcx.mk_ty_param(fn_generic.index, fn_generic.name);
         let expected_fn_sig =
-            tcx.mk_fn_sig([].iter(), &generic_ty, false, hir::Unsafety::Normal, Abi::Rust);
+            tcx.mk_fn_sig([], generic_ty, false, hir::Unsafety::Normal, Abi::Rust);
         let expected_ty = tcx.mk_fn_ptr(Binder::dummy(expected_fn_sig));
 
         // we emit the same error to suggest changing the arg no matter what's wrong with the arg

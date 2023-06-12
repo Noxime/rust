@@ -8,14 +8,15 @@ pub use self::job::{print_query_stack, QueryInfo, QueryJob, QueryJobId, QueryJob
 
 mod caches;
 pub use self::caches::{
-    CacheSelector, DefaultCacheSelector, QueryCache, QueryStorage, VecCacheSelector,
+    CacheSelector, DefaultCacheSelector, QueryCache, SingleCacheSelector, VecCacheSelector,
 };
 
 mod config;
-pub use self::config::{HashResult, QueryConfig, TryLoadFromDisk};
+pub use self::config::{HashResult, QueryConfig};
 
 use crate::dep_graph::DepKind;
 use crate::dep_graph::{DepNodeIndex, HasDepContext, SerializedDepNodeIndex};
+use rustc_data_structures::stable_hasher::Hash64;
 use rustc_data_structures::sync::Lock;
 use rustc_errors::Diagnostic;
 use rustc_hir::def::DefKind;
@@ -37,7 +38,7 @@ pub struct QueryStackFrame<D: DepKind> {
     /// This hash is used to deterministically pick
     /// a query to remove cycles in the parallel compiler.
     #[cfg(parallel_compiler)]
-    hash: u64,
+    hash: Hash64,
 }
 
 impl<D: DepKind> QueryStackFrame<D> {
@@ -49,7 +50,7 @@ impl<D: DepKind> QueryStackFrame<D> {
         def_kind: Option<DefKind>,
         dep_kind: D,
         ty_adt_id: Option<DefId>,
-        _hash: impl FnOnce() -> u64,
+        _hash: impl FnOnce() -> Hash64,
     ) -> Self {
         Self {
             description,
@@ -100,22 +101,22 @@ impl QuerySideEffects {
 }
 
 pub trait QueryContext: HasDepContext {
-    fn next_job_id(&self) -> QueryJobId;
+    fn next_job_id(self) -> QueryJobId;
 
     /// Get the query information from the TLS context.
-    fn current_query_job(&self) -> Option<QueryJobId>;
+    fn current_query_job(self) -> Option<QueryJobId>;
 
-    fn try_collect_active_jobs(&self) -> Option<QueryMap<Self::DepKind>>;
+    fn try_collect_active_jobs(self) -> Option<QueryMap<Self::DepKind>>;
 
     /// Load side effects associated to the node in the previous session.
-    fn load_side_effects(&self, prev_dep_node_index: SerializedDepNodeIndex) -> QuerySideEffects;
+    fn load_side_effects(self, prev_dep_node_index: SerializedDepNodeIndex) -> QuerySideEffects;
 
     /// Register diagnostics for the given node, for use in next session.
-    fn store_side_effects(&self, dep_node_index: DepNodeIndex, side_effects: QuerySideEffects);
+    fn store_side_effects(self, dep_node_index: DepNodeIndex, side_effects: QuerySideEffects);
 
     /// Register diagnostics for the given node, for use in next session.
     fn store_side_effects_for_anon_node(
-        &self,
+        self,
         dep_node_index: DepNodeIndex,
         side_effects: QuerySideEffects,
     );
@@ -124,12 +125,12 @@ pub trait QueryContext: HasDepContext {
     /// new query job while it executes. It returns the diagnostics
     /// captured during execution and the actual result.
     fn start_query<R>(
-        &self,
+        self,
         token: QueryJobId,
         depth_limit: bool,
         diagnostics: Option<&Lock<ThinVec<Diagnostic>>>,
         compute: impl FnOnce() -> R,
     ) -> R;
 
-    fn depth_limit_error(&self, job: QueryJobId);
+    fn depth_limit_error(self, job: QueryJobId);
 }

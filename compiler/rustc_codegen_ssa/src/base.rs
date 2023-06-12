@@ -13,33 +13,30 @@ use crate::mir::place::PlaceRef;
 use crate::traits::*;
 use crate::{CachedModuleCodegen, CompiledModule, CrateInfo, MemFlags, ModuleCodegen, ModuleKind};
 
+use rustc_ast::expand::allocator::AllocatorKind;
 use rustc_attr as attr;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::profiling::{get_resident_set_size, print_time_passes_entry};
-
-use rustc_data_structures::sync::par_iter;
-#[cfg(parallel_compiler)]
-use rustc_data_structures::sync::ParallelIterator;
+use rustc_data_structures::sync::par_map;
 use rustc_hir as hir;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE};
 use rustc_hir::lang_items::LangItem;
-use rustc_index::vec::Idx;
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
+use rustc_middle::middle::debugger_visualizer::{DebuggerVisualizerFile, DebuggerVisualizerType};
 use rustc_middle::middle::exported_symbols;
 use rustc_middle::middle::exported_symbols::SymbolExportKind;
 use rustc_middle::middle::lang_items;
 use rustc_middle::mir::mono::{CodegenUnit, CodegenUnitNameBuilder, MonoItem};
+use rustc_middle::query::Providers;
 use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf, TyAndLayout};
-use rustc_middle::ty::query::Providers;
 use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
 use rustc_session::cgu_reuse_tracker::CguReuse;
 use rustc_session::config::{self, CrateType, EntryFnType, OutputType};
 use rustc_session::Session;
 use rustc_span::symbol::sym;
 use rustc_span::Symbol;
-use rustc_span::{DebuggerVisualizerFile, DebuggerVisualizerType};
-use rustc_target::abi::{Align, Size, VariantIdx};
+use rustc_target::abi::{Align, FIRST_VARIANT};
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -148,7 +145,7 @@ pub fn unsized_info<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         cx.tcx().struct_lockstep_tails_erasing_lifetimes(source, target, bx.param_env());
     match (source.kind(), target.kind()) {
         (&ty::Array(_, len), &ty::Slice(_)) => {
-            cx.const_usize(len.eval_usize(cx.tcx(), ty::ParamEnv::reveal_all()))
+            cx.const_usize(len.eval_target_usize(cx.tcx(), ty::ParamEnv::reveal_all()))
         }
         (
             &ty::Dynamic(ref data_a, _, src_dyn_kind),
@@ -273,12 +270,13 @@ pub fn cast_to_dyn_star<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         matches!(dst_ty.kind(), ty::Dynamic(_, _, ty::DynStar)),
         "destination type must be a dyn*"
     );
-    // FIXME(dyn-star): this is probably not the best way to check if this is
-    // a pointer, and really we should ensure that the value is a suitable
-    // pointer earlier in the compilation process.
-    let src = match src_ty_and_layout.pointee_info_at(bx.cx(), Size::ZERO) {
-        Some(_) => bx.ptrtoint(src, bx.cx().type_isize()),
-        None => bx.bitcast(src, bx.type_isize()),
+    // FIXME(dyn-star): We can remove this when all supported LLVMs use opaque ptrs only.
+    let unit_ptr = bx.cx().type_ptr_to(bx.cx().type_struct(&[], false));
+    let src = match bx.cx().type_kind(bx.cx().backend_type(src_ty_and_layout)) {
+        TypeKind::Pointer => bx.pointercast(src, unit_ptr),
+        TypeKind::Integer => bx.inttoptr(src, unit_ptr),
+        // FIXME(dyn-star): We probably have to do a bitcast first, then inttoptr.
+        kind => bug!("unexpected TypeKind for left-hand side of `dyn*` cast: {kind:?}"),
     };
     (src, unsized_info(bx, src_ty_and_layout.ty, dst_ty, old_info))
 }
@@ -297,7 +295,7 @@ pub fn coerce_unsized_into<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
             let (base, info) = match bx.load_operand(src).val {
                 OperandValue::Pair(base, info) => unsize_ptr(bx, base, src_ty, dst_ty, Some(info)),
                 OperandValue::Immediate(base) => unsize_ptr(bx, base, src_ty, dst_ty, None),
-                OperandValue::Ref(..) => bug!(),
+                OperandValue::Ref(..) | OperandValue::ZeroSized => bug!(),
             };
             OperandValue::Pair(base, info).store(bx, dst);
         }
@@ -305,9 +303,9 @@ pub fn coerce_unsized_into<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         (&ty::Adt(def_a, _), &ty::Adt(def_b, _)) => {
             assert_eq!(def_a, def_b);
 
-            for i in 0..def_a.variant(VariantIdx::new(0)).fields.len() {
-                let src_f = src.project_field(bx, i);
-                let dst_f = dst.project_field(bx, i);
+            for i in def_a.variant(FIRST_VARIANT).fields.indices() {
+                let src_f = src.project_field(bx, i.as_usize());
+                let dst_f = dst.project_field(bx, i.as_usize());
 
                 if dst_f.layout.is_zst() {
                     continue;
@@ -382,7 +380,19 @@ pub fn memcpy_ty<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         return;
     }
 
-    bx.memcpy(dst, dst_align, src, src_align, bx.cx().const_usize(size), flags);
+    if flags == MemFlags::empty()
+        && let Some(bty) = bx.cx().scalar_copy_backend_type(layout)
+    {
+        // I look forward to only supporting opaque pointers
+        let pty = bx.type_ptr_to(bty);
+        let src = bx.pointercast(src, pty);
+        let dst = bx.pointercast(dst, pty);
+
+        let temp = bx.load(bty, src, src_align);
+        bx.store(temp, dst, dst_align);
+    } else {
+        bx.memcpy(dst, dst_align, src, src_align, bx.cx().const_usize(size), flags);
+    }
 }
 
 pub fn codegen_instance<'a, 'tcx: 'a, Bx: BuilderMethods<'a, 'tcx>>(
@@ -475,7 +485,7 @@ pub fn maybe_create_entry_wrapper<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
                     cx.tcx(),
                     ty::ParamEnv::reveal_all(),
                     start_def_id,
-                    cx.tcx().intern_substs(&[main_ret_ty.into()]),
+                    cx.tcx().mk_substs(&[main_ret_ty.into()]),
                 )
                 .unwrap()
                 .unwrap(),
@@ -493,7 +503,7 @@ pub fn maybe_create_entry_wrapper<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
             (rust_main, start_ty, vec![arg_argc, arg_argv])
         };
 
-        let result = bx.call(start_ty, None, start_fn, &args, None);
+        let result = bx.call(start_ty, None, None, start_fn, &args, None);
         let cast = bx.intcast(result, cx.type_int(), true);
         bx.ret(cast);
 
@@ -544,6 +554,23 @@ pub fn collect_debugger_visualizers_transitive(
         .collect::<BTreeSet<_>>()
 }
 
+/// Decide allocator kind to codegen. If `Some(_)` this will be the same as
+/// `tcx.allocator_kind`, but it may be `None` in more cases (e.g. if using
+/// allocator definitions from a dylib dependency).
+pub fn allocator_kind_for_codegen(tcx: TyCtxt<'_>) -> Option<AllocatorKind> {
+    // If the crate doesn't have an `allocator_kind` set then there's definitely
+    // no shim to generate. Otherwise we also check our dependency graph for all
+    // our output crate types. If anything there looks like its a `Dynamic`
+    // linkage, then it's already got an allocator shim and we'll be using that
+    // one instead. If nothing exists then it's our job to generate the
+    // allocator!
+    let any_dynamic_crate = tcx.dependency_formats(()).iter().any(|(_, list)| {
+        use rustc_middle::middle::dependency_format::Linkage;
+        list.iter().any(|&linkage| linkage == Linkage::Dynamic)
+    });
+    if any_dynamic_crate { None } else { tcx.allocator_kind(()) }
+}
+
 pub fn codegen_crate<B: ExtraBackendMethods>(
     backend: B,
     tcx: TyCtxt<'_>,
@@ -579,7 +606,7 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
         }
     }
 
-    let metadata_module = if need_metadata_module {
+    let metadata_module = need_metadata_module.then(|| {
         // Emit compressed metadata object.
         let metadata_cgu_name =
             cgu_name_builder.build_cgu_name(LOCAL_CRATE, &["crate"], Some("metadata")).to_string();
@@ -594,17 +621,15 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
             if let Err(error) = std::fs::write(&file_name, data) {
                 tcx.sess.emit_fatal(errors::MetadataObjectFileWrite { error });
             }
-            Some(CompiledModule {
+            CompiledModule {
                 name: metadata_cgu_name,
                 kind: ModuleKind::Metadata,
                 object: Some(file_name),
                 dwarf_object: None,
                 bytecode: None,
-            })
+            }
         })
-    } else {
-        None
-    };
+    });
 
     let ongoing_codegen = start_async_codegen(
         backend.clone(),
@@ -616,20 +641,7 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
     );
 
     // Codegen an allocator shim, if necessary.
-    //
-    // If the crate doesn't have an `allocator_kind` set then there's definitely
-    // no shim to generate. Otherwise we also check our dependency graph for all
-    // our output crate types. If anything there looks like its a `Dynamic`
-    // linkage, then it's already got an allocator shim and we'll be using that
-    // one instead. If nothing exists then it's our job to generate the
-    // allocator!
-    let any_dynamic_crate = tcx.dependency_formats(()).iter().any(|(_, list)| {
-        use rustc_middle::middle::dependency_format::Linkage;
-        list.iter().any(|&linkage| linkage == Linkage::Dynamic)
-    });
-    let allocator_module = if any_dynamic_crate {
-        None
-    } else if let Some(kind) = tcx.allocator_kind(()) {
+    if let Some(kind) = allocator_kind_for_codegen(tcx) {
         let llmod_id =
             cgu_name_builder.build_cgu_name(LOCAL_CRATE, &["crate"], Some("allocator")).to_string();
         let module_llvm = tcx.sess.time("write_allocator_module", || {
@@ -643,13 +655,10 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
             )
         });
 
-        Some(ModuleCodegen { name: llmod_id, module_llvm, kind: ModuleKind::Allocator })
-    } else {
-        None
-    };
-
-    if let Some(allocator_module) = allocator_module {
-        ongoing_codegen.submit_pre_codegened_module_to_llvm(tcx, allocator_module);
+        ongoing_codegen.submit_pre_codegened_module_to_llvm(
+            tcx,
+            ModuleCodegen { name: llmod_id, module_llvm, kind: ModuleKind::Allocator },
+        );
     }
 
     // For better throughput during parallel processing by LLVM, we used to sort
@@ -689,7 +698,7 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
     // This likely is a temporary measure. Once we don't have to support the
     // non-parallel compiler anymore, we can compile CGUs end-to-end in
     // parallel and get rid of the complicated scheduling logic.
-    let mut pre_compiled_cgus = if cfg!(parallel_compiler) {
+    let mut pre_compiled_cgus = if tcx.sess.threads() > 1 {
         tcx.sess.time("compile_first_CGU_batch", || {
             // Try to find one CGU to compile per thread.
             let cgus: Vec<_> = cgu_reuse
@@ -702,12 +711,10 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
             // Compile the found CGUs in parallel.
             let start_time = Instant::now();
 
-            let pre_compiled_cgus = par_iter(cgus)
-                .map(|(i, _)| {
-                    let module = backend.compile_codegen_unit(tcx, codegen_units[i].name());
-                    (i, module)
-                })
-                .collect();
+            let pre_compiled_cgus = par_map(cgus, |(i, _)| {
+                let module = backend.compile_codegen_unit(tcx, codegen_units[i].name());
+                (i, module)
+            });
 
             total_codegen_time += start_time.elapsed();
 
@@ -785,6 +792,7 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
             total_codegen_time,
             start_rss.unwrap(),
             end_rss,
+            tcx.sess.opts.unstable_opts.time_passes_format,
         );
     }
 
@@ -808,7 +816,7 @@ impl CrateInfo {
             .collect();
         let local_crate_name = tcx.crate_name(LOCAL_CRATE);
         let crate_attrs = tcx.hir().attrs(rustc_hir::CRATE_HIR_ID);
-        let subsystem = tcx.sess.first_attr_value_str_by_name(crate_attrs, sym::windows_subsystem);
+        let subsystem = attr::first_attr_value_str_by_name(crate_attrs, sym::windows_subsystem);
         let windows_subsystem = subsystem.map(|subsystem| {
             if subsystem != sym::windows && subsystem != sym::console {
                 tcx.sess.emit_fatal(errors::InvalidWindowsSubsystem { subsystem });
@@ -858,6 +866,7 @@ impl CrateInfo {
             dependency_formats: tcx.dependency_formats(()).clone(),
             windows_subsystem,
             natvis_debugger_visualizers: Default::default(),
+            feature_packed_bundled_libs: tcx.features().packed_bundled_libs,
         };
         let crates = tcx.crates(());
 

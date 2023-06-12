@@ -335,6 +335,9 @@ pub trait Visitor<'v>: Sized {
     fn visit_anon_const(&mut self, c: &'v AnonConst) {
         walk_anon_const(self, c)
     }
+    fn visit_inline_const(&mut self, c: &'v ConstBlock) {
+        walk_inline_const(self, c)
+    }
     fn visit_expr(&mut self, ex: &'v Expr<'v>) {
         walk_expr(self, ex)
     }
@@ -679,14 +682,18 @@ pub fn walk_anon_const<'v, V: Visitor<'v>>(visitor: &mut V, constant: &'v AnonCo
     visitor.visit_nested_body(constant.body);
 }
 
+pub fn walk_inline_const<'v, V: Visitor<'v>>(visitor: &mut V, constant: &'v ConstBlock) {
+    visitor.visit_id(constant.hir_id);
+    visitor.visit_nested_body(constant.body);
+}
+
 pub fn walk_expr<'v, V: Visitor<'v>>(visitor: &mut V, expression: &'v Expr<'v>) {
     visitor.visit_id(expression.hir_id);
     match expression.kind {
-        ExprKind::Box(ref subexpression) => visitor.visit_expr(subexpression),
         ExprKind::Array(subexpressions) => {
             walk_list!(visitor, visit_expr, subexpressions);
         }
-        ExprKind::ConstBlock(ref anon_const) => visitor.visit_anon_const(anon_const),
+        ExprKind::ConstBlock(ref const_block) => visitor.visit_inline_const(const_block),
         ExprKind::Repeat(ref element, ref count) => {
             visitor.visit_expr(element);
             visitor.visit_array_length(count)
@@ -787,10 +794,14 @@ pub fn walk_expr<'v, V: Visitor<'v>>(visitor: &mut V, expression: &'v Expr<'v>) 
         ExprKind::InlineAsm(ref asm) => {
             visitor.visit_inline_asm(asm, expression.hir_id);
         }
+        ExprKind::OffsetOf(ref container, ref fields) => {
+            visitor.visit_ty(container);
+            walk_list!(visitor, visit_ident, fields.iter().copied());
+        }
         ExprKind::Yield(ref subexpression, _) => {
             visitor.visit_expr(subexpression);
         }
-        ExprKind::Lit(_) | ExprKind::Err => {}
+        ExprKind::Lit(_) | ExprKind::Err(_) => {}
     }
 }
 
@@ -844,7 +855,7 @@ pub fn walk_ty<'v, V: Visitor<'v>>(visitor: &mut V, typ: &'v Ty<'v>) {
             visitor.visit_lifetime(lifetime);
         }
         TyKind::Typeof(ref expression) => visitor.visit_anon_const(expression),
-        TyKind::Infer | TyKind::Err => {}
+        TyKind::Infer | TyKind::Err(_) => {}
     }
 }
 

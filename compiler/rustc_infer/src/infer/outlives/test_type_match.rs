@@ -1,7 +1,7 @@
 use std::collections::hash_map::Entry;
 
 use rustc_data_structures::fx::FxHashMap;
-use rustc_middle::ty::TypeVisitable;
+use rustc_middle::ty::TypeVisitableExt;
 use rustc_middle::ty::{
     self,
     error::TypeError,
@@ -13,9 +13,11 @@ use crate::infer::region_constraints::VerifyIfEq;
 
 /// Given a "verify-if-eq" type test like:
 ///
-///     exists<'a...> {
-///         verify_if_eq(some_type, bound_region)
-///     }
+/// ```rust,ignore (pseudo-Rust)
+/// exists<'a...> {
+///     verify_if_eq(some_type, bound_region)
+/// }
+/// ```
 ///
 /// and the type `test_ty` that the type test is being tested against,
 /// returns:
@@ -137,10 +139,6 @@ impl<'tcx> TypeRelation<'tcx> for Match<'tcx> {
         "Match"
     }
 
-    fn intercrate(&self) -> bool {
-        false
-    }
-
     fn tcx(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
@@ -150,10 +148,6 @@ impl<'tcx> TypeRelation<'tcx> for Match<'tcx> {
     fn a_is_expected(&self) -> bool {
         true
     } // irrelevant
-
-    fn mark_ambiguous(&mut self) {
-        bug!()
-    }
 
     #[instrument(level = "trace", skip(self))]
     fn relate_with_variance<T: Relate<'tcx>>(
@@ -186,13 +180,14 @@ impl<'tcx> TypeRelation<'tcx> for Match<'tcx> {
 
     #[instrument(skip(self), level = "debug")]
     fn tys(&mut self, pattern: Ty<'tcx>, value: Ty<'tcx>) -> RelateResult<'tcx, Ty<'tcx>> {
-        if let ty::Error(_) = pattern.kind() {
+        // FIXME(non_lifetime_binders): What to do here?
+        if matches!(pattern.kind(), ty::Error(_) | ty::Bound(..)) {
             // Unlike normal `TypeRelation` rules, `ty::Error` does not equal any type.
             self.no_match()
         } else if pattern == value {
             Ok(pattern)
         } else {
-            relate::super_relate_tys(self, pattern, value)
+            relate::structurally_relate_tys(self, pattern, value)
         }
     }
 
@@ -206,7 +201,7 @@ impl<'tcx> TypeRelation<'tcx> for Match<'tcx> {
         if pattern == value {
             Ok(pattern)
         } else {
-            relate::super_relate_consts(self, pattern, value)
+            relate::structurally_relate_consts(self, pattern, value)
         }
     }
 

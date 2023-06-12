@@ -4,7 +4,7 @@ use crate::traits;
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::fast_reject::{self, SimplifiedType, TreatParams};
-use rustc_middle::ty::{self, TyCtxt, TypeVisitable};
+use rustc_middle::ty::{self, TyCtxt, TypeVisitableExt};
 
 pub use rustc_middle::traits::specialization_graph::*;
 
@@ -21,6 +21,7 @@ pub struct FutureCompatOverlapError<'tcx> {
 }
 
 /// The result of attempting to insert an impl into a group of children.
+#[derive(Debug)]
 enum Inserted<'tcx> {
     /// The impl was inserted as a new child in this group of children.
     BecameNewSibling(Option<FutureCompatOverlapError<'tcx>>),
@@ -49,7 +50,8 @@ impl<'tcx> ChildrenExt<'tcx> for Children {
     /// Insert an impl into this set of children without comparing to any existing impls.
     fn insert_blindly(&mut self, tcx: TyCtxt<'tcx>, impl_def_id: DefId) {
         let trait_ref = tcx.impl_trait_ref(impl_def_id).unwrap().skip_binder();
-        if let Some(st) = fast_reject::simplify_type(tcx, trait_ref.self_ty(), TreatParams::AsInfer)
+        if let Some(st) =
+            fast_reject::simplify_type(tcx, trait_ref.self_ty(), TreatParams::AsCandidateKey)
         {
             debug!("insert_blindly: impl_def_id={:?} st={:?}", impl_def_id, st);
             self.non_blanket_impls.entry(st).or_default().push(impl_def_id)
@@ -65,7 +67,8 @@ impl<'tcx> ChildrenExt<'tcx> for Children {
     fn remove_existing(&mut self, tcx: TyCtxt<'tcx>, impl_def_id: DefId) {
         let trait_ref = tcx.impl_trait_ref(impl_def_id).unwrap().skip_binder();
         let vec: &mut Vec<DefId>;
-        if let Some(st) = fast_reject::simplify_type(tcx, trait_ref.self_ty(), TreatParams::AsInfer)
+        if let Some(st) =
+            fast_reject::simplify_type(tcx, trait_ref.self_ty(), TreatParams::AsCandidateKey)
         {
             debug!("remove_existing: impl_def_id={:?} st={:?}", impl_def_id, st);
             vec = self.non_blanket_impls.get_mut(&st).unwrap();
@@ -80,6 +83,7 @@ impl<'tcx> ChildrenExt<'tcx> for Children {
 
     /// Attempt to insert an impl into this set of children, while comparing for
     /// specialization relationships.
+    #[instrument(level = "debug", skip(self, tcx), ret)]
     fn insert(
         &mut self,
         tcx: TyCtxt<'tcx>,
@@ -90,18 +94,13 @@ impl<'tcx> ChildrenExt<'tcx> for Children {
         let mut last_lint = None;
         let mut replace_children = Vec::new();
 
-        debug!("insert(impl_def_id={:?}, simplified_self={:?})", impl_def_id, simplified_self,);
-
         let possible_siblings = match simplified_self {
             Some(st) => PotentialSiblings::Filtered(filtered_children(self, st)),
             None => PotentialSiblings::Unfiltered(iter_children(self)),
         };
 
         for possible_sibling in possible_siblings {
-            debug!(
-                "insert: impl_def_id={:?}, simplified_self={:?}, possible_sibling={:?}",
-                impl_def_id, simplified_self, possible_sibling,
-            );
+            debug!(?possible_sibling);
 
             let create_overlap_error = |overlap: traits::coherence::OverlapResult<'tcx>| {
                 let trait_ref = overlap.impl_header.trait_ref.unwrap();
@@ -113,7 +112,7 @@ impl<'tcx> ChildrenExt<'tcx> for Children {
                     // Only report the `Self` type if it has at least
                     // some outer concrete shell; otherwise, it's
                     // not adding much information.
-                    self_ty: if self_ty.has_concrete_skeleton() { Some(self_ty) } else { None },
+                    self_ty: self_ty.has_concrete_skeleton().then_some(self_ty),
                     intercrate_ambiguity_causes: overlap.intercrate_ambiguity_causes,
                     involves_placeholder: overlap.involves_placeholder,
                 }
@@ -302,7 +301,8 @@ impl<'tcx> GraphExt<'tcx> for Graph {
 
         let mut parent = trait_def_id;
         let mut last_lint = None;
-        let simplified = fast_reject::simplify_type(tcx, trait_ref.self_ty(), TreatParams::AsInfer);
+        let simplified =
+            fast_reject::simplify_type(tcx, trait_ref.self_ty(), TreatParams::AsCandidateKey);
 
         // Descend the specialization tree, where `parent` is the current parent node.
         loop {
@@ -399,7 +399,7 @@ pub(crate) fn assoc_def(
     // If there is no such item in that impl, this function will fail with a
     // cycle error if the specialization graph is currently being built.
     if let Some(&impl_item_id) = tcx.impl_item_implementor_ids(impl_def_id).get(&assoc_def_id) {
-        let &item = tcx.associated_item(impl_item_id);
+        let item = tcx.associated_item(impl_item_id);
         let impl_node = Node::Impl(impl_def_id);
         return Ok(LeafDef {
             item,

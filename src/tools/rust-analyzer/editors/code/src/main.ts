@@ -120,13 +120,11 @@ function createCommands(): Record<string, CommandFactory> {
             enabled: commands.onEnter,
             disabled: (_) => () => vscode.commands.executeCommand("default:type", { text: "\n" }),
         },
-        reload: {
+        restartServer: {
             enabled: (ctx) => async () => {
-                void vscode.window.showInformationMessage("Reloading rust-analyzer...");
                 await ctx.restart();
             },
             disabled: (ctx) => async () => {
-                void vscode.window.showInformationMessage("Reloading rust-analyzer...");
                 await ctx.start();
             },
         },
@@ -153,11 +151,15 @@ function createCommands(): Record<string, CommandFactory> {
         memoryUsage: { enabled: commands.memoryUsage },
         shuffleCrateGraph: { enabled: commands.shuffleCrateGraph },
         reloadWorkspace: { enabled: commands.reloadWorkspace },
+        rebuildProcMacros: { enabled: commands.rebuildProcMacros },
+        addProject: { enabled: commands.addProject },
         matchingBrace: { enabled: commands.matchingBrace },
         joinLines: { enabled: commands.joinLines },
         parentModule: { enabled: commands.parentModule },
         syntaxTree: { enabled: commands.syntaxTree },
         viewHir: { enabled: commands.viewHir },
+        viewMir: { enabled: commands.viewMir },
+        interpretFunction: { enabled: commands.interpretFunction },
         viewFileText: { enabled: commands.viewFileText },
         viewItemTree: { enabled: commands.viewItemTree },
         viewCrateGraph: { enabled: commands.viewCrateGraph },
@@ -186,5 +188,8 @@ function createCommands(): Record<string, CommandFactory> {
         resolveCodeAction: { enabled: commands.resolveCodeAction },
         runSingle: { enabled: commands.runSingle },
         showReferences: { enabled: commands.showReferences },
+        triggerParameterHints: { enabled: commands.triggerParameterHints },
+        openLogs: { enabled: commands.openLogs },
+        revealDependency: { enabled: commands.revealDependency },
     };
 }

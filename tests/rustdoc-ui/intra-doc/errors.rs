@@ -54,11 +54,11 @@
 
 /// [u8::not_found]
 //~^ ERROR unresolved link
-//~| NOTE the builtin type `u8` has no associated item named `not_found`
+//~| NOTE the primitive type `u8` has no associated item named `not_found`
 
 /// [std::primitive::u8::not_found]
 //~^ ERROR unresolved link
-//~| NOTE the builtin type `u8` has no associated item named `not_found`
+//~| NOTE the primitive type `u8` has no associated item named `not_found`
 
 /// [type@Vec::into_iter]
 //~^ ERROR unresolved link
@@ -102,4 +102,20 @@ pub trait T {
 #[macro_export]
 macro_rules! m {
     () => {};
+}
+
+///[`TestEnum::Variant1::field_name`]
+//~^ ERROR unresolved link
+//~| NOTE variant `Variant1` has no such field
+pub enum TestEnum {
+    Variant1 {},
+    Variant2 { field_name: u64 },
+}
+
+///[`TestEnumNoFields::Variant1::field_name`]
+//~^ ERROR unresolved link
+//~| NOTE `Variant1` is a variant, not a module or type, and cannot have associated items
+pub enum TestEnumNoFields {
+    Variant1 (),
+    Variant2 {},
 }

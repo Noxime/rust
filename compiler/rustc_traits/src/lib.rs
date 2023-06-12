@@ -4,6 +4,7 @@
 #![deny(rustc::untranslatable_diagnostic)]
 #![deny(rustc::diagnostic_outside_of_impl)]
 #![feature(let_chains)]
+#![feature(drain_filter)]
 #![recursion_limit = "256"]
 
 #[macro_use]
@@ -20,9 +21,10 @@ mod normalize_erasing_regions;
 mod normalize_projection_ty;
 mod type_op;
 
-pub use type_op::{type_op_ascribe_user_type_with_span, type_op_prove_predicate_with_cause};
+pub use rustc_trait_selection::traits::query::type_op::ascribe_user_type::type_op_ascribe_user_type_with_span;
+pub use type_op::type_op_prove_predicate_with_cause;
 
-use rustc_middle::ty::query::Providers;
+use rustc_middle::query::Providers;
 
 pub fn provide(p: &mut Providers) {
     dropck_outlives::provide(p);

@@ -1,5 +1,6 @@
-// run-rustfix
+//@run-rustfix
 #![warn(clippy::box_default)]
+#![allow(clippy::default_constructed_unit_structs)]
 
 #[derive(Default)]
 struct ImplementsDefault;
@@ -33,6 +34,14 @@ fn main() {
     let _vec4: Box<_> = Box::new(Vec::from([false; 0]));
     let _more = ret_ty_fn();
     call_ty_fn(Box::new(u8::default()));
+    issue_10381();
+
+    // `Box::<Option<_>>::default()` would be valid here, but not `Box::default()` or
+    // `Box::<Option<[closure@...]>::default()`
+    //
+    // Would have a suggestion after https://github.com/rust-lang/rust/blob/fdd030127cc68afec44a8d3f6341525dd34e50ae/compiler/rustc_middle/src/ty/diagnostics.rs#L554-L563
+    let mut unnameable = Box::new(Option::default());
+    let _ = unnameable.insert(|| {});
 }
 
 fn ret_ty_fn() -> Box<bool> {
@@ -64,4 +73,21 @@ fn issue_10089() {
 
         let _ = Box::new(WeirdPathed::default());
     };
+}
+
+fn issue_10381() {
+    #[derive(Default)]
+    pub struct Foo {}
+    pub trait Bar {}
+    impl Bar for Foo {}
+
+    fn maybe_get_bar(i: u32) -> Option<Box<dyn Bar>> {
+        if i % 2 == 0 {
+            Some(Box::new(Foo::default()))
+        } else {
+            None
+        }
+    }
+
+    assert!(maybe_get_bar(2).is_some());
 }

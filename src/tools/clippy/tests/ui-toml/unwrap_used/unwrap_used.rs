@@ -1,4 +1,4 @@
-// compile-flags: --test
+//@compile-flags: --test
 
 #![allow(unused_mut, clippy::get_first, clippy::from_iter_instead_of_collect)]
 #![warn(clippy::unwrap_used)]
@@ -64,6 +64,12 @@ fn main() {
         let _ = some_vec.get(0..1).unwrap().to_vec();
         let _ = some_vec.get_mut(0..1).unwrap().to_vec();
     }
+}
+
+#[test]
+fn test() {
+    let boxed_slice: Box<[u8]> = Box::new([0, 1, 2, 3]);
+    let _ = boxed_slice.get(1).unwrap();
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 use crate::error::StrictCoherenceNeedsNegativeCoherence;
 use crate::ty::fast_reject::SimplifiedType;
-use crate::ty::visit::TypeVisitable;
+use crate::ty::visit::TypeVisitableExt;
 use crate::ty::{self, TyCtxt};
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_errors::ErrorGuaranteed;
@@ -133,11 +133,7 @@ impl Node {
     ///
     /// If this returns `None`, the item can potentially still be found in
     /// parents of this node.
-    pub fn item<'tcx>(
-        &self,
-        tcx: TyCtxt<'tcx>,
-        trait_item_def_id: DefId,
-    ) -> Option<&'tcx ty::AssocItem> {
+    pub fn item<'tcx>(&self, tcx: TyCtxt<'tcx>, trait_item_def_id: DefId) -> Option<ty::AssocItem> {
         match *self {
             Node::Trait(_) => Some(tcx.associated_item(trait_item_def_id)),
             Node::Impl(impl_def_id) => {
@@ -232,14 +228,14 @@ impl<'tcx> Ancestors<'tcx> {
             if let Some(item) = node.item(tcx, trait_item_def_id) {
                 if finalizing_node.is_none() {
                     let is_specializable = item.defaultness(tcx).is_default()
-                        || tcx.impl_defaultness(node.def_id()).is_default();
+                        || tcx.defaultness(node.def_id()).is_default();
 
                     if !is_specializable {
                         finalizing_node = Some(node);
                     }
                 }
 
-                Some(LeafDef { item: *item, defining_node: node, finalizing_node })
+                Some(LeafDef { item, defining_node: node, finalizing_node })
             } else {
                 // Item not mentioned. This "finalizes" any defaulted item provided by an ancestor.
                 finalizing_node = Some(node);
@@ -263,7 +259,7 @@ pub fn ancestors(
 
     if let Some(reported) = specialization_graph.has_errored {
         Err(reported)
-    } else if let Err(reported) = tcx.type_of(start_from_impl).error_reported() {
+    } else if let Err(reported) = tcx.type_of(start_from_impl).subst_identity().error_reported() {
         Err(reported)
     } else {
         Ok(Ancestors {

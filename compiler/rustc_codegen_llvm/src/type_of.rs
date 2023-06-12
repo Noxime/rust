@@ -1,12 +1,12 @@
 use crate::common::*;
 use crate::context::TypeLowering;
-use crate::llvm_util::get_version;
 use crate::type_::Type;
 use rustc_codegen_ssa::traits::*;
 use rustc_middle::bug;
 use rustc_middle::ty::layout::{FnAbiOf, LayoutOf, TyAndLayout};
 use rustc_middle::ty::print::{with_no_trimmed_paths, with_no_visible_paths};
-use rustc_middle::ty::{self, Ty, TypeVisitable};
+use rustc_middle::ty::{self, Ty, TypeVisitableExt};
+use rustc_target::abi::HasDataLayout;
 use rustc_target::abi::{Abi, Align, FieldsShape};
 use rustc_target::abi::{Int, Pointer, F32, F64};
 use rustc_target::abi::{PointeeInfo, Scalar, Size, TyAbiInterface, Variants};
@@ -43,10 +43,8 @@ fn uncached_llvm_type<'a, 'tcx>(
         // in problematically distinct types due to HRTB and subtyping (see #47638).
         // ty::Dynamic(..) |
         ty::Adt(..) | ty::Closure(..) | ty::Foreign(..) | ty::Generator(..) | ty::Str
-            // For performance reasons we use names only when emitting LLVM IR. Unless we are on
-            // LLVM < 14, where the use of unnamed types resulted in various issues, e.g., #76213,
-            // #79564, and #79246.
-            if get_version() < (14, 0, 0) || !cx.sess().fewer_names() =>
+            // For performance reasons we use names only when emitting LLVM IR.
+            if !cx.sess().fewer_names() =>
         {
             let mut name = with_no_visible_paths!(with_no_trimmed_paths!(layout.ty.to_string()));
             if let (&ty::Adt(def, _), &Variants::Single { index }) =
@@ -157,7 +155,7 @@ fn struct_llfields<'a, 'tcx>(
     } else {
         debug!("struct_llfields: offset: {:?} stride: {:?}", offset, layout.size);
     }
-    let field_remapping = if padding_used { Some(field_remapping) } else { None };
+    let field_remapping = padding_used.then_some(field_remapping);
     (result, packed, field_remapping)
 }
 
@@ -195,14 +193,14 @@ pub trait LayoutLlvmExt<'tcx> {
     ) -> &'a Type;
     fn llvm_field_index<'a>(&self, cx: &CodegenCx<'a, 'tcx>, index: usize) -> u64;
     fn pointee_info_at<'a>(&self, cx: &CodegenCx<'a, 'tcx>, offset: Size) -> Option<PointeeInfo>;
+    fn scalar_copy_llvm_type<'a>(&self, cx: &CodegenCx<'a, 'tcx>) -> Option<&'a Type>;
 }
 
 impl<'tcx> LayoutLlvmExt<'tcx> for TyAndLayout<'tcx> {
     fn is_llvm_immediate(&self) -> bool {
         match self.abi {
             Abi::Scalar(_) | Abi::Vector { .. } => true,
-            Abi::ScalarPair(..) => false,
-            Abi::Uninhabited | Abi::Aggregate { .. } => self.is_zst(),
+            Abi::ScalarPair(..) | Abi::Uninhabited | Abi::Aggregate { .. } => false,
         }
     }
 
@@ -332,7 +330,7 @@ impl<'tcx> LayoutLlvmExt<'tcx> for TyAndLayout<'tcx> {
     ) -> &'a Type {
         // HACK(eddyb) special-case fat pointers until LLVM removes
         // pointee types, to avoid bitcasting every `OperandRef::deref`.
-        match self.ty.kind() {
+        match *self.ty.kind() {
             ty::Ref(..) | ty::RawPtr(_) => {
                 return self.field(cx, index).llvm_type(cx);
             }
@@ -340,6 +338,11 @@ impl<'tcx> LayoutLlvmExt<'tcx> for TyAndLayout<'tcx> {
             // thin pointer boxes with scalar allocators are handled by the general logic below
             ty::Adt(def, substs) if def.is_box() && cx.layout_of(substs.type_at(1)).is_zst() => {
                 let ptr_ty = cx.tcx.mk_mut_ptr(self.ty.boxed_ty());
+                return cx.layout_of(ptr_ty).scalar_pair_element_llvm_type(cx, index, immediate);
+            }
+            // `dyn* Trait` has the same ABI as `*mut dyn Trait`
+            ty::Dynamic(bounds, region, ty::DynStar) => {
+                let ptr_ty = cx.tcx.mk_mut_ptr(cx.tcx.mk_dynamic(bounds, region, ty::Dyn));
                 return cx.layout_of(ptr_ty).scalar_pair_element_llvm_type(cx, index, immediate);
             }
             _ => {}
@@ -412,5 +415,36 @@ impl<'tcx> LayoutLlvmExt<'tcx> for TyAndLayout<'tcx> {
 
         cx.pointee_infos.borrow_mut().insert((self.ty, offset), result);
         result
+    }
+
+    fn scalar_copy_llvm_type<'a>(&self, cx: &CodegenCx<'a, 'tcx>) -> Option<&'a Type> {
+        debug_assert!(self.is_sized());
+
+        // FIXME: this is a fairly arbitrary choice, but 128 bits on WASM
+        // (matching the 128-bit SIMD types proposal) and 256 bits on x64
+        // (like AVX2 registers) seems at least like a tolerable starting point.
+        let threshold = cx.data_layout().pointer_size * 4;
+        if self.layout.size() > threshold {
+            return None;
+        }
+
+        // Vectors, even for non-power-of-two sizes, have the same layout as
+        // arrays but don't count as aggregate types
+        if let FieldsShape::Array { count, .. } = self.layout.fields()
+            && let element = self.field(cx, 0)
+            && element.ty.is_integral()
+        {
+            // `cx.type_ix(bits)` is tempting here, but while that works great
+            // for things that *stay* as memory-to-memory copies, it also ends
+            // up suppressing vectorization as it introduces shifts when it
+            // extracts all the individual values.
+
+            let ety = element.llvm_type(cx);
+            return Some(cx.type_vector(ety, *count));
+        }
+
+        // FIXME: The above only handled integer arrays; surely more things
+        // would also be possible. Be careful about provenance, though!
+        None
     }
 }

@@ -14,7 +14,7 @@ use rustc_hir::def_id::DefId;
 use rustc_middle::ty::error::ExpectedFound;
 use rustc_middle::ty::print::{FmtPrinter, Print, RegionHighlightMode};
 use rustc_middle::ty::subst::SubstsRef;
-use rustc_middle::ty::{self, RePlaceholder, ReVar, Region, TyCtxt};
+use rustc_middle::ty::{self, RePlaceholder, Region, TyCtxt};
 
 use std::fmt;
 
@@ -79,7 +79,7 @@ impl<'tcx> NiceRegionError<'_, 'tcx> {
                 sup_placeholder @ Region(Interned(RePlaceholder(_), _)),
                 _,
             )) => self.try_report_trait_placeholder_mismatch(
-                Some(self.tcx().mk_region(ReVar(*vid))),
+                Some(ty::Region::new_var(self.tcx(), *vid)),
                 cause,
                 Some(*sub_placeholder),
                 Some(*sup_placeholder),
@@ -95,7 +95,7 @@ impl<'tcx> NiceRegionError<'_, 'tcx> {
                 _,
                 _,
             )) => self.try_report_trait_placeholder_mismatch(
-                Some(self.tcx().mk_region(ReVar(*vid))),
+                Some(ty::Region::new_var(self.tcx(), *vid)),
                 cause,
                 Some(*sub_placeholder),
                 None,
@@ -111,7 +111,7 @@ impl<'tcx> NiceRegionError<'_, 'tcx> {
                 sup_placeholder @ Region(Interned(RePlaceholder(_), _)),
                 _,
             )) => self.try_report_trait_placeholder_mismatch(
-                Some(self.tcx().mk_region(ReVar(*vid))),
+                Some(ty::Region::new_var(self.tcx(), *vid)),
                 cause,
                 None,
                 Some(*sup_placeholder),
@@ -127,7 +127,7 @@ impl<'tcx> NiceRegionError<'_, 'tcx> {
                 sup_placeholder @ Region(Interned(RePlaceholder(_), _)),
                 _,
             )) => self.try_report_trait_placeholder_mismatch(
-                Some(self.tcx().mk_region(ReVar(*vid))),
+                Some(ty::Region::new_var(self.tcx(), *vid)),
                 cause,
                 None,
                 Some(*sup_placeholder),
@@ -141,7 +141,7 @@ impl<'tcx> NiceRegionError<'_, 'tcx> {
                 SubregionOrigin::Subtype(box TypeTrace { cause, values }),
                 sup_placeholder @ Region(Interned(RePlaceholder(_), _)),
             )) => self.try_report_trait_placeholder_mismatch(
-                Some(self.tcx().mk_region(ReVar(*vid))),
+                Some(ty::Region::new_var(self.tcx(), *vid)),
                 cause,
                 None,
                 Some(*sup_placeholder),
@@ -261,11 +261,16 @@ impl<'tcx> NiceRegionError<'_, 'tcx> {
                 (false, None, None, Some(span), String::new())
             };
 
-        let expected_trait_ref = self
-            .cx
-            .resolve_vars_if_possible(self.cx.tcx.mk_trait_ref(trait_def_id, expected_substs));
-        let actual_trait_ref =
-            self.cx.resolve_vars_if_possible(self.cx.tcx.mk_trait_ref(trait_def_id, actual_substs));
+        let expected_trait_ref = self.cx.resolve_vars_if_possible(ty::TraitRef::new(
+            self.cx.tcx,
+            trait_def_id,
+            expected_substs,
+        ));
+        let actual_trait_ref = self.cx.resolve_vars_if_possible(ty::TraitRef::new(
+            self.cx.tcx,
+            trait_def_id,
+            actual_substs,
+        ));
 
         // Search the expected and actual trait references to see (a)
         // whether the sub/sup placeholders appear in them (sometimes

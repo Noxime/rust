@@ -25,7 +25,6 @@
 //! to: `rustc_span::create_default_session_globals_then(|| { test_here(); })`.
 
 use super::counters;
-use super::debug;
 use super::graph;
 use super::spans;
 
@@ -34,7 +33,7 @@ use coverage_test_macros::let_bcb;
 use itertools::Itertools;
 use rustc_data_structures::graph::WithNumNodes;
 use rustc_data_structures::graph::WithSuccessors;
-use rustc_index::vec::{Idx, IndexVec};
+use rustc_index::{Idx, IndexVec};
 use rustc_middle::mir::coverage::CoverageKind;
 use rustc_middle::mir::*;
 use rustc_middle::ty;
@@ -65,7 +64,7 @@ impl<'tcx> MockBlocks<'tcx> {
     }
 
     fn push(&mut self, kind: TerminatorKind<'tcx>) -> BasicBlock {
-        let next_lo = if let Some(last) = self.blocks.last() {
+        let next_lo = if let Some(last) = self.blocks.last_index() {
             self.blocks[last].terminator().source_info.span.hi()
         } else {
             BytePos(1)
@@ -86,7 +85,6 @@ impl<'tcx> MockBlocks<'tcx> {
             TerminatorKind::Assert { ref mut target, .. }
             | TerminatorKind::Call { target: Some(ref mut target), .. }
             | TerminatorKind::Drop { ref mut target, .. }
-            | TerminatorKind::DropAndReplace { ref mut target, .. }
             | TerminatorKind::FalseEdge { real_target: ref mut target, .. }
             | TerminatorKind::FalseUnwind { real_target: ref mut target, .. }
             | TerminatorKind::Goto { ref mut target }
@@ -141,7 +139,7 @@ impl<'tcx> MockBlocks<'tcx> {
                 args: vec![],
                 destination: self.dummy_place.clone(),
                 target: Some(TEMP_BLOCK),
-                cleanup: None,
+                unwind: UnwindAction::Continue,
                 from_hir_call: false,
                 fn_span: DUMMY_SP,
             },
@@ -184,18 +182,17 @@ fn debug_basic_blocks(mir_body: &Body<'_>) -> String {
                     TerminatorKind::Assert { target, .. }
                     | TerminatorKind::Call { target: Some(target), .. }
                     | TerminatorKind::Drop { target, .. }
-                    | TerminatorKind::DropAndReplace { target, .. }
                     | TerminatorKind::FalseEdge { real_target: target, .. }
                     | TerminatorKind::FalseUnwind { real_target: target, .. }
                     | TerminatorKind::Goto { target }
                     | TerminatorKind::InlineAsm { destination: Some(target), .. }
                     | TerminatorKind::Yield { resume: target, .. } => {
-                        format!("{}{:?}:{} -> {:?}", sp, bb, debug::term_type(kind), target)
+                        format!("{}{:?}:{} -> {:?}", sp, bb, kind.name(), target)
                     }
                     TerminatorKind::SwitchInt { targets, .. } => {
-                        format!("{}{:?}:{} -> {:?}", sp, bb, debug::term_type(kind), targets)
+                        format!("{}{:?}:{} -> {:?}", sp, bb, kind.name(), targets)
                     }
-                    _ => format!("{}{:?}:{}", sp, bb, debug::term_type(kind)),
+                    _ => format!("{}{:?}:{}", sp, bb, kind.name()),
                 }
             })
             .collect::<Vec<_>>()
@@ -217,7 +214,7 @@ fn print_mir_graphviz(name: &str, mir_body: &Body<'_>) {
                         "    {:?} [label=\"{:?}: {}\"];\n{}",
                         bb,
                         bb,
-                        debug::term_type(&data.terminator().kind),
+                        data.terminator().kind.name(),
                         mir_body
                             .basic_blocks
                             .successors(bb)
@@ -246,7 +243,7 @@ fn print_coverage_graphviz(
                         "    {:?} [label=\"{:?}: {}\"];\n{}",
                         bcb,
                         bcb,
-                        debug::term_type(&bcb_data.terminator(mir_body).kind),
+                        bcb_data.terminator(mir_body).kind.name(),
                         basic_coverage_blocks
                             .successors(bcb)
                             .map(|successor| { format!("    {:?} -> {:?};", bcb, successor) })

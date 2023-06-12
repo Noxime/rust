@@ -1,5 +1,5 @@
 use crate::ty::GenericArg;
-use crate::ty::{self, DefIdTree, Ty, TyCtxt};
+use crate::ty::{self, Ty, TyCtxt};
 
 use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::sso::SsoHashSet;
@@ -115,7 +115,7 @@ pub trait Printer<'tcx>: Sized {
 
             DefPathData::Impl => {
                 let generics = self.tcx().generics_of(def_id);
-                let self_ty = self.tcx().bound_type_of(def_id);
+                let self_ty = self.tcx().type_of(def_id);
                 let impl_trait_ref = self.tcx().impl_trait_ref(def_id);
                 let (self_ty, impl_trait_ref) = if substs.len() >= generics.count() {
                     (
@@ -123,7 +123,7 @@ pub trait Printer<'tcx>: Sized {
                         impl_trait_ref.map(|i| i.subst(self.tcx(), substs)),
                     )
                 } else {
-                    (self_ty.0, impl_trait_ref.map(|i| i.0))
+                    (self_ty.subst_identity(), impl_trait_ref.map(|i| i.subst_identity()))
                 };
                 self.print_impl_path(def_id, substs, self_ty, impl_trait_ref)
             }
@@ -169,8 +169,11 @@ pub trait Printer<'tcx>: Sized {
                 self.path_append(
                     |cx: Self| {
                         if trait_qualify_parent {
-                            let trait_ref =
-                                cx.tcx().mk_trait_ref(parent_def_id, parent_substs.iter().copied());
+                            let trait_ref = ty::TraitRef::new(
+                                cx.tcx(),
+                                parent_def_id,
+                                parent_substs.iter().copied(),
+                            );
                             cx.path_qualified(trait_ref.self_ty(), Some(trait_ref))
                         } else {
                             cx.print_def_path(parent_def_id, parent_substs)
@@ -327,6 +330,6 @@ pub fn describe_as_module(def_id: LocalDefId, tcx: TyCtxt<'_>) -> String {
     if def_id.is_top_level_module() {
         "top-level module".to_string()
     } else {
-        format!("module `{}`", tcx.def_path_str(def_id.to_def_id()))
+        format!("module `{}`", tcx.def_path_str(def_id))
     }
 }

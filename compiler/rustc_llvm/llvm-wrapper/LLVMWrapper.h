@@ -4,7 +4,6 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/Triple.h"
 #include "llvm/Analysis/Lint.h"
 #include "llvm/Analysis/Passes.h"
 #include "llvm/IR/IRBuilder.h"
@@ -15,6 +14,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/DynamicLibrary.h"
 #include "llvm/Support/FormattedStream.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/Host.h"
 #include "llvm/Support/Memory.h"
 #include "llvm/Support/SourceMgr.h"
@@ -43,6 +43,12 @@
 #include "llvm/IR/DebugInfo.h"
 #include "llvm/IR/IRPrintingPasses.h"
 #include "llvm/Linker/Linker.h"
+
+#if LLVM_VERSION_GE(16, 0)
+#include "llvm/TargetParser/Triple.h"
+#else
+#include "llvm/ADT/Triple.h"
+#endif
 
 extern "C" void LLVMRustSetLastError(const char *);
 
@@ -90,6 +96,7 @@ enum LLVMRustAttribute {
   AllocatedPointer = 38,
   AllocAlign = 39,
 #endif
+  SanitizeSafeStack = 40,
 };
 
 typedef struct OpaqueRustString *RustStringRef;

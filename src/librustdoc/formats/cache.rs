@@ -1,6 +1,6 @@
 use std::mem;
 
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexSet};
 use rustc_hir::def_id::{CrateNum, DefId, DefIdMap, DefIdSet};
 use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::Symbol;
@@ -118,7 +118,7 @@ pub(crate) struct Cache {
     /// All intra-doc links resolved so far.
     ///
     /// Links are indexed by the DefId of the item they document.
-    pub(crate) intra_doc_links: FxHashMap<ItemId, Vec<clean::ItemLink>>,
+    pub(crate) intra_doc_links: FxHashMap<ItemId, FxIndexSet<clean::ItemLink>>,
     /// Cfg that have been hidden via #![doc(cfg_hide(...))]
     pub(crate) hidden_cfg: FxHashSet<clean::cfg::Cfg>,
 }
@@ -147,7 +147,7 @@ impl Cache {
 
         // Cache where all our extern crates are located
         // FIXME: this part is specific to HTML so it'd be nice to remove it from the common code
-        for &crate_num in cx.tcx.crates(()) {
+        for &crate_num in tcx.crates(()) {
             let e = ExternalCrate { crate_num };
 
             let name = e.name(tcx);
@@ -195,7 +195,13 @@ impl Cache {
 impl<'a, 'tcx> DocFolder for CacheBuilder<'a, 'tcx> {
     fn fold_item(&mut self, item: clean::Item) -> Option<clean::Item> {
         if item.item_id.is_local() {
-            debug!("folding {} \"{:?}\", id {:?}", item.type_(), item.name, item.item_id);
+            let is_stripped = matches!(*item.kind, clean::ItemKind::StrippedItem(..));
+            debug!(
+                "folding {} (stripped: {is_stripped:?}) \"{:?}\", id {:?}",
+                item.type_(),
+                item.name,
+                item.item_id
+            );
         }
 
         // If this is a stripped module,
@@ -229,16 +235,15 @@ impl<'a, 'tcx> DocFolder for CacheBuilder<'a, 'tcx> {
         }
 
         // Collect all the implementors of traits.
-        if let clean::ImplItem(ref i) = *item.kind {
-            if let Some(trait_) = &i.trait_ {
-                if !i.kind.is_blanket() {
-                    self.cache
-                        .implementors
-                        .entry(trait_.def_id())
-                        .or_default()
-                        .push(Impl { impl_item: item.clone() });
-                }
-            }
+        if let clean::ImplItem(ref i) = *item.kind &&
+            let Some(trait_) = &i.trait_ &&
+            !i.kind.is_blanket()
+        {
+            self.cache
+                .implementors
+                .entry(trait_.def_id())
+                .or_default()
+                .push(Impl { impl_item: item.clone() });
         }
 
         // Index this method for searching later on.
@@ -288,17 +293,26 @@ impl<'a, 'tcx> DocFolder for CacheBuilder<'a, 'tcx> {
                     } else {
                         let last = self.cache.parent_stack.last().expect("parent_stack is empty 2");
                         let did = match &*last {
+                            ParentStackItem::Impl {
+                                // impl Trait for &T { fn method(self); }
+                                //
+                                // When generating a function index with the above shape, we want it
+                                // associated with `T`, not with the primitive reference type. It should
+                                // show up as `T::method`, rather than `reference::method`, in the search
+                                // results page.
+                                for_: clean::Type::BorrowedRef { type_, .. },
+                                ..
+                            } => type_.def_id(&self.cache),
                             ParentStackItem::Impl { for_, .. } => for_.def_id(&self.cache),
                             ParentStackItem::Type(item_id) => item_id.as_def_id(),
                         };
-                        let path = match did.and_then(|did| self.cache.paths.get(&did)) {
+                        let path = did
+                            .and_then(|did| self.cache.paths.get(&did))
                             // The current stack not necessarily has correlation
                             // for where the type was defined. On the other
                             // hand, `paths` always has the right
                             // information if present.
-                            Some((fqp, _)) => Some(&fqp[..fqp.len() - 1]),
-                            None => None,
-                        };
+                            .map(|(fqp, _)| &fqp[..fqp.len() - 1]);
                         ((did, path), true)
                     }
                 }
@@ -313,9 +327,8 @@ impl<'a, 'tcx> DocFolder for CacheBuilder<'a, 'tcx> {
                     // which should not be indexed. The crate-item itself is
                     // inserted later on when serializing the search-index.
                     if item.item_id.as_def_id().map_or(false, |idx| !idx.is_crate_root()) {
-                        let desc = item.doc_value().map_or_else(String::new, |x| {
-                            short_markdown_summary(x.as_str(), &item.link_names(self.cache))
-                        });
+                        let desc =
+                            short_markdown_summary(&item.doc_value(), &item.link_names(self.cache));
                         let ty = item.type_();
                         if ty != ItemType::StructField
                             || u16::from_str_radix(s.as_str(), 10).is_err()
@@ -337,6 +350,7 @@ impl<'a, 'tcx> DocFolder for CacheBuilder<'a, 'tcx> {
                                     self.cache,
                                 ),
                                 aliases: item.attrs.get_doc_aliases(),
+                                deprecation: item.deprecation(self.tcx),
                             });
                         }
                     }
@@ -454,7 +468,7 @@ impl<'a, 'tcx> DocFolder for CacheBuilder<'a, 'tcx> {
                 | clean::BorrowedRef { type_: box clean::Type::Path { ref path }, .. } => {
                     dids.insert(path.def_id());
                     if let Some(generics) = path.generics() &&
-                        let ty::Adt(adt, _) = self.tcx.type_of(path.def_id()).kind() &&
+                        let ty::Adt(adt, _) = self.tcx.type_of(path.def_id()).subst_identity().kind() &&
                         adt.is_fundamental() {
                         for ty in generics {
                             if let Some(did) = ty.def_id(self.cache) {

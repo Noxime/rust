@@ -3,15 +3,23 @@ import * as lc from "vscode-languageclient";
 import * as ra from "./lsp_ext";
 import * as path from "path";
 
-import { Ctx, Cmd, CtxInit } from "./ctx";
+import { Ctx, Cmd, CtxInit, discoverWorkspace } from "./ctx";
 import { applySnippetWorkspaceEdit, applySnippetTextEdits } from "./snippets";
 import { spawnSync } from "child_process";
 import { RunnableQuickPick, selectRunnable, createTask, createArgs } from "./run";
 import { AstInspector } from "./ast_inspector";
-import { isRustDocument, isCargoTomlDocument, sleep, isRustEditor } from "./util";
+import {
+    isRustDocument,
+    isCargoTomlDocument,
+    sleep,
+    isRustEditor,
+    RustEditor,
+    RustDocument,
+} from "./util";
 import { startDebugSession, makeDebugConfig } from "./debug";
 import { LanguageClient } from "vscode-languageclient/node";
 import { LINKED_COMMANDS } from "./client";
+import { DependencyId } from "./dependencies_provider";
 
 export * from "./ast_inspector";
 export * from "./run";
@@ -87,6 +95,26 @@ export function shuffleCrateGraph(ctx: CtxInit): Cmd {
     };
 }
 
+export function triggerParameterHints(_: CtxInit): Cmd {
+    return async () => {
+        const parameterHintsEnabled = vscode.workspace
+            .getConfiguration("editor")
+            .get<boolean>("parameterHints.enabled");
+
+        if (parameterHintsEnabled) {
+            await vscode.commands.executeCommand("editor.action.triggerParameterHints");
+        }
+    };
+}
+
+export function openLogs(ctx: CtxInit): Cmd {
+    return async () => {
+        if (ctx.client.outputChannel) {
+            ctx.client.outputChannel.show();
+        }
+    };
+}
+
 export function matchingBrace(ctx: CtxInit): Cmd {
     return async () => {
         const editor = ctx.activeRustEditor;
@@ -130,11 +158,11 @@ export function joinLines(ctx: CtxInit): Cmd {
 }
 
 export function moveItemUp(ctx: CtxInit): Cmd {
-    return moveItem(ctx, ra.Direction.Up);
+    return moveItem(ctx, "Up");
 }
 
 export function moveItemDown(ctx: CtxInit): Cmd {
-    return moveItem(ctx, ra.Direction.Down);
+    return moveItem(ctx, "Down");
 }
 
 export function moveItem(ctx: CtxInit, direction: ra.Direction): Cmd {
@@ -244,6 +272,71 @@ export function openCargoToml(ctx: CtxInit): Cmd {
         e.selection = new vscode.Selection(range.start, range.start);
         e.revealRange(range, vscode.TextEditorRevealType.InCenter);
     };
+}
+
+export function revealDependency(ctx: CtxInit): Cmd {
+    return async (editor: RustEditor) => {
+        if (!ctx.dependencies?.isInitialized()) {
+            return;
+        }
+        const documentPath = editor.document.uri.fsPath;
+        const dep = ctx.dependencies?.getDependency(documentPath);
+        if (dep) {
+            await ctx.treeView?.reveal(dep, { select: true, expand: true });
+        } else {
+            await revealParentChain(editor.document, ctx);
+        }
+    };
+}
+
+/**
+ * This function calculates the parent chain of a given file until it reaches it crate root contained in ctx.dependencies.
+ * This is need because the TreeView is Lazy, so at first it only has the root dependencies: For example if we have the following crates:
+ * - core
+ * - alloc
+ * - std
+ *
+ * if I want to reveal alloc/src/str.rs, I have to:
+
+ * 1. reveal every children of alloc
+ * - core
+ * - alloc\
+ * &emsp;|-beches\
+ * &emsp;|-src\
+ * &emsp;|- ...
+ * - std
+ * 2. reveal every children of src:
+ * core
+ * alloc\
+ * &emsp;|-beches\
+ * &emsp;|-src\
+ * &emsp;&emsp;|- lib.rs\
+ * &emsp;&emsp;|- str.rs <------- FOUND IT!\
+ * &emsp;&emsp;|- ...\
+ * &emsp;|- ...\
+ * std
+ */
+async function revealParentChain(document: RustDocument, ctx: CtxInit) {
+    let documentPath = document.uri.fsPath;
+    const maxDepth = documentPath.split(path.sep).length - 1;
+    const parentChain: DependencyId[] = [{ id: documentPath.toLowerCase() }];
+    do {
+        documentPath = path.dirname(documentPath);
+        parentChain.push({ id: documentPath.toLowerCase() });
+        if (parentChain.length >= maxDepth) {
+            // this is an odd case that can happen when we change a crate version but we'd still have
+            // a open file referencing the old version
+            return;
+        }
+    } while (!ctx.dependencies?.contains(documentPath));
+    parentChain.reverse();
+    for (const idx in parentChain) {
+        await ctx.treeView?.reveal(parentChain[idx], { select: true, expand: true });
+    }
+}
+
+export async function execRevealDependency(e: RustEditor): Promise<void> {
+    await vscode.commands.executeCommand("rust-analyzer.revealDependency", e);
 }
 
 export function ssr(ctx: CtxInit): Cmd {
@@ -399,12 +492,23 @@ export function syntaxTree(ctx: CtxInit): Cmd {
     };
 }
 
-// Opens the virtual file that will show the HIR of the function containing the cursor position
-//
-// The contents of the file come from the `TextDocumentContentProvider`
-export function viewHir(ctx: CtxInit): Cmd {
+function viewHirOrMir(ctx: CtxInit, xir: "hir" | "mir"): Cmd {
+    const viewXir = xir === "hir" ? "viewHir" : "viewMir";
+    const requestType = xir === "hir" ? ra.viewHir : ra.viewMir;
+    const uri = `rust-analyzer-${xir}://${viewXir}/${xir}.rs`;
+    const scheme = `rust-analyzer-${xir}`;
+    return viewFileUsingTextDocumentContentProvider(ctx, requestType, uri, scheme, true);
+}
+
+function viewFileUsingTextDocumentContentProvider(
+    ctx: CtxInit,
+    requestType: lc.RequestType<lc.TextDocumentPositionParams, string, void>,
+    uri: string,
+    scheme: string,
+    shouldUpdate: boolean
+): Cmd {
     const tdcp = new (class implements vscode.TextDocumentContentProvider {
-        readonly uri = vscode.Uri.parse("rust-analyzer-hir://viewHir/hir.rs");
+        readonly uri = vscode.Uri.parse(uri);
         readonly eventEmitter = new vscode.EventEmitter<vscode.Uri>();
         constructor() {
             vscode.workspace.onDidChangeTextDocument(
@@ -420,14 +524,14 @@ export function viewHir(ctx: CtxInit): Cmd {
         }
 
         private onDidChangeTextDocument(event: vscode.TextDocumentChangeEvent) {
-            if (isRustDocument(event.document)) {
+            if (isRustDocument(event.document) && shouldUpdate) {
                 // We need to order this after language server updates, but there's no API for that.
                 // Hence, good old sleep().
                 void sleep(10).then(() => this.eventEmitter.fire(this.uri));
             }
         }
         private onDidChangeActiveTextEditor(editor: vscode.TextEditor | undefined) {
-            if (editor && isRustEditor(editor)) {
+            if (editor && isRustEditor(editor) && shouldUpdate) {
                 this.eventEmitter.fire(this.uri);
             }
         }
@@ -446,7 +550,7 @@ export function viewHir(ctx: CtxInit): Cmd {
                 ),
                 position: client.code2ProtocolConverter.asPosition(rustEditor.selection.active),
             };
-            return client.sendRequest(ra.viewHir, params, ct);
+            return client.sendRequest(requestType, params, ct);
         }
 
         get onDidChange(): vscode.Event<vscode.Uri> {
@@ -454,9 +558,7 @@ export function viewHir(ctx: CtxInit): Cmd {
         }
     })();
 
-    ctx.pushExtCleanup(
-        vscode.workspace.registerTextDocumentContentProvider("rust-analyzer-hir", tdcp)
-    );
+    ctx.pushExtCleanup(vscode.workspace.registerTextDocumentContentProvider(scheme, tdcp));
 
     return async () => {
         const document = await vscode.workspace.openTextDocument(tdcp.uri);
@@ -466,6 +568,34 @@ export function viewHir(ctx: CtxInit): Cmd {
             preserveFocus: true,
         }));
     };
+}
+
+// Opens the virtual file that will show the HIR of the function containing the cursor position
+//
+// The contents of the file come from the `TextDocumentContentProvider`
+export function viewHir(ctx: CtxInit): Cmd {
+    return viewHirOrMir(ctx, "hir");
+}
+
+// Opens the virtual file that will show the MIR of the function containing the cursor position
+//
+// The contents of the file come from the `TextDocumentContentProvider`
+export function viewMir(ctx: CtxInit): Cmd {
+    return viewHirOrMir(ctx, "mir");
+}
+
+// Opens the virtual file that will show the MIR of the function containing the cursor position
+//
+// The contents of the file come from the `TextDocumentContentProvider`
+export function interpretFunction(ctx: CtxInit): Cmd {
+    const uri = `rust-analyzer-interpret-function://interpretFunction/result.log`;
+    return viewFileUsingTextDocumentContentProvider(
+        ctx,
+        ra.interpretFunction,
+        uri,
+        `rust-analyzer-interpret-function`,
+        false
+    );
 }
 
 export function viewFileText(ctx: CtxInit): Cmd {
@@ -636,20 +766,25 @@ function crateGraph(ctx: CtxInit, full: boolean): Cmd {
             </head>
             <body>
                 <script type="text/javascript" src="${uri}/d3/dist/d3.min.js"></script>
-                <script type="text/javascript" src="${uri}/@hpcc-js/wasm/dist/index.min.js"></script>
+                <script type="text/javascript" src="${uri}/@hpcc-js/wasm/dist/graphviz.umd.js"></script>
                 <script type="text/javascript" src="${uri}/d3-graphviz/build/d3-graphviz.min.js"></script>
                 <div id="graph"></div>
                 <script>
+                    let dot = \`${dot}\`;
                     let graph = d3.select("#graph")
-                                  .graphviz()
+                                  .graphviz({ useWorker: false, useSharedWorker: false })
                                   .fit(true)
                                   .zoomScaleExtent([0.1, Infinity])
-                                  .renderDot(\`${dot}\`);
+                                  .renderDot(dot);
 
                     d3.select(window).on("click", (event) => {
                         if (event.ctrlKey) {
                             graph.resetZoom(d3.transition().duration(100));
                         }
+                    });
+                    d3.select(window).on("copy", (event) => {
+                        event.clipboardData.setData("text/plain", dot);
+                        event.preventDefault();
                     });
                 </script>
             </body>
@@ -672,7 +807,7 @@ export function viewFullCrateGraph(ctx: CtxInit): Cmd {
 // The contents of the file come from the `TextDocumentContentProvider`
 export function expandMacro(ctx: CtxInit): Cmd {
     function codeFormat(expanded: ra.ExpandedMacro): string {
-        let result = `// Recursive expansion of ${expanded.name}! macro\n`;
+        let result = `// Recursive expansion of ${expanded.name} macro\n`;
         result += "// " + "=".repeat(result.length - 3);
         result += "\n\n";
         result += expanded.expansion;
@@ -720,6 +855,38 @@ export function expandMacro(ctx: CtxInit): Cmd {
 
 export function reloadWorkspace(ctx: CtxInit): Cmd {
     return async () => ctx.client.sendRequest(ra.reloadWorkspace);
+}
+
+export function rebuildProcMacros(ctx: CtxInit): Cmd {
+    return async () => ctx.client.sendRequest(ra.rebuildProcMacros);
+}
+
+export function addProject(ctx: CtxInit): Cmd {
+    return async () => {
+        const discoverProjectCommand = ctx.config.discoverProjectCommand;
+        if (!discoverProjectCommand) {
+            return;
+        }
+
+        const workspaces: JsonProject[] = await Promise.all(
+            vscode.workspace.textDocuments
+                .filter(isRustDocument)
+                .map(async (file): Promise<JsonProject> => {
+                    return discoverWorkspace([file], discoverProjectCommand, {
+                        cwd: path.dirname(file.uri.fsPath),
+                    });
+                })
+        );
+
+        ctx.addToDiscoveredWorkspaces(workspaces);
+
+        // this is a workaround to avoid needing writing the `rust-project.json` into
+        // a workspace-level VS Code-specific settings folder. We'd like to keep the
+        // `rust-project.json` entirely in-memory.
+        await ctx.client?.sendNotification(lc.DidChangeConfigurationNotification.type, {
+            settings: "",
+        });
+    };
 }
 
 async function showReferencesImpl(

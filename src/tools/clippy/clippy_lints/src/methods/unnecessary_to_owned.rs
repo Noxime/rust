@@ -369,10 +369,10 @@ fn can_change_type<'a>(cx: &LateContext<'a>, mut expr: &'a Expr<'a>, mut ty: Ty<
             Node::Item(item) => {
                 if let ItemKind::Fn(_, _, body_id) = &item.kind
                 && let output_ty = return_ty(cx, item.owner_id)
-                && Inherited::build(cx.tcx, item.owner_id.def_id).enter(|inherited| {
-                    let fn_ctxt = FnCtxt::new(inherited, cx.param_env, item.owner_id.def_id);
-                    fn_ctxt.can_coerce(ty, output_ty)
-                }) {
+                && let inherited = Inherited::new(cx.tcx, item.owner_id.def_id)
+                && let fn_ctxt = FnCtxt::new(&inherited, cx.param_env, item.owner_id.def_id)
+                && fn_ctxt.can_coerce(ty, output_ty)
+                {
                     if has_lifetime(output_ty) && has_lifetime(ty) {
                         return false;
                     }
@@ -385,6 +385,9 @@ fn can_change_type<'a>(cx: &LateContext<'a>, mut expr: &'a Expr<'a>, mut ty: Ty<
             Node::Expr(parent_expr) => {
                 if let Some((callee_def_id, call_substs, recv, call_args)) = get_callee_substs_and_args(cx, parent_expr)
                 {
+                    // FIXME: the `subst_identity()` below seems incorrect, since we eventually
+                    // call `tcx.try_subst_and_normalize_erasing_regions` further down
+                    // (i.e., we are explicitly not in the identity context).
                     let fn_sig = cx.tcx.fn_sig(callee_def_id).subst_identity().skip_binder();
                     if let Some(arg_index) = recv.into_iter().chain(call_args).position(|arg| arg.hir_id == expr.hir_id)
                         && let Some(param_ty) = fn_sig.inputs().get(arg_index)
@@ -414,7 +417,7 @@ fn can_change_type<'a>(cx: &LateContext<'a>, mut expr: &'a Expr<'a>, mut ty: Ty<
                             }
                         });
 
-                        let new_subst = cx.tcx.mk_substs(
+                        let new_subst = cx.tcx.mk_substs_from_iter(
                             call_substs.iter()
                                 .enumerate()
                                 .map(|(i, t)|
@@ -425,7 +428,7 @@ fn can_change_type<'a>(cx: &LateContext<'a>, mut expr: &'a Expr<'a>, mut ty: Ty<
                                      }));
 
                         if trait_predicates.any(|predicate| {
-                            let predicate = EarlyBinder(predicate).subst(cx.tcx, new_subst);
+                            let predicate = EarlyBinder::bind(predicate).subst(cx.tcx, new_subst);
                             let obligation = Obligation::new(cx.tcx, ObligationCause::dummy(), cx.param_env, predicate);
                             !cx.tcx.infer_ctxt().build().predicate_must_hold_modulo_regions(&obligation)
                         }) {
@@ -435,7 +438,7 @@ fn can_change_type<'a>(cx: &LateContext<'a>, mut expr: &'a Expr<'a>, mut ty: Ty<
                         let output_ty = fn_sig.output();
                         if output_ty.contains(*param_ty) {
                             if let Ok(new_ty)  = cx.tcx.try_subst_and_normalize_erasing_regions(
-                                new_subst, cx.param_env, output_ty) {
+                                new_subst, cx.param_env, EarlyBinder::bind(output_ty)) {
                                 expr = parent_expr;
                                 ty = new_ty;
                                 continue;

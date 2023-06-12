@@ -1,9 +1,9 @@
 use hir::HirId;
 use rustc_errors::struct_span_err;
 use rustc_hir as hir;
-use rustc_index::vec::Idx;
+use rustc_index::Idx;
 use rustc_middle::ty::layout::{LayoutError, SizeSkeleton};
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitable};
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
 use rustc_target::abi::{Pointer, VariantIdx};
 
 use super::FnCtxt;
@@ -28,7 +28,7 @@ fn unpack_option_like<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Ty<'tcx> {
         }
 
         if def.variant(data_idx).fields.len() == 1 {
-            return def.variant(data_idx).fields[0].ty(tcx, substs);
+            return def.variant(data_idx).single_field().ty(tcx, substs);
         }
     }
 
@@ -72,8 +72,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             let from = unpack_option_like(tcx, from);
             if let (&ty::FnDef(..), SizeSkeleton::Known(size_to)) = (from.kind(), sk_to) && size_to == Pointer(dl.instruction_address_space).size(&tcx) {
                 struct_span_err!(tcx.sess, span, E0591, "can't transmute zero-sized type")
-                    .note(&format!("source type: {from}"))
-                    .note(&format!("target type: {to}"))
+                    .note(format!("source type: {from}"))
+                    .note(format!("target type: {to}"))
                     .help("cast with `as` to a pointer instead")
                     .emit();
                 return;
@@ -84,6 +84,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         let skeleton_string = |ty: Ty<'tcx>, sk| match sk {
             Ok(SizeSkeleton::Known(size)) => format!("{} bits", size.bits()),
             Ok(SizeSkeleton::Pointer { tail, .. }) => format!("pointer to `{tail}`"),
+            Ok(SizeSkeleton::Generic(size)) => {
+                if let Some(size) = size.try_eval_target_usize(tcx, self.param_env) {
+                    format!("{size} bytes")
+                } else {
+                    format!("generic size {size}")
+                }
+            }
             Err(LayoutError::Unknown(bad)) => {
                 if bad == ty {
                     "this type does not have a fixed size".to_owned()
@@ -102,10 +109,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                         or dependently-sized types"
         );
         if from == to {
-            err.note(&format!("`{from}` does not have a fixed size"));
+            err.note(format!("`{from}` does not have a fixed size"));
         } else {
-            err.note(&format!("source type: `{}` ({})", from, skeleton_string(from, sk_from)))
-                .note(&format!("target type: `{}` ({})", to, skeleton_string(to, sk_to)));
+            err.note(format!("source type: `{}` ({})", from, skeleton_string(from, sk_from)))
+                .note(format!("target type: `{}` ({})", to, skeleton_string(to, sk_to)));
             let mut should_delay_as_bug = false;
             if let Err(LayoutError::Unknown(bad_from)) = sk_from && bad_from.references_error() {
                 should_delay_as_bug = true;

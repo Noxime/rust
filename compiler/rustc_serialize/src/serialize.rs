@@ -1,9 +1,5 @@
 //! Support code for encoding and decoding types.
 
-/*
-Core encoding and decoding interfaces.
-*/
-
 use std::alloc::Allocator;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
@@ -11,6 +7,13 @@ use std::marker::PhantomData;
 use std::path;
 use std::rc::Rc;
 use std::sync::Arc;
+
+/// A byte that [cannot occur in UTF8 sequences][utf8]. Used to mark the end of a string.
+/// This way we can skip validation and still be relatively sure that deserialization
+/// did not desynchronize.
+///
+/// [utf8]: https://en.wikipedia.org/w/index.php?title=UTF-8&oldid=1058865525#Codepage_layout
+const STR_SENTINEL: u8 = 0xC1;
 
 /// A note about error handling.
 ///
@@ -22,45 +25,55 @@ use std::sync::Arc;
 /// be processed or ignored, whichever is appropriate. Then they should provide
 /// a `finish` method that finishes up encoding. If the encoder is fallible,
 /// `finish` should return a `Result` that indicates success or failure.
+///
+/// This current does not support `f32` nor `f64`, as they're not needed in any
+/// serialized data structures. That could be changed, but consider whether it
+/// really makes sense to store floating-point values at all.
+/// (If you need it, revert <https://github.com/rust-lang/rust/pull/109984>.)
 pub trait Encoder {
-    // Primitive types:
     fn emit_usize(&mut self, v: usize);
     fn emit_u128(&mut self, v: u128);
     fn emit_u64(&mut self, v: u64);
     fn emit_u32(&mut self, v: u32);
     fn emit_u16(&mut self, v: u16);
     fn emit_u8(&mut self, v: u8);
+
     fn emit_isize(&mut self, v: isize);
     fn emit_i128(&mut self, v: i128);
     fn emit_i64(&mut self, v: i64);
     fn emit_i32(&mut self, v: i32);
     fn emit_i16(&mut self, v: i16);
-    fn emit_i8(&mut self, v: i8);
-    fn emit_bool(&mut self, v: bool);
-    fn emit_f64(&mut self, v: f64);
-    fn emit_f32(&mut self, v: f32);
-    fn emit_char(&mut self, v: char);
-    fn emit_str(&mut self, v: &str);
+
+    #[inline]
+    fn emit_i8(&mut self, v: i8) {
+        self.emit_u8(v as u8);
+    }
+
+    #[inline]
+    fn emit_bool(&mut self, v: bool) {
+        self.emit_u8(if v { 1 } else { 0 });
+    }
+
+    #[inline]
+    fn emit_char(&mut self, v: char) {
+        self.emit_u32(v as u32);
+    }
+
+    #[inline]
+    fn emit_str(&mut self, v: &str) {
+        self.emit_usize(v.len());
+        self.emit_raw_bytes(v.as_bytes());
+        self.emit_u8(STR_SENTINEL);
+    }
+
     fn emit_raw_bytes(&mut self, s: &[u8]);
 
-    // Convenience for the derive macro:
     fn emit_enum_variant<F>(&mut self, v_id: usize, f: F)
     where
         F: FnOnce(&mut Self),
     {
         self.emit_usize(v_id);
         f(self);
-    }
-
-    // We put the field index in a const generic to allow the emit_usize to be
-    // compiled into a more efficient form. In practice, the variant index is
-    // known at compile-time, and that knowledge allows much more efficient
-    // codegen than we'd otherwise get. LLVM isn't always able to make the
-    // optimization that would otherwise be necessary here, likely due to the
-    // multiple levels of inlining and const-prop that are needed.
-    #[inline]
-    fn emit_fieldless_enum_variant<const ID: usize>(&mut self) {
-        self.emit_usize(ID)
     }
 }
 
@@ -70,26 +83,58 @@ pub trait Encoder {
 // top-level invocation would also just panic on failure. Switching to
 // infallibility made things faster and lots of code a little simpler and more
 // concise.
+///
+/// This current does not support `f32` nor `f64`, as they're not needed in any
+/// serialized data structures. That could be changed, but consider whether it
+/// really makes sense to store floating-point values at all.
+/// (If you need it, revert <https://github.com/rust-lang/rust/pull/109984>.)
 pub trait Decoder {
-    // Primitive types:
     fn read_usize(&mut self) -> usize;
     fn read_u128(&mut self) -> u128;
     fn read_u64(&mut self) -> u64;
     fn read_u32(&mut self) -> u32;
     fn read_u16(&mut self) -> u16;
     fn read_u8(&mut self) -> u8;
+
     fn read_isize(&mut self) -> isize;
     fn read_i128(&mut self) -> i128;
     fn read_i64(&mut self) -> i64;
     fn read_i32(&mut self) -> i32;
     fn read_i16(&mut self) -> i16;
-    fn read_i8(&mut self) -> i8;
-    fn read_bool(&mut self) -> bool;
-    fn read_f64(&mut self) -> f64;
-    fn read_f32(&mut self) -> f32;
-    fn read_char(&mut self) -> char;
-    fn read_str(&mut self) -> &str;
+
+    #[inline]
+    fn read_i8(&mut self) -> i8 {
+        self.read_u8() as i8
+    }
+
+    #[inline]
+    fn read_bool(&mut self) -> bool {
+        let value = self.read_u8();
+        value != 0
+    }
+
+    #[inline]
+    fn read_char(&mut self) -> char {
+        let bits = self.read_u32();
+        std::char::from_u32(bits).unwrap()
+    }
+
+    #[inline]
+    fn read_str(&mut self) -> &str {
+        let len = self.read_usize();
+        let bytes = self.read_raw_bytes(len + 1);
+        assert!(bytes[len] == STR_SENTINEL);
+        unsafe { std::str::from_utf8_unchecked(&bytes[..len]) }
+    }
+
     fn read_raw_bytes(&mut self, len: usize) -> &[u8];
+
+    // Although there is an `emit_enum_variant` method in `Encoder`, the code
+    // patterns in decoding are different enough to encoding that there is no
+    // need for a corresponding `read_enum_variant` method here.
+
+    fn peek_byte(&self) -> u8;
+    fn position(&self) -> usize;
 }
 
 /// Trait for types that can be serialized
@@ -155,8 +200,6 @@ direct_serialize_impls! {
     i64 emit_i64 read_i64,
     i128 emit_i128 read_i128,
 
-    f32 emit_f32 read_f32,
-    f64 emit_f64 read_f64,
     bool emit_bool read_bool,
     char emit_char read_char
 }
@@ -429,11 +472,6 @@ impl<D: Decoder, T: Decodable<D> + Copy> Decodable<D> for Cell<T> {
         Cell::new(Decodable::decode(d))
     }
 }
-
-// FIXME: #15036
-// Should use `try_borrow`, returning an
-// `encoder.error("attempting to Encode borrowed RefCell")`
-// from `encode` when `try_borrow` returns `None`.
 
 impl<S: Encoder, T: Encodable<S>> Encodable<S> for RefCell<T> {
     fn encode(&self, s: &mut S) {

@@ -1,4 +1,4 @@
-#![warn(clippy::integer_arithmetic)]
+#![warn(clippy::arithmetic_side_effects)]
 
 mod backtrace;
 #[cfg(target_os = "linux")]
@@ -34,7 +34,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         args: &[OpTy<'tcx, Provenance>],
         dest: &PlaceTy<'tcx, Provenance>,
         ret: Option<mir::BasicBlock>,
-        unwind: StackPopUnwind,
+        unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx, Option<(&'mir mir::Body<'tcx>, ty::Instance<'tcx>)>> {
         let this = self.eval_context_mut();
         trace!("eval_fn_call: {:#?}, {:?}", instance, dest);
@@ -70,7 +70,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         align_op: &OpTy<'tcx, Provenance>,
         dest: &PlaceTy<'tcx, Provenance>,
         ret: Option<mir::BasicBlock>,
-        unwind: StackPopUnwind,
+        unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx, bool> {
         let this = self.eval_context_mut();
         let ret = ret.unwrap();
@@ -80,7 +80,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             return Ok(false);
         }
 
-        let req_align = this.read_machine_usize(align_op)?;
+        let req_align = this.read_target_usize(align_op)?;
 
         // Stop if the alignment is not a power of two.
         if !req_align.is_power_of_two() {
@@ -106,7 +106,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
 
         // Return error result (usize::MAX), and jump to caller.
-        this.write_scalar(Scalar::from_machine_usize(this.machine_usize_max(), this), dest)?;
+        this.write_scalar(Scalar::from_target_usize(this.target_usize_max(), this), dest)?;
         this.go_to_block(ret);
         Ok(true)
     }

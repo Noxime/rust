@@ -10,7 +10,7 @@ mod path;
 mod stmt;
 mod ty;
 
-use crate::lexer::UnmatchedBrace;
+use crate::lexer::UnmatchedDelim;
 pub use attr_wrapper::AttrWrapper;
 pub use diagnostics::AttemptLocalParseRecovery;
 pub(crate) use item::FnParseMode;
@@ -29,6 +29,7 @@ use rustc_ast::{Async, AttrArgs, AttrArgsEq, Expr, ExprKind, MacDelimiter, Mutab
 use rustc_ast::{HasAttrs, HasTokens, Unsafe, Visibility, VisibilityKind};
 use rustc_ast_pretty::pprust;
 use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::sync::Ordering;
 use rustc_errors::PResult;
 use rustc_errors::{
     Applicability, DiagnosticBuilder, ErrorGuaranteed, FatalError, IntoDiagnostic, MultiSpan,
@@ -36,13 +37,13 @@ use rustc_errors::{
 use rustc_session::parse::ParseSess;
 use rustc_span::source_map::{Span, DUMMY_SP};
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
-
 use std::ops::Range;
 use std::{cmp, mem, slice};
+use thin_vec::ThinVec;
+use tracing::debug;
 
 use crate::errors::{
-    DocCommentDoesNotDocumentAnything, IncorrectVisibilityRestriction, MismatchedClosingDelimiter,
-    NonStringAbiLiteral,
+    self, IncorrectVisibilityRestriction, MismatchedClosingDelimiter, NonStringAbiLiteral,
 };
 
 bitflags::bitflags! {
@@ -145,14 +146,8 @@ pub struct Parser<'a> {
     /// See the comments in the `parse_path_segment` function for more details.
     unmatched_angle_bracket_count: u32,
     max_angle_bracket_count: u32,
-    /// A list of all unclosed delimiters found by the lexer. If an entry is used for error recovery
-    /// it gets removed from here. Every entry left at the end gets emitted as an independent
-    /// error.
-    pub(super) unclosed_delims: Vec<UnmatchedBrace>,
+
     last_unexpected_token_span: Option<Span>,
-    /// Span pointing at the `:` for the last type ascription the parser has seen, and whether it
-    /// looked like it could have been a mistyped path or literal `Option:Some(42)`).
-    pub last_type_ascription: Option<(Span, bool /* likely path typo */)>,
     /// If present, this `Parser` is not parsing Rust code but rather a macro call.
     subparser_name: Option<&'static str>,
     capture_state: CaptureState,
@@ -167,7 +162,7 @@ pub struct Parser<'a> {
 // This type is used a lot, e.g. it's cloned when matching many declarative macro rules with nonterminals. Make sure
 // it doesn't unintentionally get bigger.
 #[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
-rustc_data_structures::static_assert_size!(Parser<'_>, 312);
+rustc_data_structures::static_assert_size!(Parser<'_>, 272);
 
 /// Stores span information about a closure.
 #[derive(Clone)]
@@ -212,12 +207,6 @@ struct CaptureState {
     capturing: Capturing,
     replace_ranges: Vec<ReplaceRange>,
     inner_attr_ranges: FxHashMap<AttrId, ReplaceRange>,
-}
-
-impl<'a> Drop for Parser<'a> {
-    fn drop(&mut self) {
-        emit_unclosed_delims(&mut self.unclosed_delims, &self.sess);
-    }
 }
 
 /// Iterator over a `TokenStream` that produces `Token`s. It's a bit odd that
@@ -334,7 +323,7 @@ impl TokenCursor {
             num_of_hashes = cmp::max(num_of_hashes, count);
         }
 
-        // `/// foo` becomes `doc = r"foo".
+        // `/// foo` becomes `doc = r"foo"`.
         let delim_span = DelimSpan::from_single(span);
         let body = TokenTree::Delimited(
             delim_span,
@@ -477,9 +466,7 @@ impl<'a> Parser<'a> {
             desugar_doc_comments,
             unmatched_angle_bracket_count: 0,
             max_angle_bracket_count: 0,
-            unclosed_delims: Vec::new(),
             last_unexpected_token_span: None,
-            last_type_ascription: None,
             subparser_name,
             capture_state: CaptureState {
                 capturing: Capturing::No,
@@ -549,7 +536,9 @@ impl<'a> Parser<'a> {
         } else if inedible.contains(&self.token.kind) {
             // leave it in the input
             Ok(false)
-        } else if self.last_unexpected_token_span == Some(self.token.span) {
+        } else if self.token.kind != token::Eof
+            && self.last_unexpected_token_span == Some(self.token.span)
+        {
             FatalError.raise();
         } else {
             self.expected_one_of_not_found(edible, inedible)
@@ -561,21 +550,11 @@ impl<'a> Parser<'a> {
         self.parse_ident_common(true)
     }
 
-    fn ident_or_err(&mut self) -> PResult<'a, (Ident, /* is_raw */ bool)> {
-        self.token.ident().ok_or_else(|| match self.prev_token.kind {
-            TokenKind::DocComment(..) => DocCommentDoesNotDocumentAnything {
-                span: self.prev_token.span,
-                missing_comma: None,
-            }
-            .into_diagnostic(&self.sess.span_diagnostic),
-            _ => self.expected_ident_found(),
-        })
-    }
-
     fn parse_ident_common(&mut self, recover: bool) -> PResult<'a, Ident> {
-        let (ident, is_raw) = self.ident_or_err()?;
+        let (ident, is_raw) = self.ident_or_err(recover)?;
+
         if !is_raw && ident.is_reserved() {
-            let mut err = self.expected_ident_found();
+            let mut err = self.expected_ident_found_err();
             if recover {
                 err.emit();
             } else {
@@ -584,6 +563,21 @@ impl<'a> Parser<'a> {
         }
         self.bump();
         Ok(ident)
+    }
+
+    fn ident_or_err(&mut self, recover: bool) -> PResult<'a, (Ident, /* is_raw */ bool)> {
+        let result = self.token.ident().ok_or_else(|| self.expected_ident_found(recover));
+
+        let (ident, is_raw) = match result {
+            Ok(ident) => ident,
+            Err(err) => match err {
+                // we recovered!
+                Ok(ident) => ident,
+                Err(err) => return Err(err),
+            },
+        };
+
+        Ok((ident, is_raw))
     }
 
     /// Checks if the next token is `tok`, and returns `true` if so.
@@ -667,15 +661,10 @@ impl<'a> Parser<'a> {
         if case == Case::Insensitive
         && let Some((ident, /* is_raw */ false)) = self.token.ident()
         && ident.as_str().to_lowercase() == kw.as_str().to_lowercase() {
-            self
-                .struct_span_err(ident.span, format!("keyword `{kw}` is written in a wrong case"))
-                .span_suggestion(
-                    ident.span,
-                    "write it in the correct case",
-                    kw,
-                    Applicability::MachineApplicable
-                ).emit();
-
+            self.sess.emit_err(errors::KwBadCase {
+                span: ident.span,
+                kw: kw.as_str()
+            });
             self.bump();
             return true;
         }
@@ -853,12 +842,11 @@ impl<'a> Parser<'a> {
         sep: SeqSep,
         expect: TokenExpectType,
         mut f: impl FnMut(&mut Parser<'a>) -> PResult<'a, T>,
-    ) -> PResult<'a, (Vec<T>, bool /* trailing */, bool /* recovered */)> {
+    ) -> PResult<'a, (ThinVec<T>, bool /* trailing */, bool /* recovered */)> {
         let mut first = true;
         let mut recovered = false;
         let mut trailing = false;
-        let mut v = vec![];
-        let unclosed_delims = !self.unclosed_delims.is_empty();
+        let mut v = ThinVec::new();
 
         while !self.expect_any_with_type(kets, expect) {
             if let token::CloseDelim(..) | token::Eof = self.token.kind {
@@ -900,7 +888,7 @@ impl<'a> Parser<'a> {
                                 _ => {
                                     // Attempt to keep parsing if it was a similar separator.
                                     if let Some(tokens) = t.similar_tokens() {
-                                        if tokens.contains(&self.token.kind) && !unclosed_delims {
+                                        if tokens.contains(&self.token.kind) {
                                             self.bump();
                                         }
                                     }
@@ -919,7 +907,7 @@ impl<'a> Parser<'a> {
                                 expect_err
                                     .span_suggestion_verbose(
                                         self.prev_token.span.shrink_to_hi().until(self.token.span),
-                                        &msg,
+                                        msg,
                                         " @ ",
                                         Applicability::MaybeIncorrect,
                                     )
@@ -935,7 +923,7 @@ impl<'a> Parser<'a> {
                                     expect_err
                                         .span_suggestion_short(
                                             sp,
-                                            &format!("missing `{}`", token_str),
+                                            format!("missing `{}`", token_str),
                                             token_str,
                                             Applicability::MaybeIncorrect,
                                         )
@@ -951,10 +939,14 @@ impl<'a> Parser<'a> {
                                         // propagate the help message from sub error 'e' to main error 'expect_err;
                                         expect_err.children.push(xx.clone());
                                     }
-                                    expect_err.emit();
-
                                     e.cancel();
-                                    break;
+                                    if self.token == token::Colon {
+                                        // we will try to recover in `maybe_recover_struct_lit_bad_delims`
+                                        return Err(expect_err);
+                                    } else {
+                                        expect_err.emit();
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -981,7 +973,11 @@ impl<'a> Parser<'a> {
         let initial_semicolon = self.token.span;
 
         while self.eat(&TokenKind::Semi) {
-            let _ = self.parse_stmt(ForceCollect::Yes)?;
+            let _ =
+                self.parse_stmt_without_recovery(false, ForceCollect::Yes).unwrap_or_else(|e| {
+                    e.cancel();
+                    None
+                });
         }
 
         expect_err.set_primary_message(
@@ -1037,7 +1033,7 @@ impl<'a> Parser<'a> {
         ket: &TokenKind,
         sep: SeqSep,
         f: impl FnMut(&mut Parser<'a>) -> PResult<'a, T>,
-    ) -> PResult<'a, (Vec<T>, bool, bool)> {
+    ) -> PResult<'a, (ThinVec<T>, bool, bool)> {
         self.parse_seq_to_before_tokens(&[ket], sep, TokenExpectType::Expect, f)
     }
 
@@ -1049,7 +1045,7 @@ impl<'a> Parser<'a> {
         ket: &TokenKind,
         sep: SeqSep,
         f: impl FnMut(&mut Parser<'a>) -> PResult<'a, T>,
-    ) -> PResult<'a, (Vec<T>, bool /* trailing */)> {
+    ) -> PResult<'a, (ThinVec<T>, bool /* trailing */)> {
         let (val, trailing, recovered) = self.parse_seq_to_before_end(ket, sep, f)?;
         if !recovered {
             self.eat(ket);
@@ -1066,7 +1062,7 @@ impl<'a> Parser<'a> {
         ket: &TokenKind,
         sep: SeqSep,
         f: impl FnMut(&mut Parser<'a>) -> PResult<'a, T>,
-    ) -> PResult<'a, (Vec<T>, bool)> {
+    ) -> PResult<'a, (ThinVec<T>, bool)> {
         self.expect(bra)?;
         self.parse_seq_to_end(ket, sep, f)
     }
@@ -1075,7 +1071,7 @@ impl<'a> Parser<'a> {
         &mut self,
         delim: Delimiter,
         f: impl FnMut(&mut Parser<'a>) -> PResult<'a, T>,
-    ) -> PResult<'a, (Vec<T>, bool)> {
+    ) -> PResult<'a, (ThinVec<T>, bool)> {
         self.parse_unspanned_seq(
             &token::OpenDelim(delim),
             &token::CloseDelim(delim),
@@ -1087,7 +1083,7 @@ impl<'a> Parser<'a> {
     fn parse_paren_comma_seq<T>(
         &mut self,
         f: impl FnMut(&mut Parser<'a>) -> PResult<'a, T>,
-    ) -> PResult<'a, (Vec<T>, bool)> {
+    ) -> PResult<'a, (ThinVec<T>, bool)> {
         self.parse_delim_comma_seq(Delimiter::Parenthesis, f)
     }
 
@@ -1202,9 +1198,13 @@ impl<'a> Parser<'a> {
         self.parse_constness_(case, false)
     }
 
-    /// Parses constness for closures
-    fn parse_closure_constness(&mut self, case: Case) -> Const {
-        self.parse_constness_(case, true)
+    /// Parses constness for closures (case sensitive, feature-gated)
+    fn parse_closure_constness(&mut self) -> Const {
+        let constness = self.parse_constness_(Case::Sensitive, true);
+        if let Const::Yes(span) = constness {
+            self.sess.gated_spans.gate(sym::const_closures, span);
+        }
+        constness
     }
 
     fn parse_constness_(&mut self, case: Case, is_closure: bool) -> Const {
@@ -1283,22 +1283,16 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_delim_args_inner(&mut self) -> Option<DelimArgs> {
-        if self.check(&token::OpenDelim(Delimiter::Parenthesis))
+        let delimited = self.check(&token::OpenDelim(Delimiter::Parenthesis))
             || self.check(&token::OpenDelim(Delimiter::Bracket))
-            || self.check(&token::OpenDelim(Delimiter::Brace))
-        {
-            match self.parse_token_tree() {
-                // We've confirmed above that there is a delimiter so unwrapping is OK.
-                TokenTree::Delimited(dspan, delim, tokens) => Some(DelimArgs {
-                    dspan,
-                    delim: MacDelimiter::from_token(delim).unwrap(),
-                    tokens,
-                }),
-                _ => unreachable!(),
-            }
-        } else {
-            None
-        }
+            || self.check(&token::OpenDelim(Delimiter::Brace));
+
+        delimited.then(|| {
+            // We've confirmed above that there is a delimiter so unwrapping is OK.
+            let TokenTree::Delimited(dspan, delim, tokens) = self.parse_token_tree() else { unreachable!() };
+
+            DelimArgs { dspan, delim: MacDelimiter::from_token(delim).unwrap(), tokens }
+        })
     }
 
     fn parse_or_use_outer_attributes(
@@ -1522,11 +1516,11 @@ impl<'a> Parser<'a> {
 }
 
 pub(crate) fn make_unclosed_delims_error(
-    unmatched: UnmatchedBrace,
+    unmatched: UnmatchedDelim,
     sess: &ParseSess,
 ) -> Option<DiagnosticBuilder<'_, ErrorGuaranteed>> {
     // `None` here means an `Eof` was found. We already emit those errors elsewhere, we add them to
-    // `unmatched_braces` only for error recovery in the `Parser`.
+    // `unmatched_delims` only for error recovery in the `Parser`.
     let found_delim = unmatched.found_delim?;
     let mut spans = vec![unmatched.found_span];
     if let Some(sp) = unmatched.unclosed_span {
@@ -1543,9 +1537,11 @@ pub(crate) fn make_unclosed_delims_error(
     Some(err)
 }
 
-pub fn emit_unclosed_delims(unclosed_delims: &mut Vec<UnmatchedBrace>, sess: &ParseSess) {
-    *sess.reached_eof.borrow_mut() |=
-        unclosed_delims.iter().any(|unmatched_delim| unmatched_delim.found_delim.is_none());
+pub fn emit_unclosed_delims(unclosed_delims: &mut Vec<UnmatchedDelim>, sess: &ParseSess) {
+    let _ = sess.reached_eof.fetch_or(
+        unclosed_delims.iter().any(|unmatched_delim| unmatched_delim.found_delim.is_none()),
+        Ordering::Relaxed,
+    );
     for unmatched in unclosed_delims.drain(..) {
         if let Some(mut e) = make_unclosed_delims_error(unmatched, sess) {
             e.emit();

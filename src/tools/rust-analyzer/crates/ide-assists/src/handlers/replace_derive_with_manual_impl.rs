@@ -59,7 +59,7 @@ pub(crate) fn replace_derive_with_manual_impl(
     // collect the derive paths from the #[derive] expansion
     let current_derives = ctx
         .sema
-        .parse_or_expand(hir_file)?
+        .parse_or_expand(hir_file)
         .descendants()
         .filter_map(ast::Attr::cast)
         .filter_map(|attr| attr.path())
@@ -214,7 +214,7 @@ fn impl_def_from_trait(
 
     // Generate a default `impl` function body for the derived trait.
     if let ast::AssocItem::Fn(ref func) = first_assoc_item {
-        let _ = gen_trait_fn_body(func, trait_path, adt);
+        let _ = gen_trait_fn_body(func, trait_path, adt, None);
     };
 
     Some((impl_def, first_assoc_item))

@@ -3,6 +3,7 @@
 //! Simple things like testing the various filesystem operations here and there,
 //! not a lot of interesting happenings here unfortunately.
 
+use build_helper::util::{fail, try_run};
 use std::env;
 use std::fs;
 use std::io;
@@ -133,113 +134,22 @@ pub(crate) fn program_out_of_date(stamp: &Path, key: &str) -> bool {
 
 /// Symlinks two directories, using junctions on Windows and normal symlinks on
 /// Unix.
-pub fn symlink_dir(config: &Config, src: &Path, dest: &Path) -> io::Result<()> {
+pub fn symlink_dir(config: &Config, original: &Path, link: &Path) -> io::Result<()> {
     if config.dry_run() {
         return Ok(());
     }
-    let _ = fs::remove_dir(dest);
-    return symlink_dir_inner(src, dest);
+    let _ = fs::remove_dir(link);
+    return symlink_dir_inner(original, link);
 
     #[cfg(not(windows))]
-    fn symlink_dir_inner(src: &Path, dest: &Path) -> io::Result<()> {
+    fn symlink_dir_inner(original: &Path, link: &Path) -> io::Result<()> {
         use std::os::unix::fs;
-        fs::symlink(src, dest)
+        fs::symlink(original, link)
     }
 
-    // Creating a directory junction on windows involves dealing with reparse
-    // points and the DeviceIoControl function, and this code is a skeleton of
-    // what can be found here:
-    //
-    // http://www.flexhex.com/docs/articles/hard-links.phtml
     #[cfg(windows)]
     fn symlink_dir_inner(target: &Path, junction: &Path) -> io::Result<()> {
-        use std::ffi::OsStr;
-        use std::os::windows::ffi::OsStrExt;
-        use std::ptr;
-
-        use winapi::shared::minwindef::{DWORD, WORD};
-        use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
-        use winapi::um::handleapi::CloseHandle;
-        use winapi::um::ioapiset::DeviceIoControl;
-        use winapi::um::winbase::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT};
-        use winapi::um::winioctl::FSCTL_SET_REPARSE_POINT;
-        use winapi::um::winnt::{
-            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GENERIC_WRITE,
-            IO_REPARSE_TAG_MOUNT_POINT, MAXIMUM_REPARSE_DATA_BUFFER_SIZE, WCHAR,
-        };
-
-        #[allow(non_snake_case)]
-        #[repr(C)]
-        struct REPARSE_MOUNTPOINT_DATA_BUFFER {
-            ReparseTag: DWORD,
-            ReparseDataLength: DWORD,
-            Reserved: WORD,
-            ReparseTargetLength: WORD,
-            ReparseTargetMaximumLength: WORD,
-            Reserved1: WORD,
-            ReparseTarget: WCHAR,
-        }
-
-        fn to_u16s<S: AsRef<OsStr>>(s: S) -> io::Result<Vec<u16>> {
-            Ok(s.as_ref().encode_wide().chain(Some(0)).collect())
-        }
-
-        // We're using low-level APIs to create the junction, and these are more
-        // picky about paths. For example, forward slashes cannot be used as a
-        // path separator, so we should try to canonicalize the path first.
-        let target = fs::canonicalize(target)?;
-
-        fs::create_dir(junction)?;
-
-        let path = to_u16s(junction)?;
-
-        unsafe {
-            let h = CreateFileW(
-                path.as_ptr(),
-                GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                ptr::null_mut(),
-                OPEN_EXISTING,
-                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
-                ptr::null_mut(),
-            );
-
-            #[repr(C, align(8))]
-            struct Align8<T>(T);
-            let mut data = Align8([0u8; MAXIMUM_REPARSE_DATA_BUFFER_SIZE as usize]);
-            let db = data.0.as_mut_ptr() as *mut REPARSE_MOUNTPOINT_DATA_BUFFER;
-            let buf = core::ptr::addr_of_mut!((*db).ReparseTarget) as *mut u16;
-            let mut i = 0;
-            // FIXME: this conversion is very hacky
-            let v = br"\??\";
-            let v = v.iter().map(|x| *x as u16);
-            for c in v.chain(target.as_os_str().encode_wide().skip(4)) {
-                *buf.offset(i) = c;
-                i += 1;
-            }
-            *buf.offset(i) = 0;
-            i += 1;
-            (*db).ReparseTag = IO_REPARSE_TAG_MOUNT_POINT;
-            (*db).ReparseTargetMaximumLength = (i * 2) as WORD;
-            (*db).ReparseTargetLength = ((i - 1) * 2) as WORD;
-            (*db).ReparseDataLength = (*db).ReparseTargetLength as DWORD + 12;
-
-            let mut ret = 0;
-            let res = DeviceIoControl(
-                h as *mut _,
-                FSCTL_SET_REPARSE_POINT,
-                db.cast(),
-                (*db).ReparseDataLength + 8,
-                ptr::null_mut(),
-                0,
-                &mut ret,
-                ptr::null_mut(),
-            );
-
-            let out = if res == 0 { Err(io::Error::last_os_error()) } else { Ok(()) };
-            CloseHandle(h);
-            out
-        }
+        junction::create(&target, &junction)
     }
 }
 
@@ -321,23 +231,8 @@ pub fn is_valid_test_suite_arg<'a, P: AsRef<Path>>(
 
 pub fn run(cmd: &mut Command, print_cmd_on_fail: bool) {
     if !try_run(cmd, print_cmd_on_fail) {
-        crate::detail_exit(1);
+        crate::detail_exit_macro!(1);
     }
-}
-
-pub fn try_run(cmd: &mut Command, print_cmd_on_fail: bool) -> bool {
-    let status = match cmd.status() {
-        Ok(status) => status,
-        Err(e) => fail(&format!("failed to execute command: {:?}\nerror: {}", cmd, e)),
-    };
-    if !status.success() && print_cmd_on_fail {
-        println!(
-            "\n\ncommand did not execute successfully: {:?}\n\
-             expected success, got: {}\n\n",
-            cmd, status
-        );
-    }
-    status.success()
 }
 
 pub fn check_run(cmd: &mut Command, print_cmd_on_fail: bool) -> bool {
@@ -360,7 +255,7 @@ pub fn check_run(cmd: &mut Command, print_cmd_on_fail: bool) -> bool {
 
 pub fn run_suppressed(cmd: &mut Command) {
     if !try_run_suppressed(cmd) {
-        crate::detail_exit(1);
+        crate::detail_exit_macro!(1);
     }
 }
 
@@ -463,11 +358,6 @@ fn dir_up_to_date(src: &Path, threshold: SystemTime) -> bool {
             meta.modified().unwrap_or(UNIX_EPOCH) < threshold
         }
     })
-}
-
-fn fail(s: &str) -> ! {
-    eprintln!("\n\n{}\n\n", s);
-    crate::detail_exit(1);
 }
 
 /// Copied from `std::path::absolute` until it stabilizes.
@@ -579,7 +469,7 @@ fn absolute_windows(path: &std::path::Path) -> std::io::Result<std::path::PathBu
     }
 }
 
-/// Adapted from https://github.com/llvm/llvm-project/blob/782e91224601e461c019e0a4573bbccc6094fbcd/llvm/cmake/modules/HandleLLVMOptions.cmake#L1058-L1079
+/// Adapted from <https://github.com/llvm/llvm-project/blob/782e91224601e461c019e0a4573bbccc6094fbcd/llvm/cmake/modules/HandleLLVMOptions.cmake#L1058-L1079>
 ///
 /// When `clang-cl` is used with instrumentation, we need to add clang's runtime library resource
 /// directory to the linker flags, otherwise there will be linker errors about the profiler runtime

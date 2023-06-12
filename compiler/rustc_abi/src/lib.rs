@@ -8,9 +8,11 @@ use std::ops::{Add, AddAssign, Mul, RangeInclusive, Sub};
 use std::str::FromStr;
 
 use bitflags::bitflags;
+use rustc_data_structures::intern::Interned;
+use rustc_data_structures::stable_hasher::Hash64;
 #[cfg(feature = "nightly")]
 use rustc_data_structures::stable_hasher::StableOrd;
-use rustc_index::vec::{Idx, IndexVec};
+use rustc_index::{IndexSlice, IndexVec};
 #[cfg(feature = "nightly")]
 use rustc_macros::HashStable_Generic;
 #[cfg(feature = "nightly")]
@@ -76,12 +78,12 @@ pub struct ReprOptions {
     pub flags: ReprFlags,
     /// The seed to be used for randomizing a type's layout
     ///
-    /// Note: This could technically be a `[u8; 16]` (a `u128`) which would
+    /// Note: This could technically be a `Hash128` which would
     /// be the "most accurate" hash as it'd encompass the item and crate
     /// hash without loss, but it does pay the price of being larger.
-    /// Everything's a tradeoff, a `u64` seed should be sufficient for our
+    /// Everything's a tradeoff, a 64-bit seed should be sufficient for our
     /// purposes (primarily `-Z randomize-layout`)
-    pub field_shuffle_seed: u64,
+    pub field_shuffle_seed: Hash64,
 }
 
 impl ReprOptions {
@@ -170,7 +172,9 @@ pub struct TargetDataLayout {
 
     pub instruction_address_space: AddressSpace,
 
-    /// Minimum size of #[repr(C)] enums (default I32 bits)
+    /// Minimum size of #[repr(C)] enums (default c_int::BITS, usually 32)
+    /// Note: This isn't in LLVM's data layout string, it is `short_enum`
+    /// so the only valid spec for LLVM is c_int::BITS or 8
     pub c_enum_min_size: Integer,
 }
 
@@ -205,7 +209,7 @@ pub enum TargetDataLayoutErrors<'a> {
     InvalidAddressSpace { addr_space: &'a str, cause: &'a str, err: ParseIntError },
     InvalidBits { kind: &'a str, bit: &'a str, cause: &'a str, err: ParseIntError },
     MissingAlignment { cause: &'a str },
-    InvalidAlignment { cause: &'a str, err: String },
+    InvalidAlignment { cause: &'a str, err: AlignFromBytesError },
     InconsistentTargetArchitecture { dl: &'a str, target: &'a str },
     InconsistentTargetPointerWidth { pointer_size: u64, target: u32 },
     InvalidBitsSize { err: String },
@@ -410,7 +414,9 @@ pub struct Size {
 // Safety: Ord is implement as just comparing numerical values and numerical values
 // are not changed by (de-)serialization.
 #[cfg(feature = "nightly")]
-unsafe impl StableOrd for Size {}
+unsafe impl StableOrd for Size {
+    const CAN_USE_UNSTABLE_SORT: bool = true;
+}
 
 // This is debug-printed a lot in larger structs, don't waste too much space there
 impl fmt::Debug for Size {
@@ -636,41 +642,73 @@ impl fmt::Debug for Align {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum AlignFromBytesError {
+    NotPowerOfTwo(u64),
+    TooLarge(u64),
+}
+
+impl AlignFromBytesError {
+    pub fn diag_ident(self) -> &'static str {
+        match self {
+            Self::NotPowerOfTwo(_) => "not_power_of_two",
+            Self::TooLarge(_) => "too_large",
+        }
+    }
+
+    pub fn align(self) -> u64 {
+        let (Self::NotPowerOfTwo(align) | Self::TooLarge(align)) = self;
+        align
+    }
+}
+
+impl fmt::Debug for AlignFromBytesError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl fmt::Display for AlignFromBytesError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AlignFromBytesError::NotPowerOfTwo(align) => write!(f, "`{align}` is not a power of 2"),
+            AlignFromBytesError::TooLarge(align) => write!(f, "`{align}` is too large"),
+        }
+    }
+}
+
 impl Align {
     pub const ONE: Align = Align { pow2: 0 };
     pub const MAX: Align = Align { pow2: 29 };
 
     #[inline]
-    pub fn from_bits(bits: u64) -> Result<Align, String> {
+    pub fn from_bits(bits: u64) -> Result<Align, AlignFromBytesError> {
         Align::from_bytes(Size::from_bits(bits).bytes())
     }
 
     #[inline]
-    pub fn from_bytes(align: u64) -> Result<Align, String> {
+    pub fn from_bytes(align: u64) -> Result<Align, AlignFromBytesError> {
         // Treat an alignment of 0 bytes like 1-byte alignment.
         if align == 0 {
             return Ok(Align::ONE);
         }
 
         #[cold]
-        fn not_power_of_2(align: u64) -> String {
-            format!("`{}` is not a power of 2", align)
+        fn not_power_of_2(align: u64) -> AlignFromBytesError {
+            AlignFromBytesError::NotPowerOfTwo(align)
         }
 
         #[cold]
-        fn too_large(align: u64) -> String {
-            format!("`{}` is too large", align)
+        fn too_large(align: u64) -> AlignFromBytesError {
+            AlignFromBytesError::TooLarge(align)
         }
 
-        let mut bytes = align;
-        let mut pow2: u8 = 0;
-        while (bytes & 1) == 0 {
-            pow2 += 1;
-            bytes >>= 1;
-        }
-        if bytes != 1 {
+        let tz = align.trailing_zeros();
+        if align != (1 << tz) {
             return Err(not_power_of_2(align));
         }
+
+        let pow2 = tz as u8;
         if pow2 > Self::MAX.pow2 {
             return Err(too_large(align));
         }
@@ -1054,6 +1092,32 @@ impl Scalar {
     }
 }
 
+rustc_index::newtype_index! {
+    /// The *source-order* index of a field in a variant.
+    ///
+    /// This is how most code after type checking refers to fields, rather than
+    /// using names (as names have hygiene complications and more complex lookup).
+    ///
+    /// Particularly for `repr(Rust)` types, this may not be the same as *layout* order.
+    /// (It is for `repr(C)` `struct`s, however.)
+    ///
+    /// For example, in the following types,
+    /// ```rust
+    /// # enum Never {}
+    /// # #[repr(u16)]
+    /// enum Demo1 {
+    ///    Variant0 { a: Never, b: i32 } = 100,
+    ///    Variant1 { c: u8, d: u64 } = 10,
+    /// }
+    /// struct Demo2 { e: u8, f: u16, g: u8 }
+    /// ```
+    /// `b` is `FieldIdx(1)` in `VariantIdx(0)`,
+    /// `d` is `FieldIdx(1)` in `VariantIdx(1)`, and
+    /// `f` is `FieldIdx(1)` in `VariantIdx(0)`.
+    #[derive(HashStable_Generic)]
+    pub struct FieldIdx {}
+}
+
 /// Describes how the fields of a type are located in memory.
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 #[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
@@ -1079,7 +1143,7 @@ pub enum FieldsShape {
         /// ordered to match the source definition order.
         /// This vector does not go in increasing order.
         // FIXME(eddyb) use small vector optimization for the common case.
-        offsets: Vec<Size>,
+        offsets: IndexVec<FieldIdx, Size>,
 
         /// Maps source order field indices to memory order indices,
         /// depending on how the fields were reordered (if at all).
@@ -1093,7 +1157,7 @@ pub enum FieldsShape {
         ///
         // FIXME(eddyb) build a better abstraction for permutations, if possible.
         // FIXME(camlorn) also consider small vector optimization here.
-        memory_index: Vec<u32>,
+        memory_index: IndexVec<FieldIdx, u32>,
     },
 }
 
@@ -1128,7 +1192,7 @@ impl FieldsShape {
                 assert!(i < count);
                 stride * i
             }
-            FieldsShape::Arbitrary { ref offsets, .. } => offsets[i],
+            FieldsShape::Arbitrary { ref offsets, .. } => offsets[FieldIdx::from_usize(i)],
         }
     }
 
@@ -1139,28 +1203,27 @@ impl FieldsShape {
                 unreachable!("FieldsShape::memory_index: `Primitive`s have no fields")
             }
             FieldsShape::Union(_) | FieldsShape::Array { .. } => i,
-            FieldsShape::Arbitrary { ref memory_index, .. } => memory_index[i].try_into().unwrap(),
+            FieldsShape::Arbitrary { ref memory_index, .. } => {
+                memory_index[FieldIdx::from_usize(i)].try_into().unwrap()
+            }
         }
     }
 
     /// Gets source indices of the fields by increasing offsets.
     #[inline]
-    pub fn index_by_increasing_offset<'a>(&'a self) -> impl Iterator<Item = usize> + 'a {
+    pub fn index_by_increasing_offset(&self) -> impl Iterator<Item = usize> + '_ {
         let mut inverse_small = [0u8; 64];
-        let mut inverse_big = vec![];
+        let mut inverse_big = IndexVec::new();
         let use_small = self.count() <= inverse_small.len();
 
         // We have to write this logic twice in order to keep the array small.
         if let FieldsShape::Arbitrary { ref memory_index, .. } = *self {
             if use_small {
-                for i in 0..self.count() {
-                    inverse_small[memory_index[i] as usize] = i as u8;
+                for (field_idx, &mem_idx) in memory_index.iter_enumerated() {
+                    inverse_small[mem_idx as usize] = field_idx.as_u32() as u8;
                 }
             } else {
-                inverse_big = vec![0; self.count()];
-                for i in 0..self.count() {
-                    inverse_big[memory_index[i] as usize] = i as u32;
-                }
+                inverse_big = memory_index.invert_bijective_mapping();
             }
         }
 
@@ -1170,7 +1233,7 @@ impl FieldsShape {
                 if use_small {
                     inverse_small[i] as usize
                 } else {
-                    inverse_big[i] as usize
+                    inverse_big[i as u32].as_usize()
                 }
             }
         })
@@ -1246,13 +1309,57 @@ impl Abi {
     pub fn is_scalar(&self) -> bool {
         matches!(*self, Abi::Scalar(_))
     }
+
+    /// Returns the fixed alignment of this ABI, if any is mandated.
+    pub fn inherent_align<C: HasDataLayout>(&self, cx: &C) -> Option<AbiAndPrefAlign> {
+        Some(match *self {
+            Abi::Scalar(s) => s.align(cx),
+            Abi::ScalarPair(s1, s2) => s1.align(cx).max(s2.align(cx)),
+            Abi::Vector { element, count } => {
+                cx.data_layout().vector_align(element.size(cx) * count)
+            }
+            Abi::Uninhabited | Abi::Aggregate { .. } => return None,
+        })
+    }
+
+    /// Returns the fixed size of this ABI, if any is mandated.
+    pub fn inherent_size<C: HasDataLayout>(&self, cx: &C) -> Option<Size> {
+        Some(match *self {
+            Abi::Scalar(s) => {
+                // No padding in scalars.
+                s.size(cx)
+            }
+            Abi::ScalarPair(s1, s2) => {
+                // May have some padding between the pair.
+                let field2_offset = s1.size(cx).align_to(s2.align(cx).abi);
+                (field2_offset + s2.size(cx)).align_to(self.inherent_align(cx)?.abi)
+            }
+            Abi::Vector { element, count } => {
+                // No padding in vectors, except possibly for trailing padding
+                // to make the size a multiple of align (e.g. for vectors of size 3).
+                (element.size(cx) * count).align_to(self.inherent_align(cx)?.abi)
+            }
+            Abi::Uninhabited | Abi::Aggregate { .. } => return None,
+        })
+    }
+
+    /// Discard validity range information and allow undef.
+    pub fn to_union(&self) -> Self {
+        assert!(self.is_sized());
+        match *self {
+            Abi::Scalar(s) => Abi::Scalar(s.to_union()),
+            Abi::ScalarPair(s1, s2) => Abi::ScalarPair(s1.to_union(), s2.to_union()),
+            Abi::Vector { element, count } => Abi::Vector { element: element.to_union(), count },
+            Abi::Uninhabited | Abi::Aggregate { .. } => Abi::Aggregate { sized: true },
+        }
+    }
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 #[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
-pub enum Variants<V: Idx> {
+pub enum Variants {
     /// Single enum variants, structs/tuples, unions, and all non-ADTs.
-    Single { index: V },
+    Single { index: VariantIdx },
 
     /// Enum-likes with more than one inhabited variant: each variant comes with
     /// a *discriminant* (usually the same as the variant index but the user can
@@ -1262,15 +1369,15 @@ pub enum Variants<V: Idx> {
     /// For enums, the tag is the sole field of the layout.
     Multiple {
         tag: Scalar,
-        tag_encoding: TagEncoding<V>,
+        tag_encoding: TagEncoding,
         tag_field: usize,
-        variants: IndexVec<V, LayoutS<V>>,
+        variants: IndexVec<VariantIdx, LayoutS>,
     },
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]
 #[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
-pub enum TagEncoding<V: Idx> {
+pub enum TagEncoding {
     /// The tag directly stores the discriminant, but possibly with a smaller layout
     /// (so converting the tag to the discriminant can require sign extension).
     Direct,
@@ -1285,7 +1392,11 @@ pub enum TagEncoding<V: Idx> {
     /// For example, `Option<(usize, &T)>`  is represented such that
     /// `None` has a null pointer for the second tuple field, and
     /// `Some` is the identity function (with a non-null reference).
-    Niche { untagged_variant: V, niche_variants: RangeInclusive<V>, niche_start: u128 },
+    Niche {
+        untagged_variant: VariantIdx,
+        niche_variants: RangeInclusive<VariantIdx>,
+        niche_start: u128,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -1372,9 +1483,27 @@ impl Niche {
     }
 }
 
+rustc_index::newtype_index! {
+    /// The *source-order* index of a variant in a type.
+    ///
+    /// For enums, these are always `0..variant_count`, regardless of any
+    /// custom discriminants that may have been defined, and including any
+    /// variants that may end up uninhabited due to field types.  (Some of the
+    /// variants may not be present in a monomorphized ABI [`Variants`], but
+    /// those skipped variants are always counted when determining the *index*.)
+    ///
+    /// `struct`s, `tuples`, and `unions`s are considered to have a single variant
+    /// with variant index zero, aka [`FIRST_VARIANT`].
+    #[derive(HashStable_Generic)]
+    pub struct VariantIdx {
+        /// Equivalent to `VariantIdx(0)`.
+        const FIRST_VARIANT = 0;
+    }
+}
+
 #[derive(PartialEq, Eq, Hash, Clone)]
 #[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
-pub struct LayoutS<V: Idx> {
+pub struct LayoutS {
     /// Says where the fields are located within the layout.
     pub fields: FieldsShape,
 
@@ -1385,7 +1514,7 @@ pub struct LayoutS<V: Idx> {
     ///
     /// To access all fields of this layout, both `fields` and the fields of the active variant
     /// must be taken into account.
-    pub variants: Variants<V>,
+    pub variants: Variants,
 
     /// The `abi` defines how this data is passed between functions, and it defines
     /// value restrictions via `valid_range`.
@@ -1404,13 +1533,13 @@ pub struct LayoutS<V: Idx> {
     pub size: Size,
 }
 
-impl<V: Idx> LayoutS<V> {
+impl LayoutS {
     pub fn scalar<C: HasDataLayout>(cx: &C, scalar: Scalar) -> Self {
         let largest_niche = Niche::from_scalar(cx, Size::ZERO, scalar);
         let size = scalar.size(cx);
         let align = scalar.align(cx);
         LayoutS {
-            variants: Variants::Single { index: V::new(0) },
+            variants: Variants::Single { index: FIRST_VARIANT },
             fields: FieldsShape::Primitive,
             abi: Abi::Scalar(scalar),
             largest_niche,
@@ -1420,7 +1549,7 @@ impl<V: Idx> LayoutS<V> {
     }
 }
 
-impl<V: Idx> fmt::Debug for LayoutS<V> {
+impl fmt::Debug for LayoutS {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // This is how `Layout` used to print before it become
         // `Interned<LayoutS>`. We print it like this to avoid having to update
@@ -1437,23 +1566,61 @@ impl<V: Idx> fmt::Debug for LayoutS<V> {
     }
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Hash, HashStable_Generic)]
+#[rustc_pass_by_value]
+pub struct Layout<'a>(pub Interned<'a, LayoutS>);
+
+impl<'a> fmt::Debug for Layout<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // See comment on `<LayoutS as Debug>::fmt` above.
+        self.0.0.fmt(f)
+    }
+}
+
+impl<'a> Layout<'a> {
+    pub fn fields(self) -> &'a FieldsShape {
+        &self.0.0.fields
+    }
+
+    pub fn variants(self) -> &'a Variants {
+        &self.0.0.variants
+    }
+
+    pub fn abi(self) -> Abi {
+        self.0.0.abi
+    }
+
+    pub fn largest_niche(self) -> Option<Niche> {
+        self.0.0.largest_niche
+    }
+
+    pub fn align(self) -> AbiAndPrefAlign {
+        self.0.0.align
+    }
+
+    pub fn size(self) -> Size {
+        self.0.0.size
+    }
+
+    /// Whether the layout is from a type that implements [`std::marker::PointerLike`].
+    ///
+    /// Currently, that means that the type is pointer-sized, pointer-aligned,
+    /// and has a scalar ABI.
+    pub fn is_pointer_like(self, data_layout: &TargetDataLayout) -> bool {
+        self.size() == data_layout.pointer_size
+            && self.align().abi == data_layout.pointer_align.abi
+            && matches!(self.abi(), Abi::Scalar(..))
+    }
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum PointerKind {
-    /// Most general case, we know no restrictions to tell LLVM.
-    SharedMutable,
-
-    /// `&T` where `T` contains no `UnsafeCell`, is `dereferenceable`, `noalias` and `readonly`.
-    Frozen,
-
-    /// `&mut T` which is `dereferenceable` and `noalias` but not `readonly`.
-    UniqueBorrowed,
-
-    /// `&mut !Unpin`, which is `dereferenceable` but neither `noalias` nor `readonly`.
-    UniqueBorrowedPinned,
-
-    /// `Box<T>`, which is `noalias` (even on return types, unlike the above) but neither `readonly`
-    /// nor `dereferenceable`.
-    UniqueOwned,
+    /// Shared reference. `frozen` indicates the absence of any `UnsafeCell`.
+    SharedRef { frozen: bool },
+    /// Mutable reference. `unpin` indicates the absence of any pinned data.
+    MutableRef { unpin: bool },
+    /// Box. `unpin` indicates the absence of any pinned data.
+    Box { unpin: bool },
 }
 
 /// Note that this information is advisory only, and backends are free to ignore it.
@@ -1465,15 +1632,7 @@ pub struct PointeeInfo {
     pub safe: Option<PointerKind>,
 }
 
-/// Used in `might_permit_raw_init` to indicate the kind of initialisation
-/// that is checked to be valid
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum InitKind {
-    Zero,
-    UninitMitigated0x01Fill,
-}
-
-impl<V: Idx> LayoutS<V> {
+impl LayoutS {
     /// Returns `true` if the layout corresponds to an unsized type.
     pub fn is_unsized(&self) -> bool {
         self.abi.is_unsized()

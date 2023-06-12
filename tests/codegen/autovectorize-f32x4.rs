@@ -1,4 +1,4 @@
-// compile-flags: -C opt-level=3
+// compile-flags: -C opt-level=3 -Z merge-functions=disabled
 // only-x86_64
 #![crate_type = "lib"]
 
@@ -29,4 +29,14 @@ pub fn auto_vectorize_loop(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
         c[i] = a[i] + b[i];
     }
     c
+}
+
+// CHECK-LABEL: @auto_vectorize_array_from_fn
+#[no_mangle]
+pub fn auto_vectorize_array_from_fn(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+// CHECK: load <4 x float>
+// CHECK: load <4 x float>
+// CHECK: fadd <4 x float>
+// CHECK: store <4 x float>
+    std::array::from_fn(|i| a[i] + b[i])
 }

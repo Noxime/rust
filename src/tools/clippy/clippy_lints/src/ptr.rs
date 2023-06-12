@@ -505,13 +505,13 @@ fn check_mut_from_ref<'tcx>(cx: &LateContext<'tcx>, sig: &FnSig<'_>, body: Optio
     if let FnRetTy::Return(ty) = sig.decl.output
         && let Some((out, Mutability::Mut, _)) = get_ref_lm(ty)
     {
-        let out_region = cx.tcx.named_region(out.hir_id);
+        let out_region = cx.tcx.named_bound_var(out.hir_id);
         let args: Option<Vec<_>> = sig
             .decl
             .inputs
             .iter()
             .filter_map(get_ref_lm)
-            .filter(|&(lt, _, _)| cx.tcx.named_region(lt.hir_id) == out_region)
+            .filter(|&(lt, _, _)| cx.tcx.named_bound_var(lt.hir_id) == out_region)
             .map(|(_, mutability, span)| (mutability == Mutability::Not).then_some(span))
             .collect();
         if let Some(args) = args
@@ -624,7 +624,10 @@ fn check_ptr_arg_usage<'tcx>(cx: &LateContext<'tcx>, body: &'tcx Body<'_>, args:
                             return;
                         };
 
-                        match *self.cx.tcx.fn_sig(id).subst_identity().skip_binder().inputs()[i].peel_refs().kind() {
+                        match *self.cx.tcx.fn_sig(id).subst_identity().skip_binder().inputs()[i]
+                            .peel_refs()
+                            .kind()
+                        {
                             ty::Dynamic(preds, _, _) if !matches_preds(self.cx, args.deref_ty.ty(self.cx), preds) => {
                                 set_skip_flag();
                             },

@@ -43,6 +43,7 @@
 //! This code should only compile in modules where the uninhabitedness of `Foo`
 //! is visible.
 
+use crate::query::Providers;
 use crate::ty::context::TyCtxt;
 use crate::ty::{self, DefId, Ty, VariantDef, Visibility};
 
@@ -52,9 +53,8 @@ pub mod inhabited_predicate;
 
 pub use inhabited_predicate::InhabitedPredicate;
 
-pub(crate) fn provide(providers: &mut ty::query::Providers) {
-    *providers =
-        ty::query::Providers { inhabited_predicate_adt, inhabited_predicate_type, ..*providers };
+pub(crate) fn provide(providers: &mut Providers) {
+    *providers = Providers { inhabited_predicate_adt, inhabited_predicate_type, ..*providers };
 }
 
 /// Returns an `InhabitedPredicate` that is generic over type parameters and
@@ -87,7 +87,7 @@ impl<'tcx> VariantDef {
         InhabitedPredicate::all(
             tcx,
             self.fields.iter().map(|field| {
-                let pred = tcx.type_of(field.did).inhabited_predicate(tcx);
+                let pred = tcx.type_of(field.did).subst_identity().inhabited_predicate(tcx);
                 if adt.is_enum() {
                     return pred;
                 }
@@ -105,7 +105,7 @@ impl<'tcx> VariantDef {
 impl<'tcx> Ty<'tcx> {
     pub fn inhabited_predicate(self, tcx: TyCtxt<'tcx>) -> InhabitedPredicate<'tcx> {
         match self.kind() {
-            // For now, union`s are always considered inhabited
+            // For now, unions are always considered inhabited
             Adt(adt, _) if adt.is_union() => InhabitedPredicate::True,
             // Non-exhaustive ADTs from other crates are always considered inhabited
             Adt(adt, _) if adt.is_variant_list_non_exhaustive() && !adt.did().is_local() => {
@@ -113,6 +113,12 @@ impl<'tcx> Ty<'tcx> {
             }
             Never => InhabitedPredicate::False,
             Param(_) | Alias(ty::Projection, _) => InhabitedPredicate::GenericType(self),
+            // FIXME(inherent_associated_types): Most likely we can just map to `GenericType` like above.
+            // However it's unclear if the substs passed to `InhabitedPredicate::subst` are of the correct
+            // format, i.e. don't contain parent substs. If you hit this case, please verify this beforehand.
+            Alias(ty::Inherent, _) => {
+                bug!("unimplemented: inhabitedness checking for inherent projections")
+            }
             Tuple(tys) if tys.is_empty() => InhabitedPredicate::True,
             // use a query for more complex cases
             Adt(..) | Array(..) | Tuple(_) => tcx.inhabited_predicate_type(self),
@@ -191,7 +197,7 @@ fn inhabited_predicate_type<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> InhabitedP
 
         // If we can evaluate the array length before having a `ParamEnv`, then
         // we can simplify the predicate. This is an optimization.
-        Array(ty, len) => match len.kind().try_to_machine_usize(tcx) {
+        Array(ty, len) => match len.kind().try_to_target_usize(tcx) {
             Some(0) => InhabitedPredicate::True,
             Some(1..) => ty.inhabited_predicate(tcx),
             None => ty.inhabited_predicate(tcx).or(tcx, InhabitedPredicate::ConstIsZero(len)),

@@ -3,15 +3,23 @@
 //! let _: u32  = /* <never-to-any> */ loop {};
 //! let _: &u32 = /* &* */ &mut 0;
 //! ```
-use hir::{Adjust, AutoBorrow, Mutability, OverloadedDeref, PointerCast, Safety, Semantics};
+use either::Either;
+use hir::{
+    Adjust, Adjustment, AutoBorrow, HirDisplay, Mutability, OverloadedDeref, PointerCast, Safety,
+    Semantics,
+};
 use ide_db::RootDatabase;
 
+use stdx::never;
 use syntax::{
     ast::{self, make, AstNode},
     ted,
 };
 
-use crate::{AdjustmentHints, AdjustmentHintsMode, InlayHint, InlayHintsConfig, InlayKind};
+use crate::{
+    AdjustmentHints, AdjustmentHintsMode, InlayHint, InlayHintLabel, InlayHintPosition,
+    InlayHintsConfig, InlayKind, InlayTooltip,
+};
 
 pub(super) fn hints(
     acc: &mut Vec<InlayHint>,
@@ -27,126 +35,140 @@ pub(super) fn hints(
         return None;
     }
 
-    // These inherit from the inner expression which would result in duplicate hints
-    if let ast::Expr::ParenExpr(_)
-    | ast::Expr::IfExpr(_)
-    | ast::Expr::BlockExpr(_)
-    | ast::Expr::MatchExpr(_) = expr
-    {
+    // ParenExpr resolve to their contained expressions HIR so they will dupe these hints
+    if let ast::Expr::ParenExpr(_) = expr {
         return None;
+    }
+    if let ast::Expr::BlockExpr(b) = expr {
+        if !b.is_standalone() {
+            return None;
+        }
     }
 
     let descended = sema.descend_node_into_attributes(expr.clone()).pop();
     let desc_expr = descended.as_ref().unwrap_or(expr);
     let adjustments = sema.expr_adjustments(desc_expr).filter(|it| !it.is_empty())?;
 
+    if let ast::Expr::BlockExpr(_) | ast::Expr::IfExpr(_) | ast::Expr::MatchExpr(_) = desc_expr {
+        if let [Adjustment { kind: Adjust::Deref(_), source, .. }, Adjustment { kind: Adjust::Borrow(_), source: _, target }] =
+            &*adjustments
+        {
+            // Don't show unnecessary reborrows for these, they will just repeat the inner ones again
+            if source == target {
+                return None;
+            }
+        }
+    }
+
     let (postfix, needs_outer_parens, needs_inner_parens) =
         mode_and_needs_parens_for_adjustment_hints(expr, config.adjustment_hints_mode);
 
     if needs_outer_parens {
-        acc.push(InlayHint {
-            range: expr.syntax().text_range(),
-            kind: InlayKind::OpeningParenthesis,
-            label: "(".into(),
-            tooltip: None,
-        });
+        acc.push(InlayHint::opening_paren_before(
+            InlayKind::Adjustment,
+            expr.syntax().text_range(),
+        ));
     }
 
     if postfix && needs_inner_parens {
-        acc.push(InlayHint {
-            range: expr.syntax().text_range(),
-            kind: InlayKind::OpeningParenthesis,
-            label: "(".into(),
-            tooltip: None,
-        });
-        acc.push(InlayHint {
-            range: expr.syntax().text_range(),
-            kind: InlayKind::ClosingParenthesis,
-            label: ")".into(),
-            tooltip: None,
-        });
+        acc.push(InlayHint::opening_paren_before(
+            InlayKind::Adjustment,
+            expr.syntax().text_range(),
+        ));
+        acc.push(InlayHint::closing_paren_after(InlayKind::Adjustment, expr.syntax().text_range()));
     }
 
-    let (mut tmp0, mut tmp1);
-    let iter: &mut dyn Iterator<Item = _> = if postfix {
-        tmp0 = adjustments.into_iter();
-        &mut tmp0
+    let mut iter = if postfix {
+        Either::Left(adjustments.into_iter())
     } else {
-        tmp1 = adjustments.into_iter().rev();
-        &mut tmp1
+        Either::Right(adjustments.into_iter().rev())
     };
+    let iter: &mut dyn Iterator<Item = _> = iter.as_mut().either(|it| it as _, |it| it as _);
 
-    for adjustment in iter {
-        if adjustment.source == adjustment.target {
+    for Adjustment { source, target, kind } in iter {
+        if source == target {
+            cov_mark::hit!(same_type_adjustment);
             continue;
         }
 
         // FIXME: Add some nicer tooltips to each of these
-        let text = match adjustment.kind {
+        let (text, coercion) = match kind {
             Adjust::NeverToAny if config.adjustment_hints == AdjustmentHints::Always => {
-                "<never-to-any>"
+                ("<never-to-any>", "never to any")
             }
-            Adjust::Deref(None) => "*",
-            Adjust::Deref(Some(OverloadedDeref(Mutability::Mut))) => "*",
-            Adjust::Deref(Some(OverloadedDeref(Mutability::Shared))) => "*",
-            Adjust::Borrow(AutoBorrow::Ref(Mutability::Shared)) => "&",
-            Adjust::Borrow(AutoBorrow::Ref(Mutability::Mut)) => "&mut ",
-            Adjust::Borrow(AutoBorrow::RawPtr(Mutability::Shared)) => "&raw const ",
-            Adjust::Borrow(AutoBorrow::RawPtr(Mutability::Mut)) => "&raw mut ",
+            Adjust::Deref(None) => ("*", "dereference"),
+            Adjust::Deref(Some(OverloadedDeref(Mutability::Shared))) => {
+                ("*", "`Deref` dereference")
+            }
+            Adjust::Deref(Some(OverloadedDeref(Mutability::Mut))) => {
+                ("*", "`DerefMut` dereference")
+            }
+            Adjust::Borrow(AutoBorrow::Ref(Mutability::Shared)) => ("&", "borrow"),
+            Adjust::Borrow(AutoBorrow::Ref(Mutability::Mut)) => ("&mut ", "unique borrow"),
+            Adjust::Borrow(AutoBorrow::RawPtr(Mutability::Shared)) => {
+                ("&raw const ", "const pointer borrow")
+            }
+            Adjust::Borrow(AutoBorrow::RawPtr(Mutability::Mut)) => {
+                ("&raw mut ", "mut pointer borrow")
+            }
             // some of these could be represented via `as` casts, but that's not too nice and
             // handling everything as a prefix expr makes the `(` and `)` insertion easier
             Adjust::Pointer(cast) if config.adjustment_hints == AdjustmentHints::Always => {
                 match cast {
-                    PointerCast::ReifyFnPointer => "<fn-item-to-fn-pointer>",
-                    PointerCast::UnsafeFnPointer => "<safe-fn-pointer-to-unsafe-fn-pointer>",
-                    PointerCast::ClosureFnPointer(Safety::Unsafe) => {
-                        "<closure-to-unsafe-fn-pointer>"
+                    PointerCast::ReifyFnPointer => {
+                        ("<fn-item-to-fn-pointer>", "fn item to fn pointer")
                     }
-                    PointerCast::ClosureFnPointer(Safety::Safe) => "<closure-to-fn-pointer>",
-                    PointerCast::MutToConstPointer => "<mut-ptr-to-const-ptr>",
-                    PointerCast::ArrayToPointer => "<array-ptr-to-element-ptr>",
-                    PointerCast::Unsize => "<unsize>",
+                    PointerCast::UnsafeFnPointer => (
+                        "<safe-fn-pointer-to-unsafe-fn-pointer>",
+                        "safe fn pointer to unsafe fn pointer",
+                    ),
+                    PointerCast::ClosureFnPointer(Safety::Unsafe) => {
+                        ("<closure-to-unsafe-fn-pointer>", "closure to unsafe fn pointer")
+                    }
+                    PointerCast::ClosureFnPointer(Safety::Safe) => {
+                        ("<closure-to-fn-pointer>", "closure to fn pointer")
+                    }
+                    PointerCast::MutToConstPointer => {
+                        ("<mut-ptr-to-const-ptr>", "mut ptr to const ptr")
+                    }
+                    PointerCast::ArrayToPointer => ("<array-ptr-to-element-ptr>", ""),
+                    PointerCast::Unsize => ("<unsize>", "unsize"),
                 }
             }
             _ => continue,
         };
         acc.push(InlayHint {
             range: expr.syntax().text_range(),
-            kind: if postfix {
-                InlayKind::AdjustmentHintPostfix
-            } else {
-                InlayKind::AdjustmentHint
-            },
-            label: if postfix { format!(".{}", text.trim_end()).into() } else { text.into() },
-            tooltip: None,
+            pad_left: false,
+            pad_right: false,
+            position: if postfix { InlayHintPosition::After } else { InlayHintPosition::Before },
+            kind: InlayKind::Adjustment,
+            label: InlayHintLabel::simple(
+                if postfix { format!(".{}", text.trim_end()) } else { text.to_owned() },
+                Some(InlayTooltip::Markdown(format!(
+                    "`{}` → `{}` ({coercion} coercion)",
+                    source.display(sema.db),
+                    target.display(sema.db),
+                ))),
+                None,
+            ),
+            text_edit: None,
         });
     }
     if !postfix && needs_inner_parens {
-        acc.push(InlayHint {
-            range: expr.syntax().text_range(),
-            kind: InlayKind::OpeningParenthesis,
-            label: "(".into(),
-            tooltip: None,
-        });
-        acc.push(InlayHint {
-            range: expr.syntax().text_range(),
-            kind: InlayKind::ClosingParenthesis,
-            label: ")".into(),
-            tooltip: None,
-        });
+        acc.push(InlayHint::opening_paren_before(
+            InlayKind::Adjustment,
+            expr.syntax().text_range(),
+        ));
+        acc.push(InlayHint::closing_paren_after(InlayKind::Adjustment, expr.syntax().text_range()));
     }
     if needs_outer_parens {
-        acc.push(InlayHint {
-            range: expr.syntax().text_range(),
-            kind: InlayKind::ClosingParenthesis,
-            label: ")".into(),
-            tooltip: None,
-        });
+        acc.push(InlayHint::closing_paren_after(InlayKind::Adjustment, expr.syntax().text_range()));
     }
     Some(())
 }
 
-/// Returns whatever the hint should be postfix and if we need to add paretheses on the inside and/or outside of `expr`,
+/// Returns whatever the hint should be postfix and if we need to add parentheses on the inside and/or outside of `expr`,
 /// if we are going to add (`postfix`) adjustments hints to it.
 fn mode_and_needs_parens_for_adjustment_hints(
     expr: &ast::Expr,
@@ -181,7 +203,7 @@ fn mode_and_needs_parens_for_adjustment_hints(
     }
 }
 
-/// Returns whatever we need to add paretheses on the inside and/or outside of `expr`,
+/// Returns whatever we need to add parentheses on the inside and/or outside of `expr`,
 /// if we are going to add (`postfix`) adjustments hints to it.
 fn needs_parens_for_adjustment_hints(expr: &ast::Expr, postfix: bool) -> (bool, bool) {
     // This is a very miserable pile of hacks...
@@ -192,10 +214,10 @@ fn needs_parens_for_adjustment_hints(expr: &ast::Expr, postfix: bool) -> (bool, 
     // But we want to check what would happen if we add `*`/`.*` to the inner expression.
     // To check for inner we need `` expr.needs_parens_in(`*expr`) ``,
     // to check for outer we need `` `*expr`.needs_parens_in(parent) ``,
-    // where "expr" is the `expr` parameter, `*expr` is the editted `expr`,
+    // where "expr" is the `expr` parameter, `*expr` is the edited `expr`,
     // and "parent" is the parent of the original expression...
     //
-    // For this we utilize mutable mutable trees, which is a HACK, but it works.
+    // For this we utilize mutable trees, which is a HACK, but it works.
     //
     // FIXME: comeup with a better API for `needs_parens_in`, so that we don't have to do *this*
 
@@ -223,20 +245,25 @@ fn needs_parens_for_adjustment_hints(expr: &ast::Expr, postfix: bool) -> (bool, 
     ted::replace(expr.syntax(), dummy_expr.syntax());
 
     let parent = dummy_expr.syntax().parent();
-    let expr = if postfix {
-        let ast::Expr::TryExpr(e) = &dummy_expr else { unreachable!() };
-        let Some(ast::Expr::ParenExpr(e)) = e.expr() else { unreachable!() };
+    let Some(expr) = (|| {
+        if postfix {
+            let ast::Expr::TryExpr(e) = &dummy_expr else { return None };
+            let Some(ast::Expr::ParenExpr(e)) = e.expr() else { return None };
 
-        e.expr().unwrap()
-    } else {
-        let ast::Expr::RefExpr(e) = &dummy_expr else { unreachable!() };
-        let Some(ast::Expr::ParenExpr(e)) = e.expr() else { unreachable!() };
+            e.expr()
+        } else {
+            let ast::Expr::RefExpr(e) = &dummy_expr else { return None };
+            let Some(ast::Expr::ParenExpr(e)) = e.expr() else { return None };
 
-        e.expr().unwrap()
+            e.expr()
+        }
+    })() else {
+        never!("broken syntax tree?\n{:?}\n{:?}", expr, dummy_expr);
+        return (true, true)
     };
 
     // At this point
-    // - `parent`     is the parrent of the original expression
+    // - `parent`     is the parent of the original expression
     // - `dummy_expr` is the original expression wrapped in the operator we want (`*`/`.*`)
     // - `expr`       is the clone of the original expression (with `dummy_expr` as the parent)
 
@@ -258,7 +285,7 @@ mod tests {
         check_with_config(
             InlayHintsConfig { adjustment_hints: AdjustmentHints::Always, ..DISABLED_CONFIG },
             r#"
-//- minicore: coerce_unsized, fn
+//- minicore: coerce_unsized, fn, eq, index
 fn main() {
     let _: u32         = loop {};
                        //^^^^^^^<never-to-any>
@@ -309,6 +336,8 @@ fn main() {
     (&Struct).consume();
    //^^^^^^^*
     (&Struct).by_ref();
+   //^^^^^^^&
+   //^^^^^^^*
 
     (&mut Struct).consume();
    //^^^^^^^^^^^*
@@ -316,6 +345,8 @@ fn main() {
    //^^^^^^^^^^^&
    //^^^^^^^^^^^*
     (&mut Struct).by_ref_mut();
+   //^^^^^^^^^^^&mut $
+   //^^^^^^^^^^^*
 
     // Check that block-like expressions don't duplicate hints
     let _: &mut [u32] = (&mut []);
@@ -339,7 +370,7 @@ fn main() {
         loop {}
       //^^^^^^^<never-to-any>
     };
-    let _: &mut [u32] = match () { () => &mut [] }
+    let _: &mut [u32] = match () { () => &mut [] };
                                        //^^^^^^^<unsize>
                                        //^^^^^^^&mut $
                                        //^^^^^^^*
@@ -348,6 +379,25 @@ fn main() {
                          //^^^^^^^^^^<unsize>
                          //^^^^^^^^^^&mut $
                          //^^^^^^^^^^*
+    () == ();
+ // ^^&
+       // ^^&
+    (()) == {()};
+  // ^^&
+         // ^^^^&
+    let closure: dyn Fn = || ();
+    closure();
+  //^^^^^^^(
+  //^^^^^^^&
+  //^^^^^^^)
+    Struct[0];
+  //^^^^^^(
+  //^^^^^^&
+  //^^^^^^)
+    &mut Struct[0];
+       //^^^^^^(
+       //^^^^^^&mut $
+       //^^^^^^)
 }
 
 #[derive(Copy, Clone)]
@@ -357,8 +407,13 @@ impl Struct {
     fn by_ref(&self) {}
     fn by_ref_mut(&mut self) {}
 }
+struct StructMut;
+impl core::ops::Index<usize> for Struct {
+    type Output = ();
+}
+impl core::ops::IndexMut for Struct {}
 "#,
-        )
+        );
     }
 
     #[test]
@@ -370,7 +425,7 @@ impl Struct {
                 ..DISABLED_CONFIG
             },
             r#"
-//- minicore: coerce_unsized, fn
+//- minicore: coerce_unsized, fn, eq, index
 fn main() {
 
     Struct.consume();
@@ -384,6 +439,10 @@ fn main() {
    //^^^^^^^)
    //^^^^^^^.*
     (&Struct).by_ref();
+   //^^^^^^^(
+   //^^^^^^^)
+   //^^^^^^^.*
+   //^^^^^^^.&
 
     (&mut Struct).consume();
    //^^^^^^^^^^^(
@@ -395,6 +454,10 @@ fn main() {
    //^^^^^^^^^^^.*
    //^^^^^^^^^^^.&
     (&mut Struct).by_ref_mut();
+   //^^^^^^^^^^^(
+   //^^^^^^^^^^^)
+   //^^^^^^^^^^^.*
+   //^^^^^^^^^^^.&mut
 
     // Check that block-like expressions don't duplicate hints
     let _: &mut [u32] = (&mut []);
@@ -426,7 +489,7 @@ fn main() {
         loop {}
       //^^^^^^^.<never-to-any>
     };
-    let _: &mut [u32] = match () { () => &mut [] }
+    let _: &mut [u32] = match () { () => &mut [] };
                                        //^^^^^^^(
                                        //^^^^^^^)
                                        //^^^^^^^.*
@@ -439,6 +502,19 @@ fn main() {
                          //^^^^^^^^^^.*
                          //^^^^^^^^^^.&mut
                          //^^^^^^^^^^.<unsize>
+    () == ();
+ // ^^.&
+       // ^^.&
+    (()) == {()};
+  // ^^.&
+         // ^^^^.&
+    let closure: dyn Fn = || ();
+    closure();
+  //^^^^^^^.&
+    Struct[0];
+  //^^^^^^.&
+    &mut Struct[0];
+       //^^^^^^.&mut
 }
 
 #[derive(Copy, Clone)]
@@ -448,6 +524,11 @@ impl Struct {
     fn by_ref(&self) {}
     fn by_ref_mut(&mut self) {}
 }
+struct StructMut;
+impl core::ops::Index<usize> for Struct {
+    type Output = ();
+}
+impl core::ops::IndexMut for Struct {}
 "#,
         );
     }
@@ -506,6 +587,7 @@ fn main() {
 
     #[test]
     fn never_to_never_is_never_shown() {
+        cov_mark::check!(same_type_adjustment);
         check_with_config(
             InlayHintsConfig { adjustment_hints: AdjustmentHints::Always, ..DISABLED_CONFIG },
             r#"
@@ -613,14 +695,13 @@ fn a() {
     }
 
     #[test]
-    fn bug() {
+    fn let_stmt_explicit_ty() {
         check_with_config(
             InlayHintsConfig { adjustment_hints: AdjustmentHints::Always, ..DISABLED_CONFIG },
             r#"
 fn main() {
-    // These should be identical, but they are not...
-
     let () = return;
+           //^^^^^^<never-to-any>
     let (): () = return;
                //^^^^^^<never-to-any>
 }

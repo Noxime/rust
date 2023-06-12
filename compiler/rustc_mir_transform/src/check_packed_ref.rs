@@ -1,10 +1,9 @@
-use rustc_errors::struct_span_err;
 use rustc_middle::mir::visit::{PlaceContext, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, TyCtxt};
 
-use crate::util;
 use crate::MirLint;
+use crate::{errors, util};
 
 pub struct CheckPackedRef;
 
@@ -42,29 +41,14 @@ impl<'tcx> Visitor<'tcx> for PackedRefChecker<'_, 'tcx> {
             if util::is_disaligned(self.tcx, self.body, self.param_env, *place) {
                 let def_id = self.body.source.instance.def_id();
                 if let Some(impl_def_id) = self.tcx.impl_of_method(def_id)
-                    && self.tcx.is_builtin_derive(impl_def_id)
+                    && self.tcx.is_builtin_derived(impl_def_id)
                 {
                     // If we ever reach here it means that the generated derive
                     // code is somehow doing an unaligned reference, which it
                     // shouldn't do.
-                    unreachable!();
+                    span_bug!(self.source_info.span, "builtin derive created an unaligned reference");
                 } else {
-                    struct_span_err!(
-                        self.tcx.sess,
-                        self.source_info.span,
-                        E0793,
-                        "reference to packed field is unaligned"
-                    )
-                    .note(
-                        "fields of packed structs are not properly aligned, and creating \
-                        a misaligned reference is undefined behavior (even if that \
-                        reference is never dereferenced)",
-                    ).help(
-                        "copy the field contents to a local variable, or replace the \
-                        reference with a raw pointer and use `read_unaligned`/`write_unaligned` \
-                        (loads and stores via `*p` must be properly aligned even when using raw pointers)"
-                    )
-                    .emit();
+                    self.tcx.sess.emit_err(errors::UnalignedPackedRef { span: self.source_info.span });
                 }
             }
         }

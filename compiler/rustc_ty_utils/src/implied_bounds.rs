@@ -1,9 +1,9 @@
-use crate::rustc_middle::ty::DefIdTree;
 use rustc_hir::{def::DefKind, def_id::DefId};
+use rustc_middle::query::Providers;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 
-pub fn provide(providers: &mut ty::query::Providers) {
-    *providers = ty::query::Providers { assumed_wf_types, ..*providers };
+pub fn provide(providers: &mut Providers) {
+    *providers = Providers { assumed_wf_types, ..*providers };
 }
 
 fn assumed_wf_types(tcx: TyCtxt<'_>, def_id: DefId) -> &ty::List<Ty<'_>> {
@@ -19,19 +19,31 @@ fn assumed_wf_types(tcx: TyCtxt<'_>, def_id: DefId) -> &ty::List<Ty<'_>> {
             let mut assumed_wf_types: Vec<_> =
                 tcx.assumed_wf_types(tcx.parent(def_id)).as_slice().into();
             assumed_wf_types.extend(liberated_sig.inputs_and_output);
-            tcx.intern_type_list(&assumed_wf_types)
+            tcx.mk_type_list(&assumed_wf_types)
         }
-        DefKind::Impl => {
+        DefKind::Impl { .. } => {
             match tcx.impl_trait_ref(def_id) {
                 Some(trait_ref) => {
                     let types: Vec<_> = trait_ref.skip_binder().substs.types().collect();
-                    tcx.intern_type_list(&types)
+                    tcx.mk_type_list(&types)
                 }
                 // Only the impl self type
-                None => tcx.intern_type_list(&[tcx.type_of(def_id)]),
+                None => tcx.mk_type_list(&[tcx.type_of(def_id).subst_identity()]),
             }
         }
         DefKind::AssocConst | DefKind::AssocTy => tcx.assumed_wf_types(tcx.parent(def_id)),
+        DefKind::OpaqueTy => match tcx.def_kind(tcx.parent(def_id)) {
+            DefKind::TyAlias => ty::List::empty(),
+            DefKind::AssocTy => tcx.assumed_wf_types(tcx.parent(def_id)),
+            // Nested opaque types only occur in associated types:
+            // ` type Opaque<T> = impl Trait<&'static T, AssocTy = impl Nested>; `
+            // assumed_wf_types should include those of `Opaque<T>`, `Opaque<T>` itself
+            // and `&'static T`.
+            DefKind::OpaqueTy => bug!("unimplemented implied bounds for neseted opaque types"),
+            def_kind @ _ => {
+                bug!("unimplemented implied bounds for opaque types with parent {def_kind:?}")
+            }
+        },
         DefKind::Mod
         | DefKind::Struct
         | DefKind::Union
@@ -52,7 +64,6 @@ fn assumed_wf_types(tcx: TyCtxt<'_>, def_id: DefId) -> &ty::List<Ty<'_>> {
         | DefKind::ForeignMod
         | DefKind::AnonConst
         | DefKind::InlineConst
-        | DefKind::OpaqueTy
         | DefKind::ImplTraitPlaceholder
         | DefKind::Field
         | DefKind::LifetimeParam

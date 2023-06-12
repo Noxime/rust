@@ -40,7 +40,6 @@ use std::{
     hash::{Hash, Hasher},
     marker::PhantomData,
     ops::Index,
-    sync::Arc,
 };
 
 use ast::{AstNode, HasName, StructKind};
@@ -48,22 +47,24 @@ use base_db::CrateId;
 use either::Either;
 use hir_expand::{
     ast_id_map::FileAstId,
+    attrs::RawAttrs,
     hygiene::Hygiene,
     name::{name, AsName, Name},
     ExpandTo, HirFileId, InFile,
 };
+use intern::Interned;
 use la_arena::{Arena, Idx, IdxRange, RawIdx};
 use profile::Count;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use stdx::never;
 use syntax::{ast, match_ast, SyntaxKind};
+use triomphe::Arc;
 
 use crate::{
-    attr::{Attrs, RawAttrs},
+    attr::Attrs,
     db::DefDatabase,
     generics::GenericParams,
-    intern::Interned,
     path::{path, AssociatedTypeBinding, GenericArgs, ImportAlias, ModPath, Path, PathKind},
     type_ref::{Mutability, TraitRef, TypeBound, TypeRef},
     visibility::RawVisibility,
@@ -100,17 +101,16 @@ pub struct ItemTree {
     top_level: SmallVec<[ModItem; 1]>,
     attrs: FxHashMap<AttrOwner, RawAttrs>,
 
+    // FIXME: Remove this indirection, an item tree is almost always non-empty?
     data: Option<Box<ItemTreeData>>,
 }
 
 impl ItemTree {
     pub(crate) fn file_item_tree_query(db: &dyn DefDatabase, file_id: HirFileId) -> Arc<ItemTree> {
         let _p = profile::span("file_item_tree_query").detail(|| format!("{file_id:?}"));
-        let syntax = match db.parse_or_expand(file_id) {
-            Some(node) => node,
-            None => return Default::default(),
-        };
-        if never!(syntax.kind() == SyntaxKind::ERROR) {
+        let syntax = db.parse_or_expand(file_id);
+        if never!(syntax.kind() == SyntaxKind::ERROR, "{:?} from {:?} {}", file_id, syntax, syntax)
+        {
             // FIXME: not 100% sure why these crop up, but return an empty tree to avoid a panic
             return Default::default();
         }
@@ -120,7 +120,7 @@ impl ItemTree {
         let mut item_tree = match_ast! {
             match syntax {
                 ast::SourceFile(file) => {
-                    top_attrs = Some(RawAttrs::new(db, &file, ctx.hygiene()));
+                    top_attrs = Some(RawAttrs::new(db.upcast(), &file, ctx.hygiene()));
                     ctx.lower_module_items(&file)
                 },
                 ast::MacroItems(items) => {
@@ -132,7 +132,7 @@ impl ItemTree {
                     ctx.lower_macro_stmts(stmts)
                 },
                 _ => {
-                    panic!("cannot create item tree from {syntax:?} {syntax}");
+                    panic!("cannot create item tree for file {file_id:?} from {syntax:?} {syntax}");
                 },
             }
         };
@@ -152,7 +152,11 @@ impl ItemTree {
 
     /// Returns the inner attributes of the source file.
     pub fn top_level_attrs(&self, db: &dyn DefDatabase, krate: CrateId) -> Attrs {
-        self.attrs.get(&AttrOwner::TopLevel).unwrap_or(&RawAttrs::EMPTY).clone().filter(db, krate)
+        Attrs::filter(
+            db,
+            krate,
+            self.attrs.get(&AttrOwner::TopLevel).unwrap_or(&RawAttrs::EMPTY).clone(),
+        )
     }
 
     pub(crate) fn raw_attrs(&self, of: AttrOwner) -> &RawAttrs {
@@ -160,11 +164,11 @@ impl ItemTree {
     }
 
     pub(crate) fn attrs(&self, db: &dyn DefDatabase, krate: CrateId, of: AttrOwner) -> Attrs {
-        self.raw_attrs(of).clone().filter(db, krate)
+        Attrs::filter(db, krate, self.raw_attrs(of).clone())
     }
 
-    pub fn pretty_print(&self) -> String {
-        pretty::print_item_tree(self)
+    pub fn pretty_print(&self, db: &dyn DefDatabase) -> String {
+        pretty::print_item_tree(db.upcast(), self)
     }
 
     fn data(&self) -> &ItemTreeData {
@@ -198,6 +202,7 @@ impl ItemTree {
                 consts,
                 statics,
                 traits,
+                trait_aliases,
                 impls,
                 type_aliases,
                 mods,
@@ -220,6 +225,7 @@ impl ItemTree {
             consts.shrink_to_fit();
             statics.shrink_to_fit();
             traits.shrink_to_fit();
+            trait_aliases.shrink_to_fit();
             impls.shrink_to_fit();
             type_aliases.shrink_to_fit();
             mods.shrink_to_fit();
@@ -270,6 +276,7 @@ struct ItemTreeData {
     consts: Arena<Const>,
     statics: Arena<Static>,
     traits: Arena<Trait>,
+    trait_aliases: Arena<TraitAlias>,
     impls: Arena<Impl>,
     type_aliases: Arena<TypeAlias>,
     mods: Arena<Mod>,
@@ -490,6 +497,7 @@ mod_items! {
     Const in consts -> ast::Const,
     Static in statics -> ast::Static,
     Trait in traits -> ast::Trait,
+    TraitAlias in trait_aliases -> ast::TraitAlias,
     Impl in impls -> ast::Impl,
     TypeAlias in type_aliases -> ast::TypeAlias,
     Mod in mods -> ast::Module,
@@ -590,19 +598,18 @@ pub struct Function {
     pub abi: Option<Interned<str>>,
     pub params: IdxRange<Param>,
     pub ret_type: Interned<TypeRef>,
-    pub async_ret_type: Option<Interned<TypeRef>>,
     pub ast_id: FileAstId<ast::Fn>,
     pub(crate) flags: FnFlags,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Param {
-    Normal(Option<Name>, Interned<TypeRef>),
+    Normal(Interned<TypeRef>),
     Varargs,
 }
 
 bitflags::bitflags! {
-    #[derive(Default)]
+    #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
     pub(crate) struct FnFlags: u8 {
         const HAS_SELF_PARAM = 1 << 0;
         const HAS_BODY = 1 << 1;
@@ -666,9 +673,16 @@ pub struct Trait {
     pub generic_params: Interned<GenericParams>,
     pub is_auto: bool,
     pub is_unsafe: bool,
-    /// This is [`None`] if this Trait is a trait alias.
-    pub items: Option<Box<[AssocItem]>>,
+    pub items: Box<[AssocItem]>,
     pub ast_id: FileAstId<ast::Trait>,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct TraitAlias {
+    pub name: Name,
+    pub visibility: RawVisibilityId,
+    pub generic_params: Interned<GenericParams>,
+    pub ast_id: FileAstId<ast::TraitAlias>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -866,6 +880,7 @@ impl ModItem {
             | ModItem::Enum(_)
             | ModItem::Static(_)
             | ModItem::Trait(_)
+            | ModItem::TraitAlias(_)
             | ModItem::Impl(_)
             | ModItem::Mod(_)
             | ModItem::MacroRules(_)
@@ -893,6 +908,7 @@ impl ModItem {
             ModItem::Const(it) => tree[it.index].ast_id().upcast(),
             ModItem::Static(it) => tree[it.index].ast_id().upcast(),
             ModItem::Trait(it) => tree[it.index].ast_id().upcast(),
+            ModItem::TraitAlias(it) => tree[it.index].ast_id().upcast(),
             ModItem::Impl(it) => tree[it.index].ast_id().upcast(),
             ModItem::TypeAlias(it) => tree[it.index].ast_id().upcast(),
             ModItem::Mod(it) => tree[it.index].ast_id().upcast(),

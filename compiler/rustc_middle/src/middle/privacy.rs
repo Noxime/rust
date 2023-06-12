@@ -1,12 +1,12 @@
 //! A pass that checks to make sure private fields and methods aren't used
 //! outside their scopes. This pass will also generate a set of exported items
 //! which are available for use externally when compiled as a library.
-use crate::ty::{DefIdTree, TyCtxt, Visibility};
+use crate::ty::{TyCtxt, Visibility};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_macros::HashStable;
 use rustc_query_system::ich::StableHashingContext;
-use rustc_span::def_id::LocalDefId;
+use rustc_span::def_id::{LocalDefId, CRATE_DEF_ID};
 use std::hash::Hash;
 
 /// Represents the levels of effective visibility an item can have.
@@ -64,13 +64,25 @@ impl EffectiveVisibility {
         self.at_level(level).is_public()
     }
 
-    pub fn from_vis(vis: Visibility) -> EffectiveVisibility {
+    pub const fn from_vis(vis: Visibility) -> EffectiveVisibility {
         EffectiveVisibility {
             direct: vis,
             reexported: vis,
             reachable: vis,
             reachable_through_impl_trait: vis,
         }
+    }
+
+    #[must_use]
+    pub fn min(mut self, lhs: EffectiveVisibility, tcx: TyCtxt<'_>) -> Self {
+        for l in Level::all_levels() {
+            let rhs_vis = self.at_level_mut(l);
+            let lhs_vis = *lhs.at_level(l);
+            if rhs_vis.is_at_least(lhs_vis, tcx) {
+                *rhs_vis = lhs_vis;
+            };
+        }
+        self
     }
 }
 
@@ -82,8 +94,7 @@ pub struct EffectiveVisibilities<Id = LocalDefId> {
 
 impl EffectiveVisibilities {
     pub fn is_public_at_level(&self, id: LocalDefId, level: Level) -> bool {
-        self.effective_vis(id)
-            .map_or(false, |effective_vis| effective_vis.is_public_at_level(level))
+        self.effective_vis(id).is_some_and(|effective_vis| effective_vis.is_public_at_level(level))
     }
 
     /// See `Level::Reachable`.
@@ -107,12 +118,16 @@ impl EffectiveVisibilities {
         })
     }
 
+    pub fn update_root(&mut self) {
+        self.map.insert(CRATE_DEF_ID, EffectiveVisibility::from_vis(Visibility::Public));
+    }
+
     // FIXME: Share code with `fn update`.
     pub fn update_eff_vis(
         &mut self,
         def_id: LocalDefId,
         eff_vis: &EffectiveVisibility,
-        tree: impl DefIdTree,
+        tcx: TyCtxt<'_>,
     ) {
         use std::collections::hash_map::Entry;
         match self.map.entry(def_id) {
@@ -122,7 +137,7 @@ impl EffectiveVisibilities {
                     let vis_at_level = eff_vis.at_level(l);
                     let old_vis_at_level = old_eff_vis.at_level_mut(l);
                     if vis_at_level != old_vis_at_level
-                        && vis_at_level.is_at_least(*old_vis_at_level, tree)
+                        && vis_at_level.is_at_least(*old_vis_at_level, tcx)
                     {
                         *old_vis_at_level = *vis_at_level
                     }
@@ -131,24 +146,6 @@ impl EffectiveVisibilities {
             }
             Entry::Vacant(vacant) => vacant.insert(*eff_vis),
         };
-    }
-
-    pub fn set_public_at_level(
-        &mut self,
-        id: LocalDefId,
-        lazy_private_vis: impl FnOnce() -> Visibility,
-        level: Level,
-    ) {
-        let mut effective_vis = self
-            .effective_vis(id)
-            .copied()
-            .unwrap_or_else(|| EffectiveVisibility::from_vis(lazy_private_vis()));
-        for l in Level::all_levels() {
-            if l <= level {
-                *effective_vis.at_level_mut(l) = Visibility::Public;
-            }
-        }
-        self.map.insert(id, effective_vis);
     }
 
     pub fn check_invariants(&self, tcx: TyCtxt<'_>, early: bool) {
@@ -194,11 +191,6 @@ impl EffectiveVisibilities {
     }
 }
 
-pub trait IntoDefIdTree {
-    type Tree: DefIdTree;
-    fn tree(self) -> Self::Tree;
-}
-
 impl<Id: Eq + Hash> EffectiveVisibilities<Id> {
     pub fn iter(&self) -> impl Iterator<Item = (&Id, &EffectiveVisibility)> {
         self.map.iter()
@@ -217,25 +209,21 @@ impl<Id: Eq + Hash> EffectiveVisibilities<Id> {
         self.map.entry(id).or_insert_with(|| EffectiveVisibility::from_vis(lazy_private_vis()))
     }
 
-    pub fn update<T: IntoDefIdTree>(
+    pub fn update(
         &mut self,
         id: Id,
-        nominal_vis: Visibility,
-        lazy_private_vis: impl FnOnce(T) -> (Visibility, T),
+        nominal_vis: Option<Visibility>,
+        lazy_private_vis: impl FnOnce() -> Visibility,
         inherited_effective_vis: EffectiveVisibility,
         level: Level,
-        mut into_tree: T,
+        tcx: TyCtxt<'_>,
     ) -> bool {
         let mut changed = false;
-        let mut current_effective_vis = match self.map.get(&id).copied() {
-            Some(eff_vis) => eff_vis,
-            None => {
-                let private_vis;
-                (private_vis, into_tree) = lazy_private_vis(into_tree);
-                EffectiveVisibility::from_vis(private_vis)
-            }
-        };
-        let tree = into_tree.tree();
+        let mut current_effective_vis = self
+            .map
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| EffectiveVisibility::from_vis(lazy_private_vis()));
 
         let mut inherited_effective_vis_at_prev_level = *inherited_effective_vis.at_level(level);
         let mut calculated_effective_vis = inherited_effective_vis_at_prev_level;
@@ -248,17 +236,16 @@ impl<Id: Eq + Hash> EffectiveVisibilities<Id> {
                 if !(inherited_effective_vis_at_prev_level == inherited_effective_vis_at_level
                     && level != l)
                 {
-                    calculated_effective_vis =
-                        if nominal_vis.is_at_least(inherited_effective_vis_at_level, tree) {
-                            inherited_effective_vis_at_level
-                        } else {
-                            nominal_vis
-                        };
+                    calculated_effective_vis = if let Some(nominal_vis) = nominal_vis && !nominal_vis.is_at_least(inherited_effective_vis_at_level, tcx) {
+                        nominal_vis
+                    } else {
+                        inherited_effective_vis_at_level
+                    }
                 }
                 // effective visibility can't be decreased at next update call for the
                 // same id
                 if *current_effective_vis_at_level != calculated_effective_vis
-                    && calculated_effective_vis.is_at_least(*current_effective_vis_at_level, tree)
+                    && calculated_effective_vis.is_at_least(*current_effective_vis_at_level, tcx)
                 {
                     changed = true;
                     *current_effective_vis_at_level = calculated_effective_vis;

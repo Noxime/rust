@@ -10,6 +10,7 @@
 //! [rustc dev guide]: https://rustc-dev-guide.rust-lang.org/traits/specialization.html
 
 pub mod specialization_graph;
+use rustc_infer::infer::DefineOpaqueTypes;
 use specialization_graph::GraphExt;
 
 use crate::errors::NegativePositiveConflict;
@@ -21,7 +22,7 @@ use crate::traits::{
 use rustc_data_structures::fx::FxIndexSet;
 use rustc_errors::{error_code, DelayDm, Diagnostic};
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_middle::ty::{self, ImplSubject, Ty, TyCtxt};
+use rustc_middle::ty::{self, ImplSubject, Ty, TyCtxt, TypeVisitableExt};
 use rustc_middle::ty::{InternalSubsts, SubstsRef};
 use rustc_session::lint::builtin::COHERENCE_LEAK_CHECK;
 use rustc_session::lint::builtin::ORDER_DEPENDENT_TRAIT_OBJECTS;
@@ -82,6 +83,30 @@ pub fn translate_substs<'tcx>(
     source_substs: SubstsRef<'tcx>,
     target_node: specialization_graph::Node,
 ) -> SubstsRef<'tcx> {
+    translate_substs_with_cause(
+        infcx,
+        param_env,
+        source_impl,
+        source_substs,
+        target_node,
+        |_, _| ObligationCause::dummy(),
+    )
+}
+
+/// Like [translate_substs], but obligations from the parent implementation
+/// are registered with the provided `ObligationCause`.
+///
+/// This is for reporting *region* errors from those bounds. Type errors should
+/// not happen because the specialization graph already checks for those, and
+/// will result in an ICE.
+pub fn translate_substs_with_cause<'tcx>(
+    infcx: &InferCtxt<'tcx>,
+    param_env: ty::ParamEnv<'tcx>,
+    source_impl: DefId,
+    source_substs: SubstsRef<'tcx>,
+    target_node: specialization_graph::Node,
+    cause: impl Fn(usize, Span) -> ObligationCause<'tcx>,
+) -> SubstsRef<'tcx> {
     debug!(
         "translate_substs({:?}, {:?}, {:?}, {:?})",
         param_env, source_impl, source_substs, target_node
@@ -98,14 +123,13 @@ pub fn translate_substs<'tcx>(
                 return source_substs;
             }
 
-            fulfill_implication(infcx, param_env, source_trait_ref, target_impl).unwrap_or_else(
-                |_| {
+            fulfill_implication(infcx, param_env, source_trait_ref, source_impl, target_impl, cause)
+                .unwrap_or_else(|()| {
                     bug!(
-                        "When translating substitutions for specialization, the expected \
-                         specialization failed to hold"
+                        "When translating substitutions from {source_impl:?} to {target_impl:?}, \
+                        the expected specialization failed to hold"
                     )
-                },
-            )
+                })
         }
         specialization_graph::Node::Trait(..) => source_trait_ref.substs,
     };
@@ -152,20 +176,12 @@ pub(super) fn specializes(tcx: TyCtxt<'_>, (impl1_def_id, impl2_def_id): (DefId,
 
     // Create an infcx, taking the predicates of impl1 as assumptions:
     let infcx = tcx.infer_ctxt().build();
-    let impl1_trait_ref =
-        match traits::fully_normalize(&infcx, ObligationCause::dummy(), penv, impl1_trait_ref) {
-            Ok(impl1_trait_ref) => impl1_trait_ref,
-            Err(_errors) => {
-                tcx.sess.delay_span_bug(
-                    tcx.def_span(impl1_def_id),
-                    format!("failed to fully normalize {impl1_trait_ref}"),
-                );
-                impl1_trait_ref
-            }
-        };
 
     // Attempt to prove that impl2 applies, given all of the above.
-    fulfill_implication(&infcx, penv, impl1_trait_ref, impl2_def_id).is_ok()
+    fulfill_implication(&infcx, penv, impl1_trait_ref, impl1_def_id, impl2_def_id, |_, _| {
+        ObligationCause::dummy()
+    })
+    .is_ok()
 }
 
 /// Attempt to fulfill all obligations of `target_impl` after unification with
@@ -177,23 +193,41 @@ fn fulfill_implication<'tcx>(
     infcx: &InferCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     source_trait_ref: ty::TraitRef<'tcx>,
+    source_impl: DefId,
     target_impl: DefId,
+    error_cause: impl Fn(usize, Span) -> ObligationCause<'tcx>,
 ) -> Result<SubstsRef<'tcx>, ()> {
     debug!(
         "fulfill_implication({:?}, trait_ref={:?} |- {:?} applies)",
         param_env, source_trait_ref, target_impl
     );
 
+    let source_trait_ref = match traits::fully_normalize(
+        &infcx,
+        ObligationCause::dummy(),
+        param_env,
+        source_trait_ref,
+    ) {
+        Ok(source_trait_ref) => source_trait_ref,
+        Err(_errors) => {
+            infcx.tcx.sess.delay_span_bug(
+                infcx.tcx.def_span(source_impl),
+                format!("failed to fully normalize {source_trait_ref}"),
+            );
+            source_trait_ref
+        }
+    };
+
     let source_trait = ImplSubject::Trait(source_trait_ref);
 
     let selcx = &mut SelectionContext::new(&infcx);
     let target_substs = infcx.fresh_substs_for_item(DUMMY_SP, target_impl);
     let (target_trait, obligations) =
-        util::impl_subject_and_oblig(selcx, param_env, target_impl, target_substs);
+        util::impl_subject_and_oblig(selcx, param_env, target_impl, target_substs, error_cause);
 
     // do the impls unify? If not, no specialization.
     let Ok(InferOk { obligations: more_obligations, .. }) =
-        infcx.at(&ObligationCause::dummy(), param_env).eq(source_trait, target_trait)
+        infcx.at(&ObligationCause::dummy(), param_env).eq(DefineOpaqueTypes::No, source_trait, target_trait)
     else {
         debug!(
             "fulfill_implication: {:?} does not unify with {:?}",
@@ -349,6 +383,10 @@ fn report_conflicting_impls<'tcx>(
         impl_span: Span,
         err: &mut Diagnostic,
     ) {
+        if (overlap.trait_ref, overlap.self_ty).references_error() {
+            err.downgrade_to_delayed_bug();
+        }
+
         match tcx.span_of_impl(overlap.with_impl) {
             Ok(span) => {
                 err.span_label(span, "first implementation here");
@@ -368,7 +406,7 @@ fn report_conflicting_impls<'tcx>(
                     }
                     None => format!("conflicting implementation in crate `{}`", cname),
                 };
-                err.note(&msg);
+                err.note(msg);
             }
         }
 
@@ -455,7 +493,13 @@ pub(crate) fn to_pretty_impl_header(tcx: TyCtxt<'_>, impl_def_id: DefId) -> Opti
         w.push('>');
     }
 
-    write!(w, " {} for {}", trait_ref.print_only_trait_path(), tcx.type_of(impl_def_id)).unwrap();
+    write!(
+        w,
+        " {} for {}",
+        trait_ref.print_only_trait_path(),
+        tcx.type_of(impl_def_id).subst_identity()
+    )
+    .unwrap();
 
     // The predicates will contain default bounds like `T: Sized`. We need to
     // remove these bounds, and add `T: ?Sized` to any untouched type parameters.

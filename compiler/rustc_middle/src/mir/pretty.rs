@@ -10,10 +10,10 @@ use super::spanview::write_mir_fn_spanview;
 use either::Either;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::DefId;
-use rustc_index::vec::Idx;
+use rustc_index::Idx;
 use rustc_middle::mir::interpret::{
-    alloc_range, read_target_uint, AllocId, Allocation, ConstAllocation, ConstValue, GlobalAlloc,
-    Pointer, Provenance,
+    alloc_range, read_target_uint, AllocBytes, AllocId, Allocation, ConstAllocation, ConstValue,
+    GlobalAlloc, Pointer, Provenance,
 };
 use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::*;
@@ -123,6 +123,7 @@ fn dump_matched_mir_node<'tcx, F>(
         // see notes on #41697 above
         let def_path =
             ty::print::with_forced_impl_filename_line!(tcx.def_path_str(body.source.def_id()));
+        // ignore-tidy-odd-backticks the literal below is fine
         write!(file, "// MIR for `{}", def_path)?;
         match body.source.promoted {
             None => write!(file, "`")?,
@@ -297,8 +298,7 @@ pub fn write_mir_pretty<'tcx>(
             // are shared between mir_for_ctfe and optimized_mir
             write_mir_fn(tcx, tcx.mir_for_ctfe(def_id), &mut |_, _| Ok(()), w)?;
         } else {
-            let instance_mir =
-                tcx.instance_mir(ty::InstanceDef::Item(ty::WithOptConstParam::unknown(def_id)));
+            let instance_mir = tcx.instance_mir(ty::InstanceDef::Item(def_id));
             render_body(w, instance_mir)?;
         }
     }
@@ -463,11 +463,7 @@ impl<'tcx> Visitor<'tcx> for ExtraComments<'tcx> {
                 ConstantKind::Ty(ct) => match ct.kind() {
                     ty::ConstKind::Param(p) => format!("Param({})", p),
                     ty::ConstKind::Unevaluated(uv) => {
-                        format!(
-                            "Unevaluated({}, {:?})",
-                            self.tcx.def_path_str(uv.def.did),
-                            uv.substs,
-                        )
+                        format!("Unevaluated({}, {:?})", self.tcx.def_path_str(uv.def), uv.substs,)
                     }
                     ty::ConstKind::Value(val) => format!("Value({})", fmt_valtree(&val)),
                     ty::ConstKind::Error(_) => "Error".to_string(),
@@ -480,7 +476,7 @@ impl<'tcx> Visitor<'tcx> for ExtraComments<'tcx> {
                 ConstantKind::Unevaluated(uv, _) => {
                     format!(
                         "Unevaluated({}, {:?}, {:?})",
-                        self.tcx.def_path_str(uv.def.did),
+                        self.tcx.def_path_str(uv.def),
                         uv.substs,
                         uv.promoted,
                     )
@@ -555,8 +551,13 @@ fn write_scope_tree(
         }
 
         let indented_debug_info = format!(
-            "{0:1$}debug {2} => {3:?};",
-            INDENT, indent, var_debug_info.name, var_debug_info.value,
+            "{0:1$}debug {2} => {3:&<4$}{5:?};",
+            INDENT,
+            indent,
+            var_debug_info.name,
+            "",
+            var_debug_info.references as usize,
+            var_debug_info.value,
         );
 
         writeln!(
@@ -787,21 +788,21 @@ pub fn write_allocations<'tcx>(
 /// After the hex dump, an ascii dump follows, replacing all unprintable characters (control
 /// characters or characters whose value is larger than 127) with a `.`
 /// This also prints provenance adequately.
-pub fn display_allocation<'a, 'tcx, Prov: Provenance, Extra>(
+pub fn display_allocation<'a, 'tcx, Prov: Provenance, Extra, Bytes: AllocBytes>(
     tcx: TyCtxt<'tcx>,
-    alloc: &'a Allocation<Prov, Extra>,
-) -> RenderAllocation<'a, 'tcx, Prov, Extra> {
+    alloc: &'a Allocation<Prov, Extra, Bytes>,
+) -> RenderAllocation<'a, 'tcx, Prov, Extra, Bytes> {
     RenderAllocation { tcx, alloc }
 }
 
 #[doc(hidden)]
-pub struct RenderAllocation<'a, 'tcx, Prov: Provenance, Extra> {
+pub struct RenderAllocation<'a, 'tcx, Prov: Provenance, Extra, Bytes: AllocBytes> {
     tcx: TyCtxt<'tcx>,
-    alloc: &'a Allocation<Prov, Extra>,
+    alloc: &'a Allocation<Prov, Extra, Bytes>,
 }
 
-impl<'a, 'tcx, Prov: Provenance, Extra> std::fmt::Display
-    for RenderAllocation<'a, 'tcx, Prov, Extra>
+impl<'a, 'tcx, Prov: Provenance, Extra, Bytes: AllocBytes> std::fmt::Display
+    for RenderAllocation<'a, 'tcx, Prov, Extra, Bytes>
 {
     fn fmt(&self, w: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let RenderAllocation { tcx, alloc } = *self;
@@ -845,9 +846,9 @@ fn write_allocation_newline(
 /// The `prefix` argument allows callers to add an arbitrary prefix before each line (even if there
 /// is only one line). Note that your prefix should contain a trailing space as the lines are
 /// printed directly after it.
-fn write_allocation_bytes<'tcx, Prov: Provenance, Extra>(
+pub fn write_allocation_bytes<'tcx, Prov: Provenance, Extra, Bytes: AllocBytes>(
     tcx: TyCtxt<'tcx>,
-    alloc: &Allocation<Prov, Extra>,
+    alloc: &Allocation<Prov, Extra, Bytes>,
     w: &mut dyn std::fmt::Write,
     prefix: &str,
 ) -> std::fmt::Result {

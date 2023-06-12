@@ -2,9 +2,10 @@ use std::borrow::Cow;
 use std::ffi::CString;
 use std::path::Path;
 
+use crate::fluent_generated as fluent;
 use rustc_data_structures::small_c_str::SmallCStr;
 use rustc_errors::{
-    fluent, DiagnosticBuilder, EmissionGuarantee, ErrorGuaranteed, Handler, IntoDiagnostic,
+    DiagnosticBuilder, EmissionGuarantee, ErrorGuaranteed, Handler, IntoDiagnostic,
 };
 use rustc_macros::{Diagnostic, Subdiagnostic};
 use rustc_span::Span;
@@ -27,9 +28,9 @@ pub(crate) struct UnknownCTargetFeature<'a> {
 
 #[derive(Subdiagnostic)]
 pub(crate) enum PossibleFeature<'a> {
-    #[help(possible_feature)]
+    #[help(codegen_llvm_possible_feature)]
     Some { rust_feature: &'a str },
-    #[help(consider_filing_feature_request)]
+    #[help(codegen_llvm_consider_filing_feature_request)]
     None,
 }
 
@@ -49,9 +50,15 @@ pub(crate) struct SymbolAlreadyDefined<'a> {
 }
 
 #[derive(Diagnostic)]
-#[diag(codegen_llvm_invalid_minimum_alignment)]
-pub(crate) struct InvalidMinimumAlignment {
-    pub err: String,
+#[diag(codegen_llvm_invalid_minimum_alignment_not_power_of_two)]
+pub(crate) struct InvalidMinimumAlignmentNotPowerOfTwo {
+    pub align: u64,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_llvm_invalid_minimum_alignment_too_large)]
+pub(crate) struct InvalidMinimumAlignmentTooLarge {
+    pub align: u64,
 }
 
 #[derive(Diagnostic)]
@@ -66,7 +73,8 @@ pub(crate) struct ErrorWritingDEFFile {
 
 #[derive(Diagnostic)]
 #[diag(codegen_llvm_error_calling_dlltool)]
-pub(crate) struct ErrorCallingDllTool {
+pub(crate) struct ErrorCallingDllTool<'a> {
+    pub dlltool_path: Cow<'a, str>,
     pub error: std::io::Error,
 }
 
@@ -194,6 +202,7 @@ pub(crate) struct FromLlvmOptimizationDiag<'a> {
     pub line: std::ffi::c_uint,
     pub column: std::ffi::c_uint,
     pub pass_name: &'a str,
+    pub kind: &'a str,
     pub message: &'a str,
 }
 

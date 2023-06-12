@@ -75,8 +75,8 @@ impl<'tcx> ConstValue<'tcx> {
         self.try_to_scalar_int()?.try_into().ok()
     }
 
-    pub fn try_to_machine_usize(&self, tcx: TyCtxt<'tcx>) -> Option<u64> {
-        self.try_to_scalar_int()?.try_to_machine_usize(tcx).ok()
+    pub fn try_to_target_usize(&self, tcx: TyCtxt<'tcx>) -> Option<u64> {
+        self.try_to_scalar_int()?.try_to_target_usize(tcx).ok()
     }
 
     pub fn try_to_bits_for_ty(
@@ -97,8 +97,12 @@ impl<'tcx> ConstValue<'tcx> {
         ConstValue::Scalar(Scalar::from_u64(i))
     }
 
-    pub fn from_machine_usize(i: u64, cx: &impl HasDataLayout) -> Self {
-        ConstValue::Scalar(Scalar::from_machine_usize(i, cx))
+    pub fn from_u128(i: u128) -> Self {
+        ConstValue::Scalar(Scalar::from_u128(i))
+    }
+
+    pub fn from_target_usize(i: u64, cx: &impl HasDataLayout) -> Self {
+        ConstValue::Scalar(Scalar::from_target_usize(i, cx))
     }
 }
 
@@ -241,7 +245,12 @@ impl<Prov> Scalar<Prov> {
     }
 
     #[inline]
-    pub fn from_machine_usize(i: u64, cx: &impl HasDataLayout) -> Self {
+    pub fn from_u128(i: u128) -> Self {
+        Scalar::Int(i.into())
+    }
+
+    #[inline]
+    pub fn from_target_usize(i: u64, cx: &impl HasDataLayout) -> Self {
         Self::from_uint(i, cx.data_layout().pointer_size)
     }
 
@@ -268,7 +277,7 @@ impl<Prov> Scalar<Prov> {
     }
 
     #[inline]
-    pub fn from_machine_isize(i: i64, cx: &impl HasDataLayout) -> Self {
+    pub fn from_target_isize(i: i64, cx: &impl HasDataLayout) -> Self {
         Self::from_int(i, cx.data_layout().pointer_size)
     }
 
@@ -322,7 +331,7 @@ impl<'tcx, Prov: Provenance> Scalar<Prov> {
             Right(ptr) => Ok(ptr.into()),
             Left(bits) => {
                 let addr = u64::try_from(bits).unwrap();
-                Ok(Pointer::from_addr(addr))
+                Ok(Pointer::from_addr_invalid(addr))
             }
         }
     }
@@ -375,7 +384,8 @@ impl<'tcx, Prov: Provenance> Scalar<Prov> {
     #[inline(always)]
     #[cfg_attr(debug_assertions, track_caller)] // only in debug builds due to perf (see #98980)
     pub fn assert_bits(self, target_size: Size) -> u128 {
-        self.to_bits(target_size).unwrap()
+        self.to_bits(target_size)
+            .unwrap_or_else(|_| panic!("assertion failed: {self:?} fits {target_size:?}"))
     }
 
     pub fn to_bool(self) -> InterpResult<'tcx, bool> {
@@ -429,7 +439,7 @@ impl<'tcx, Prov: Provenance> Scalar<Prov> {
 
     /// Converts the scalar to produce a machine-pointer-sized unsigned integer.
     /// Fails if the scalar is a pointer.
-    pub fn to_machine_usize(self, cx: &impl HasDataLayout) -> InterpResult<'tcx, u64> {
+    pub fn to_target_usize(self, cx: &impl HasDataLayout) -> InterpResult<'tcx, u64> {
         let b = self.to_uint(cx.data_layout().pointer_size)?;
         Ok(u64::try_from(b).unwrap())
     }
@@ -469,7 +479,7 @@ impl<'tcx, Prov: Provenance> Scalar<Prov> {
 
     /// Converts the scalar to produce a machine-pointer-sized signed integer.
     /// Fails if the scalar is a pointer.
-    pub fn to_machine_isize(self, cx: &impl HasDataLayout) -> InterpResult<'tcx, i64> {
+    pub fn to_target_isize(self, cx: &impl HasDataLayout) -> InterpResult<'tcx, i64> {
         let b = self.to_int(cx.data_layout().pointer_size)?;
         Ok(i64::try_from(b).unwrap())
     }

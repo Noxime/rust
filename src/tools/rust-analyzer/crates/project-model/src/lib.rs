@@ -25,7 +25,7 @@ mod sysroot;
 mod workspace;
 mod rustc_cfg;
 mod build_scripts;
-mod target_data_layout;
+pub mod target_data_layout;
 
 #[cfg(test)]
 mod tests;
@@ -44,7 +44,7 @@ pub use crate::{
     build_scripts::WorkspaceBuildScripts,
     cargo_workspace::{
         CargoConfig, CargoFeatures, CargoWorkspace, Package, PackageData, PackageDependency,
-        RustcSource, Target, TargetData, TargetKind, UnsetTestCrates,
+        RustLibSource, Target, TargetData, TargetKind,
     },
     manifest_path::ManifestPath,
     project_json::{ProjectJson, ProjectJsonData},

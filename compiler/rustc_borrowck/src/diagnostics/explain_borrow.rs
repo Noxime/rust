@@ -3,11 +3,11 @@
 use rustc_errors::{Applicability, Diagnostic};
 use rustc_hir as hir;
 use rustc_hir::intravisit::Visitor;
-use rustc_index::vec::IndexVec;
+use rustc_index::IndexSlice;
 use rustc_infer::infer::NllRegionVariableOrigin;
 use rustc_middle::mir::{
-    Body, CastKind, ConstraintCategory, FakeReadCause, Local, Location, Operand, Place, Rvalue,
-    Statement, StatementKind, TerminatorKind,
+    Body, CastKind, ConstraintCategory, FakeReadCause, Local, LocalInfo, Location, Operand, Place,
+    Rvalue, Statement, StatementKind, TerminatorKind,
 };
 use rustc_middle::ty::adjustment::PointerCast;
 use rustc_middle::ty::{self, RegionVid, TyCtxt};
@@ -60,7 +60,7 @@ impl<'tcx> BorrowExplanation<'tcx> {
         &self,
         tcx: TyCtxt<'tcx>,
         body: &Body<'tcx>,
-        local_names: &IndexVec<Local, Option<Symbol>>,
+        local_names: &IndexSlice<Local, Option<Symbol>>,
         err: &mut Diagnostic,
         borrow_desc: &str,
         borrow_span: Option<Span>,
@@ -90,7 +90,7 @@ impl<'tcx> BorrowExplanation<'tcx> {
                     {
                         err.span_label(
                             pat.span,
-                            &format!("binding `{ident}` declared here"),
+                            format!("binding `{ident}` declared here"),
                         );
                     }
                 }
@@ -118,7 +118,7 @@ impl<'tcx> BorrowExplanation<'tcx> {
                     let path_span = path_span.unwrap();
                     // path_span is only present in the case of closure capture
                     assert!(matches!(later_use_kind, LaterUseKind::ClosureCapture));
-                    if !borrow_span.map_or(false, |sp| sp.overlaps(var_or_use_span)) {
+                    if !borrow_span.is_some_and(|sp| sp.overlaps(var_or_use_span)) {
                         let path_label = "used here by closure";
                         let capture_kind_label = message;
                         err.span_label(
@@ -220,16 +220,13 @@ impl<'tcx> BorrowExplanation<'tcx> {
                         );
                         err.span_label(body.source_info(drop_loc).span, message);
 
-                        if let Some(info) = &local_decl.is_block_tail {
+                        if let LocalInfo::BlockTailTemp(info) = local_decl.local_info() {
                             if info.tail_result_is_ignored {
                                 // #85581: If the first mutable borrow's scope contains
                                 // the second borrow, this suggestion isn't helpful.
-                                if !multiple_borrow_span
-                                    .map(|(old, new)| {
-                                        old.to(info.span.shrink_to_hi()).contains(new)
-                                    })
-                                    .unwrap_or(false)
-                                {
+                                if !multiple_borrow_span.is_some_and(|(old, new)| {
+                                    old.to(info.span.shrink_to_hi()).contains(new)
+                                }) {
                                     err.span_suggestion_verbose(
                                         info.span.shrink_to_hi(),
                                         "consider adding semicolon after the expression so its \
@@ -323,7 +320,7 @@ impl<'tcx> BorrowExplanation<'tcx> {
 
             err.span_suggestion_verbose(
                 span.shrink_to_hi(),
-                &msg,
+                msg,
                 format!(" + {suggestable_name}"),
                 Applicability::Unspecified,
             );

@@ -4,6 +4,7 @@ Rust MIR: a lowered representation of Rust.
 
 */
 
+#![deny(rustc::untranslatable_diagnostic)]
 #![feature(assert_matches)]
 #![feature(box_patterns)]
 #![feature(decl_macro)]
@@ -20,7 +21,6 @@ Rust MIR: a lowered representation of Rust.
 #![feature(try_blocks)]
 #![feature(yeet_expr)]
 #![feature(if_let_guard)]
-#![feature(is_some_and)]
 #![recursion_limit = "256"]
 
 #[macro_use]
@@ -34,9 +34,14 @@ pub mod interpret;
 pub mod transform;
 pub mod util;
 
+pub use errors::ReportErrorExt;
+
+use rustc_errors::{DiagnosticMessage, SubdiagnosticMessage};
+use rustc_fluent_macro::fluent_messages;
+use rustc_middle::query::Providers;
 use rustc_middle::ty;
-use rustc_middle::ty::query::Providers;
-use rustc_target::abi::InitKind;
+
+fluent_messages! { "../messages.ftl" }
 
 pub fn provide(providers: &mut Providers) {
     const_eval::provide(providers);
@@ -54,16 +59,7 @@ pub fn provide(providers: &mut Providers) {
     providers.valtree_to_const_val = |tcx, (ty, valtree)| {
         const_eval::valtree_to_const_value(tcx, ty::ParamEnv::empty().and(ty), valtree)
     };
-    providers.deref_mir_constant = |tcx, param_env_and_value| {
-        let (param_env, value) = param_env_and_value.into_parts();
-        const_eval::deref_mir_constant(tcx, param_env, value)
-    };
-    providers.permits_uninit_init = |tcx, param_env_and_ty| {
-        let (param_env, ty) = param_env_and_ty.into_parts();
-        util::might_permit_raw_init(tcx, param_env, ty, InitKind::UninitMitigated0x01Fill)
-    };
-    providers.permits_zero_init = |tcx, param_env_and_ty| {
-        let (param_env, ty) = param_env_and_ty.into_parts();
-        util::might_permit_raw_init(tcx, param_env, ty, InitKind::Zero)
+    providers.check_validity_requirement = |tcx, (init_kind, param_env_and_ty)| {
+        util::check_validity_requirement(tcx, init_kind, param_env_and_ty)
     };
 }

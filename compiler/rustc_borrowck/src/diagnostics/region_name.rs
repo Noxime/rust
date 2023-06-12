@@ -6,11 +6,11 @@ use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_middle::ty::print::RegionHighlightMode;
 use rustc_middle::ty::subst::{GenericArgKind, SubstsRef};
-use rustc_middle::ty::{self, DefIdTree, RegionVid, Ty};
+use rustc_middle::ty::{self, RegionVid, Ty};
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::{Span, DUMMY_SP};
 
-use crate::{nll::ToRegionVid, universal_regions::DefiningTy, MirBorrowckCtxt};
+use crate::{universal_regions::DefiningTy, MirBorrowckCtxt};
 
 /// A name for a particular region used in emitting diagnostics. This name could be a generated
 /// name like `'1`, a name used by the user like `'a`, or a name like `'static`.
@@ -280,17 +280,10 @@ impl<'tcx> MirBorrowckCtxt<'_, 'tcx> {
 
         debug!("give_region_a_name: error_region = {:?}", error_region);
         match *error_region {
-            ty::ReEarlyBound(ebr) => {
-                if ebr.has_name() {
-                    let span = tcx.hir().span_if_local(ebr.def_id).unwrap_or(DUMMY_SP);
-                    Some(RegionName {
-                        name: ebr.name,
-                        source: RegionNameSource::NamedEarlyBoundRegion(span),
-                    })
-                } else {
-                    None
-                }
-            }
+            ty::ReEarlyBound(ebr) => ebr.has_name().then(|| {
+                let span = tcx.hir().span_if_local(ebr.def_id).unwrap_or(DUMMY_SP);
+                RegionName { name: ebr.name, source: RegionNameSource::NamedEarlyBoundRegion(span) }
+            }),
 
             ty::ReStatic => {
                 Some(RegionName { name: kw::StaticLifetime, source: RegionNameSource::Static })
@@ -343,11 +336,11 @@ impl<'tcx> MirBorrowckCtxt<'_, 'tcx> {
                     let note = match closure_kind_ty.to_opt_closure_kind() {
                         Some(ty::ClosureKind::Fn) => {
                             "closure implements `Fn`, so references to captured variables \
-                                can't escape the closure"
+                             can't escape the closure"
                         }
                         Some(ty::ClosureKind::FnMut) => {
                             "closure implements `FnMut`, so references to captured variables \
-                                can't escape the closure"
+                             can't escape the closure"
                         }
                         Some(ty::ClosureKind::FnOnce) => {
                             bug!("BrEnv in a `FnOnce` closure");
@@ -364,7 +357,11 @@ impl<'tcx> MirBorrowckCtxt<'_, 'tcx> {
                 ty::BoundRegionKind::BrAnon(..) => None,
             },
 
-            ty::ReLateBound(..) | ty::ReVar(..) | ty::RePlaceholder(..) | ty::ReErased => None,
+            ty::ReLateBound(..)
+            | ty::ReVar(..)
+            | ty::RePlaceholder(..)
+            | ty::ReErased
+            | ty::ReError(_) => None,
         }
     }
 
@@ -500,7 +497,7 @@ impl<'tcx> MirBorrowckCtxt<'_, 'tcx> {
                 //     &
                 //     - let's call the lifetime of this reference `'1`
                 (ty::Ref(region, referent_ty, _), hir::TyKind::Ref(_lifetime, referent_hir_ty)) => {
-                    if region.to_region_vid() == needle_fr {
+                    if region.as_var() == needle_fr {
                         // Just grab the first character, the `&`.
                         let source_map = self.infcx.tcx.sess.source_map();
                         let ampersand_span = source_map.start_point(hir_ty.span);
@@ -601,7 +598,7 @@ impl<'tcx> MirBorrowckCtxt<'_, 'tcx> {
         for (kind, hir_arg) in iter::zip(substs, args.args) {
             match (kind.unpack(), hir_arg) {
                 (GenericArgKind::Lifetime(r), hir::GenericArg::Lifetime(lt)) => {
-                    if r.to_region_vid() == needle_fr {
+                    if r.as_var() == needle_fr {
                         return Some(lt);
                     }
                 }
@@ -625,7 +622,7 @@ impl<'tcx> MirBorrowckCtxt<'_, 'tcx> {
                     // programs, so we need to use delay_span_bug here. See #82126.
                     self.infcx.tcx.sess.delay_span_bug(
                         hir_arg.span(),
-                        &format!("unmatched subst and hir arg: found {kind:?} vs {hir_arg:?}"),
+                        format!("unmatched subst and hir arg: found {kind:?} vs {hir_arg:?}"),
                     );
                 }
             }
@@ -669,7 +666,7 @@ impl<'tcx> MirBorrowckCtxt<'_, 'tcx> {
 
         let return_ty = self.regioncx.universal_regions().unnormalized_output_ty;
         debug!("give_name_if_anonymous_region_appears_in_output: return_ty = {:?}", return_ty);
-        if !tcx.any_free_region_meets(&return_ty, |r| r.to_region_vid() == fr) {
+        if !tcx.any_free_region_meets(&return_ty, |r| r.as_var() == fr) {
             return None;
         }
 
@@ -806,7 +803,7 @@ impl<'tcx> MirBorrowckCtxt<'_, 'tcx> {
 
         let tcx = self.infcx.tcx;
 
-        if !tcx.any_free_region_meets(&yield_ty, |r| r.to_region_vid() == fr) {
+        if !tcx.any_free_region_meets(&yield_ty, |r| r.as_var() == fr) {
             return None;
         }
 
@@ -848,12 +845,13 @@ impl<'tcx> MirBorrowckCtxt<'_, 'tcx> {
 
         let tcx = self.infcx.tcx;
         let region_parent = tcx.parent(region.def_id);
-        if tcx.def_kind(region_parent) != DefKind::Impl {
+        let DefKind::Impl { .. } = tcx.def_kind(region_parent) else {
             return None;
-        }
+        };
 
-        let found = tcx
-            .any_free_region_meets(&tcx.type_of(region_parent), |r| *r == ty::ReEarlyBound(region));
+        let found = tcx.any_free_region_meets(&tcx.type_of(region_parent).subst_identity(), |r| {
+            *r == ty::ReEarlyBound(region)
+        });
 
         Some(RegionName {
             name: self.synthesize_region_name(),

@@ -4,7 +4,6 @@
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![feature(never_type)]
 #![recursion_limit = "256"]
-#![allow(rustc::potential_query_instability)]
 #![deny(rustc::untranslatable_diagnostic)]
 #![deny(rustc::diagnostic_outside_of_impl)]
 
@@ -31,3 +30,8 @@ pub use persist::save_dep_graph;
 pub use persist::save_work_product_index;
 pub use persist::LoadResult;
 pub use persist::{build_dep_graph, load_dep_graph, DepGraphFuture};
+
+use rustc_errors::{DiagnosticMessage, SubdiagnosticMessage};
+use rustc_fluent_macro::fluent_messages;
+
+fluent_messages! { "../messages.ftl" }

@@ -64,7 +64,7 @@
 
 use crate::mir::*;
 use crate::ty::subst::SubstsRef;
-use crate::ty::{CanonicalUserTypeAnnotation, Ty};
+use crate::ty::{self, CanonicalUserTypeAnnotation, Ty};
 use rustc_span::Span;
 
 macro_rules! make_mir_visitor {
@@ -190,6 +190,14 @@ macro_rules! make_mir_visitor {
                 location: Location,
             ) {
                 self.super_constant(constant, location);
+            }
+
+            fn visit_ty_const(
+                &mut self,
+                ct: $( & $mutability)? ty::Const<'tcx>,
+                location: Location,
+            ) {
+                self.super_ty_const(ct, location);
             }
 
             fn visit_span(
@@ -323,7 +331,7 @@ macro_rules! make_mir_visitor {
                     self.visit_source_scope($(& $mutability)? *parent_scope);
                 }
                 if let Some((callee, callsite_span)) = inlined {
-                    let location = START_BLOCK.start_location();
+                    let location = Location::START;
 
                     self.visit_span($(& $mutability)? *callsite_span);
 
@@ -335,12 +343,14 @@ macro_rules! make_mir_visitor {
                         ty::InstanceDef::VTableShim(_def_id) |
                         ty::InstanceDef::ReifyShim(_def_id) |
                         ty::InstanceDef::Virtual(_def_id, _) |
+                        ty::InstanceDef::ThreadLocalShim(_def_id) |
                         ty::InstanceDef::ClosureOnceShim { call_once: _def_id, track_caller: _ } |
                         ty::InstanceDef::DropGlue(_def_id, None) => {}
 
                         ty::InstanceDef::FnPtrShim(_def_id, ty) |
                         ty::InstanceDef::DropGlue(_def_id, Some(ty)) |
-                        ty::InstanceDef::CloneShim(_def_id, ty) => {
+                        ty::InstanceDef::CloneShim(_def_id, ty) |
+                        ty::InstanceDef::FnPtrAddrShim(_def_id, ty) => {
                             // FIXME(eddyb) use a better `TyContext` here.
                             self.visit_ty($(& $mutability)? *ty, TyContext::Location(location));
                         }
@@ -405,6 +415,13 @@ macro_rules! make_mir_visitor {
                     StatementKind::Retag(kind, place) => {
                         self.visit_retag($(& $mutability)? *kind, place, location);
                     }
+                    StatementKind::PlaceMention(place) => {
+                        self.visit_place(
+                            place,
+                            PlaceContext::NonMutatingUse(NonMutatingUseContext::PlaceMention),
+                            location
+                        );
+                    }
                     StatementKind::AscribeUserType(
                         box (place, user_ty),
                         variance
@@ -453,7 +470,7 @@ macro_rules! make_mir_visitor {
                 match kind {
                     TerminatorKind::Goto { .. } |
                     TerminatorKind::Resume |
-                    TerminatorKind::Abort |
+                    TerminatorKind::Terminate |
                     TerminatorKind::GeneratorDrop |
                     TerminatorKind::Unreachable |
                     TerminatorKind::FalseEdge { .. } |
@@ -487,26 +504,13 @@ macro_rules! make_mir_visitor {
                         place,
                         target: _,
                         unwind: _,
+                        replace: _,
                     } => {
                         self.visit_place(
                             place,
                             PlaceContext::MutatingUse(MutatingUseContext::Drop),
                             location
                         );
-                    }
-
-                    TerminatorKind::DropAndReplace {
-                        place,
-                        value,
-                        target: _,
-                        unwind: _,
-                    } => {
-                        self.visit_place(
-                            place,
-                            PlaceContext::MutatingUse(MutatingUseContext::Drop),
-                            location
-                        );
-                        self.visit_operand(value, location);
                     }
 
                     TerminatorKind::Call {
@@ -514,7 +518,7 @@ macro_rules! make_mir_visitor {
                         args,
                         destination,
                         target: _,
-                        cleanup: _,
+                        unwind: _,
                         from_hir_call: _,
                         fn_span: _
                     } => {
@@ -534,7 +538,7 @@ macro_rules! make_mir_visitor {
                         expected: _,
                         msg,
                         target: _,
-                        cleanup: _,
+                        unwind: _,
                     } => {
                         self.visit_operand(cond, location);
                         self.visit_assert_message(msg, location);
@@ -560,7 +564,7 @@ macro_rules! make_mir_visitor {
                         options: _,
                         line_spans: _,
                         destination: _,
-                        cleanup: _,
+                        unwind: _,
                     } => {
                         for op in operands {
                             match op {
@@ -615,6 +619,10 @@ macro_rules! make_mir_visitor {
                     ResumedAfterReturn(_) | ResumedAfterPanic(_) => {
                         // Nothing to visit
                     }
+                    MisalignedPointerDereference { required, found } => {
+                        self.visit_operand(required, location);
+                        self.visit_operand(found, location);
+                    }
                 }
             }
 
@@ -626,8 +634,9 @@ macro_rules! make_mir_visitor {
                         self.visit_operand(operand, location);
                     }
 
-                    Rvalue::Repeat(value, _) => {
+                    Rvalue::Repeat(value, ct) => {
                         self.visit_operand(value, location);
+                        self.visit_ty_const($(&$mutability)? *ct, location);
                     }
 
                     Rvalue::ThreadLocalRef(_) => {}
@@ -641,8 +650,8 @@ macro_rules! make_mir_visitor {
                             BorrowKind::Shallow => PlaceContext::NonMutatingUse(
                                 NonMutatingUseContext::ShallowBorrow
                             ),
-                            BorrowKind::Unique => PlaceContext::NonMutatingUse(
-                                NonMutatingUseContext::UniqueBorrow
+                            BorrowKind::Unique => PlaceContext::MutatingUse(
+                                MutatingUseContext::Borrow
                             ),
                             BorrowKind::Mut { .. } =>
                                 PlaceContext::MutatingUse(MutatingUseContext::Borrow),
@@ -774,12 +783,12 @@ macro_rules! make_mir_visitor {
 
             fn super_ascribe_user_ty(&mut self,
                                      place: & $($mutability)? Place<'tcx>,
-                                     _variance: $(& $mutability)? ty::Variance,
+                                     variance: $(& $mutability)? ty::Variance,
                                      user_ty: & $($mutability)? UserTypeProjection,
                                      location: Location) {
                 self.visit_place(
                     place,
-                    PlaceContext::NonUse(NonUseContext::AscribeUserTy),
+                    PlaceContext::NonUse(NonUseContext::AscribeUserTy($(* &$mutability *)? variance)),
                     location
                 );
                 self.visit_user_type_projection(user_ty);
@@ -811,7 +820,6 @@ macro_rules! make_mir_visitor {
                     source_info,
                     internal: _,
                     local_info: _,
-                    is_block_tail: _,
                 } = local_decl;
 
                 self.visit_ty($(& $mutability)? *ty, TyContext::LocalDecl {
@@ -834,10 +842,12 @@ macro_rules! make_mir_visitor {
                     name: _,
                     source_info,
                     value,
+                    argument_index: _,
+                    references: _,
                 } = var_debug_info;
 
                 self.visit_source_info(source_info);
-                let location = START_BLOCK.start_location();
+                let location = Location::START;
                 match value {
                     VarDebugInfoContents::Const(c) => self.visit_constant(c, location),
                     VarDebugInfoContents::Place(place) =>
@@ -872,17 +882,24 @@ macro_rules! make_mir_visitor {
             ) {
                 let Constant {
                     span,
-                    user_ty,
+                    user_ty: _, // no visit method for this
                     literal,
                 } = constant;
 
                 self.visit_span($(& $mutability)? *span);
-                drop(user_ty); // no visit method for this
                 match literal {
-                    ConstantKind::Ty(_) => {}
+                    ConstantKind::Ty(ct) => self.visit_ty_const($(&$mutability)? *ct, location),
                     ConstantKind::Val(_, ty) => self.visit_ty($(& $mutability)? *ty, TyContext::Location(location)),
                     ConstantKind::Unevaluated(_, ty) => self.visit_ty($(& $mutability)? *ty, TyContext::Location(location)),
                 }
+            }
+
+            fn super_ty_const(
+                &mut self,
+                _ct: $(& $mutability)? ty::Const<'tcx>,
+                _location: Location,
+            ) {
+
             }
 
             fn super_span(&mut self, _span: $(& $mutability)? Span) {
@@ -1026,7 +1043,7 @@ macro_rules! super_body {
         $self.visit_span($(& $mutability)? $body.span);
 
         for const_ in &$($mutability)? $body.required_consts {
-            let location = START_BLOCK.start_location();
+            let location = Location::START;
             $self.visit_constant(const_, location);
         }
     }
@@ -1045,7 +1062,7 @@ macro_rules! visit_place_fns {
             self.visit_local(&mut place.local, context, location);
 
             if let Some(new_projection) = self.process_projection(&place.projection, location) {
-                place.projection = self.tcx().intern_place_elems(&new_projection);
+                place.projection = self.tcx().mk_place_elems(&new_projection);
             }
         }
 
@@ -1214,7 +1231,7 @@ impl<'tcx> MirVisitable<'tcx> for Option<Terminator<'tcx>> {
 
 /// Extra information passed to `visit_ty` and friends to give context
 /// about where the type etc appears.
-#[derive(Debug)]
+#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
 pub enum TyContext {
     LocalDecl {
         /// The index of the local variable we are visiting.
@@ -1248,10 +1265,13 @@ pub enum NonMutatingUseContext {
     SharedBorrow,
     /// Shallow borrow.
     ShallowBorrow,
-    /// Unique borrow.
-    UniqueBorrow,
     /// AddressOf for *const pointer.
     AddressOf,
+    /// PlaceMention statement.
+    ///
+    /// This statement is executed as a check that the `Place` is live without reading from it,
+    /// so it must be considered as a non-mutating use.
+    PlaceMention,
     /// Used as base for another place, e.g., `x` in `x.y`. Will not mutate the place.
     /// For example, the projection `x.y` is not marked as a mutation in these cases:
     /// ```ignore (illustrative)
@@ -1299,7 +1319,7 @@ pub enum NonUseContext {
     /// Ending a storage live range.
     StorageDead,
     /// User type annotation assertions for NLL.
-    AscribeUserTy,
+    AscribeUserTy(ty::Variance),
     /// The data of a user variable, for debug info.
     VarDebugInfo,
 }
@@ -1323,9 +1343,7 @@ impl PlaceContext {
         matches!(
             self,
             PlaceContext::NonMutatingUse(
-                NonMutatingUseContext::SharedBorrow
-                    | NonMutatingUseContext::ShallowBorrow
-                    | NonMutatingUseContext::UniqueBorrow
+                NonMutatingUseContext::SharedBorrow | NonMutatingUseContext::ShallowBorrow
             ) | PlaceContext::MutatingUse(MutatingUseContext::Borrow)
         )
     }

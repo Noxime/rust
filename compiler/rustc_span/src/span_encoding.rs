@@ -110,11 +110,16 @@ impl Span {
                 // Inline format with parent.
                 let len_or_tag = len_or_tag | PARENT_MASK;
                 let parent2 = parent.local_def_index.as_u32();
-                if ctxt2 == SyntaxContext::root().as_u32() && parent2 <= MAX_CTXT {
+                if ctxt2 == SyntaxContext::root().as_u32()
+                    && parent2 <= MAX_CTXT
+                    && len_or_tag < LEN_TAG
+                {
+                    debug_assert_ne!(len_or_tag, LEN_TAG);
                     return Span { base_or_index: base, len_or_tag, ctxt_or_tag: parent2 as u16 };
                 }
             } else {
                 // Inline format with ctxt.
+                debug_assert_ne!(len_or_tag, LEN_TAG);
                 return Span {
                     base_or_index: base,
                     len_or_tag: len as u16,
@@ -176,19 +181,23 @@ impl Span {
     #[inline]
     pub fn ctxt(self) -> SyntaxContext {
         let ctxt_or_tag = self.ctxt_or_tag as u32;
-        if ctxt_or_tag <= MAX_CTXT {
-            if self.len_or_tag == LEN_TAG || self.len_or_tag & PARENT_MASK == 0 {
-                // Inline format or interned format with inline ctxt.
-                SyntaxContext::from_u32(ctxt_or_tag)
+        // Check for interned format.
+        if self.len_or_tag == LEN_TAG {
+            if ctxt_or_tag == CTXT_TAG {
+                // Fully interned format.
+                let index = self.base_or_index;
+                with_span_interner(|interner| interner.spans[index as usize].ctxt)
             } else {
-                // Inline format or interned format with inline parent.
-                // We know that the SyntaxContext is root.
-                SyntaxContext::root()
+                // Interned format with inline ctxt.
+                SyntaxContext::from_u32(ctxt_or_tag)
             }
+        } else if self.len_or_tag & PARENT_MASK == 0 {
+            // Inline format with inline ctxt.
+            SyntaxContext::from_u32(ctxt_or_tag)
         } else {
-            // Interned format.
-            let index = self.base_or_index;
-            with_span_interner(|interner| interner.spans[index as usize].ctxt)
+            // Inline format with inline parent.
+            // We know that the SyntaxContext is root.
+            SyntaxContext::root()
         }
     }
 }

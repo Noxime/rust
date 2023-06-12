@@ -79,7 +79,7 @@ impl<'tcx> ReverseMapper<'tcx> {
         // during codegen.
 
         let generics = self.tcx.generics_of(def_id);
-        self.tcx.mk_substs(substs.iter().enumerate().map(|(index, kind)| {
+        self.tcx.mk_substs_from_iter(substs.iter().enumerate().map(|(index, kind)| {
             if index < generics.parent_count {
                 // Accommodate missing regions in the parent kinds...
                 self.fold_kind_no_missing_regions_error(kind)
@@ -91,8 +91,8 @@ impl<'tcx> ReverseMapper<'tcx> {
     }
 }
 
-impl<'tcx> TypeFolder<'tcx> for ReverseMapper<'tcx> {
-    fn tcx(&self) -> TyCtxt<'tcx> {
+impl<'tcx> TypeFolder<TyCtxt<'tcx>> for ReverseMapper<'tcx> {
+    fn interner(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
 
@@ -108,6 +108,8 @@ impl<'tcx> TypeFolder<'tcx> for ReverseMapper<'tcx> {
             // If regions have been erased (by writeback), don't try to unerase
             // them.
             ty::ReErased => return r,
+
+            ty::ReError(_) => return r,
 
             // The regions that we expect from borrow checking.
             ty::ReEarlyBound(_) | ty::ReFree(_) => {}
@@ -125,20 +127,21 @@ impl<'tcx> TypeFolder<'tcx> for ReverseMapper<'tcx> {
             Some(u) => panic!("region mapped to unexpected kind: {:?}", u),
             None if self.do_not_error => self.tcx.lifetimes.re_static,
             None => {
-                self.tcx
+                let e = self
+                    .tcx
                     .sess
                     .struct_span_err(self.span, "non-defining opaque type use in defining scope")
                     .span_label(
                         self.span,
                         format!(
                             "lifetime `{}` is part of concrete type but not used in \
-                                 parameter list of the `impl Trait` type alias",
+                             parameter list of the `impl Trait` type alias",
                             r
                         ),
                     )
                     .emit();
 
-                self.tcx().lifetimes.re_static
+                ty::Region::new_error(self.interner(), e)
             }
         }
     }
@@ -174,7 +177,7 @@ impl<'tcx> TypeFolder<'tcx> for ReverseMapper<'tcx> {
                                 .sess
                                 .struct_span_err(
                                     self.span,
-                                    &format!(
+                                    format!(
                                         "type parameter `{}` is part of concrete type but not \
                                           used in parameter list for the `impl Trait` type alias",
                                         ty
@@ -183,7 +186,7 @@ impl<'tcx> TypeFolder<'tcx> for ReverseMapper<'tcx> {
                                 .emit();
                         }
 
-                        self.tcx().ty_error()
+                        self.interner().ty_error_misc()
                     }
                 }
             }
@@ -204,14 +207,16 @@ impl<'tcx> TypeFolder<'tcx> for ReverseMapper<'tcx> {
                     Some(GenericArgKind::Const(c1)) => c1,
                     Some(u) => panic!("const mapped to unexpected kind: {:?}", u),
                     None => {
-                        if !self.ignore_errors {
-                            self.tcx.sess.emit_err(ConstNotUsedTraitAlias {
+                        let guar = self
+                            .tcx
+                            .sess
+                            .create_err(ConstNotUsedTraitAlias {
                                 ct: ct.to_string(),
                                 span: self.span,
-                            });
-                        }
+                            })
+                            .emit_unless(self.ignore_errors);
 
-                        self.tcx().const_error(ct.ty())
+                        self.interner().const_error(ct.ty(), guar)
                     }
                 }
             }

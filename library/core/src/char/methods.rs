@@ -1,5 +1,6 @@
 //! impl char {}
 
+use crate::ascii;
 use crate::slice;
 use crate::str::from_utf8_unchecked_mut;
 use crate::unicode::printable::is_printable;
@@ -53,15 +54,13 @@ impl char {
     /// Basic usage:
     ///
     /// ```
-    /// use std::char::decode_utf16;
-    ///
     /// // 𝄞mus<invalid>ic<invalid>
     /// let v = [
     ///     0xD834, 0xDD1E, 0x006d, 0x0075, 0x0073, 0xDD1E, 0x0069, 0x0063, 0xD834,
     /// ];
     ///
     /// assert_eq!(
-    ///     decode_utf16(v)
+    ///     char::decode_utf16(v)
     ///         .map(|r| r.map_err(|e| e.unpaired_surrogate()))
     ///         .collect::<Vec<_>>(),
     ///     vec![
@@ -77,16 +76,14 @@ impl char {
     /// A lossy decoder can be obtained by replacing `Err` results with the replacement character:
     ///
     /// ```
-    /// use std::char::{decode_utf16, REPLACEMENT_CHARACTER};
-    ///
     /// // 𝄞mus<invalid>ic<invalid>
     /// let v = [
     ///     0xD834, 0xDD1E, 0x006d, 0x0075, 0x0073, 0xDD1E, 0x0069, 0x0063, 0xD834,
     /// ];
     ///
     /// assert_eq!(
-    ///     decode_utf16(v)
-    ///        .map(|r| r.unwrap_or(REPLACEMENT_CHARACTER))
+    ///     char::decode_utf16(v)
+    ///        .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
     ///        .collect::<String>(),
     ///     "𝄞mus�ic�"
     /// );
@@ -123,8 +120,6 @@ impl char {
     /// Basic usage:
     ///
     /// ```
-    /// use std::char;
-    ///
     /// let c = char::from_u32(0x2764);
     ///
     /// assert_eq!(Some('❤'), c);
@@ -133,8 +128,6 @@ impl char {
     /// Returning `None` when the input is not a valid `char`:
     ///
     /// ```
-    /// use std::char;
-    ///
     /// let c = char::from_u32(0x110000);
     ///
     /// assert_eq!(None, c);
@@ -176,8 +169,6 @@ impl char {
     /// Basic usage:
     ///
     /// ```
-    /// use std::char;
-    ///
     /// let c = unsafe { char::from_u32_unchecked(0x2764) };
     ///
     /// assert_eq!('❤', c);
@@ -210,8 +201,6 @@ impl char {
     /// Basic usage:
     ///
     /// ```
-    /// use std::char;
-    ///
     /// let c = char::from_digit(4, 10);
     ///
     /// assert_eq!(Some('4'), c);
@@ -225,8 +214,6 @@ impl char {
     /// Returning `None` when the input is not a digit:
     ///
     /// ```
-    /// use std::char;
-    ///
     /// let c = char::from_digit(20, 10);
     ///
     /// assert_eq!(None, c);
@@ -235,8 +222,6 @@ impl char {
     /// Passing a large radix, causing a panic:
     ///
     /// ```should_panic
-    /// use std::char;
-    ///
     /// // this panics
     /// let _c = char::from_digit(1, 37);
     /// ```
@@ -396,20 +381,7 @@ impl char {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
     pub fn escape_unicode(self) -> EscapeUnicode {
-        let c = self as u32;
-
-        // or-ing 1 ensures that for c==0 the code computes that one
-        // digit should be printed and (which is the same) avoids the
-        // (31 - 32) underflow
-        let msb = 31 - (c | 1).leading_zeros();
-
-        // the index of the most significant hex digit
-        let ms_hex_digit = msb / 4;
-        EscapeUnicode {
-            c: self,
-            state: EscapeUnicodeState::Backslash,
-            hex_digit_idx: ms_hex_digit as usize,
-        }
+        EscapeUnicode::new(self)
     }
 
     /// An extended version of `escape_debug` that optionally permits escaping
@@ -419,21 +391,20 @@ impl char {
     /// characters, and double quotes in strings.
     #[inline]
     pub(crate) fn escape_debug_ext(self, args: EscapeDebugExtArgs) -> EscapeDebug {
-        let init_state = match self {
-            '\0' => EscapeDefaultState::Backslash('0'),
-            '\t' => EscapeDefaultState::Backslash('t'),
-            '\r' => EscapeDefaultState::Backslash('r'),
-            '\n' => EscapeDefaultState::Backslash('n'),
-            '\\' => EscapeDefaultState::Backslash(self),
-            '"' if args.escape_double_quote => EscapeDefaultState::Backslash(self),
-            '\'' if args.escape_single_quote => EscapeDefaultState::Backslash(self),
+        match self {
+            '\0' => EscapeDebug::backslash(ascii::Char::Digit0),
+            '\t' => EscapeDebug::backslash(ascii::Char::SmallT),
+            '\r' => EscapeDebug::backslash(ascii::Char::SmallR),
+            '\n' => EscapeDebug::backslash(ascii::Char::SmallN),
+            '\\' => EscapeDebug::backslash(ascii::Char::ReverseSolidus),
+            '\"' if args.escape_double_quote => EscapeDebug::backslash(ascii::Char::QuotationMark),
+            '\'' if args.escape_single_quote => EscapeDebug::backslash(ascii::Char::Apostrophe),
             _ if args.escape_grapheme_extended && self.is_grapheme_extended() => {
-                EscapeDefaultState::Unicode(self.escape_unicode())
+                EscapeDebug::from_unicode(self.escape_unicode())
             }
-            _ if is_printable(self) => EscapeDefaultState::Char(self),
-            _ => EscapeDefaultState::Unicode(self.escape_unicode()),
-        };
-        EscapeDebug(EscapeDefault { state: init_state })
+            _ if is_printable(self) => EscapeDebug::printable(self),
+            _ => EscapeDebug::from_unicode(self.escape_unicode()),
+        }
     }
 
     /// Returns an iterator that yields the literal escape code of a character
@@ -531,15 +502,14 @@ impl char {
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
     pub fn escape_default(self) -> EscapeDefault {
-        let init_state = match self {
-            '\t' => EscapeDefaultState::Backslash('t'),
-            '\r' => EscapeDefaultState::Backslash('r'),
-            '\n' => EscapeDefaultState::Backslash('n'),
-            '\\' | '\'' | '"' => EscapeDefaultState::Backslash(self),
-            '\x20'..='\x7e' => EscapeDefaultState::Char(self),
-            _ => EscapeDefaultState::Unicode(self.escape_unicode()),
-        };
-        EscapeDefault { state: init_state }
+        match self {
+            '\t' => EscapeDefault::backslash(ascii::Char::SmallT),
+            '\r' => EscapeDefault::backslash(ascii::Char::SmallR),
+            '\n' => EscapeDefault::backslash(ascii::Char::SmallN),
+            '\\' | '\'' | '"' => EscapeDefault::backslash(self.as_ascii().unwrap()),
+            '\x20'..='\x7e' => EscapeDefault::printable(self.as_ascii().unwrap()),
+            _ => EscapeDefault::from_unicode(self.escape_unicode()),
+        }
     }
 
     /// Returns the number of bytes this `char` would need if encoded in UTF-8.
@@ -1130,6 +1100,24 @@ impl char {
     #[inline]
     pub const fn is_ascii(&self) -> bool {
         *self as u32 <= 0x7F
+    }
+
+    /// Returns `Some` if the value is within the ASCII range,
+    /// or `None` if it's not.
+    ///
+    /// This is preferred to [`Self::is_ascii`] when you're passing the value
+    /// along to something else that can take [`ascii::Char`] rather than
+    /// needing to check again for itself whether the value is in ASCII.
+    #[must_use]
+    #[unstable(feature = "ascii_char", issue = "110998")]
+    #[inline]
+    pub const fn as_ascii(&self) -> Option<ascii::Char> {
+        if self.is_ascii() {
+            // SAFETY: Just checked that this is ASCII.
+            Some(unsafe { ascii::Char::from_u8_unchecked(*self as u8) })
+        } else {
+            None
+        }
     }
 
     /// Makes a copy of the value in its ASCII upper case equivalent.
@@ -1786,7 +1774,7 @@ pub fn encode_utf16_raw(mut code: u32, dst: &mut [u16]) -> &mut [u16] {
         } else {
             panic!(
                 "encode_utf16: need {} units to encode U+{:X}, but the buffer has {}",
-                from_u32_unchecked(code).len_utf16(),
+                char::from_u32_unchecked(code).len_utf16(),
                 code,
                 dst.len(),
             )

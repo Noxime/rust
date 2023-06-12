@@ -10,6 +10,7 @@ use std::thread;
 use log::info;
 
 use crate::borrow_tracker::RetagFields;
+use crate::diagnostics::report_leaks;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::def::Namespace;
 use rustc_hir::def_id::DefId;
@@ -87,7 +88,7 @@ pub struct MiriConfig {
     pub env: Vec<(OsString, OsString)>,
     /// Determine if validity checking is enabled.
     pub validate: bool,
-    /// Determines if Stacked Borrows is enabled.
+    /// Determines if Stacked Borrows or Tree Borrows is enabled.
     pub borrow_tracker: Option<BorrowTrackerMethod>,
     /// Controls alignment checking.
     pub check_alignment: AlignmentCheck,
@@ -134,7 +135,7 @@ pub struct MiriConfig {
     pub preemption_rate: f64,
     /// Report the current instruction being executed every N basic blocks.
     pub report_progress: Option<u32>,
-    /// Whether Stacked Borrows retagging should recurse into fields of datatypes.
+    /// Whether Stacked Borrows and Tree Borrows retagging should recurse into fields of datatypes.
     pub retag_fields: RetagFields,
     /// The location of a shared object file to load when calling external functions
     /// FIXME! consider allowing users to specify paths to multiple SO files, or to a directory
@@ -145,6 +146,8 @@ pub struct MiriConfig {
     pub num_cpus: u32,
     /// Requires Miri to emulate pages of a certain size
     pub page_size: Option<u64>,
+    /// Whether to collect a backtrace when each allocation is created, just in case it leaks.
+    pub collect_leak_backtraces: bool,
 }
 
 impl Default for MiriConfig {
@@ -179,6 +182,7 @@ impl Default for MiriConfig {
             gc_interval: 10_000,
             num_cpus: 1,
             page_size: None,
+            collect_leak_backtraces: true,
         }
     }
 }
@@ -236,7 +240,7 @@ impl MainThreadState {
                     this.machine.main_fn_ret_place.unwrap().ptr,
                     this.machine.layouts.isize,
                 );
-                let exit_code = this.read_machine_isize(&ret_place.into())?;
+                let exit_code = this.read_target_isize(&ret_place.into())?;
                 // Need to call this ourselves since we are not going to return to the scheduler
                 // loop, and we want the main thread TLS to not show up as memory leaks.
                 this.terminate_active_thread()?;
@@ -287,7 +291,7 @@ pub fn create_ecx<'mir, 'tcx: 'mir>(
     // First argument is constructed later, because it's skipped if the entry function uses #[start].
 
     // Second argument (argc): length of `config.args`.
-    let argc = Scalar::from_machine_usize(u64::try_from(config.args.len()).unwrap(), &ecx);
+    let argc = Scalar::from_target_usize(u64::try_from(config.args.len()).unwrap(), &ecx);
     // Third argument (`argv`): created from `config.args`.
     let argv = {
         // Put each argument in memory, collect pointers.
@@ -363,7 +367,7 @@ pub fn create_ecx<'mir, 'tcx: 'mir>(
                 tcx,
                 ty::ParamEnv::reveal_all(),
                 start_id,
-                tcx.mk_substs(::std::iter::once(ty::subst::GenericArg::from(main_ret_ty))),
+                tcx.mk_substs(&[ty::subst::GenericArg::from(main_ret_ty)]),
             )
             .unwrap()
             .unwrap();
@@ -372,7 +376,7 @@ pub fn create_ecx<'mir, 'tcx: 'mir>(
 
             // Inlining of `DEFAULT` from
             // https://github.com/rust-lang/rust/blob/master/compiler/rustc_session/src/config/sigpipe.rs.
-            // Alaways using DEFAULT is okay since we don't support signals in Miri anyway.
+            // Always using DEFAULT is okay since we don't support signals in Miri anyway.
             let sigpipe = 2;
 
             ecx.call_function(
@@ -418,8 +422,9 @@ pub fn eval_entry<'tcx>(
     let mut ecx = match create_ecx(tcx, entry_id, entry_type, &config) {
         Ok(v) => v,
         Err(err) => {
-            err.print_backtrace();
-            panic!("Miri initialization error: {}", err.kind())
+            let (kind, backtrace) = err.into_parts();
+            backtrace.print_backtrace();
+            panic!("Miri initialization error: {kind:?}")
         }
     };
 
@@ -456,11 +461,18 @@ pub fn eval_entry<'tcx>(
             return None;
         }
         // Check for memory leaks.
-        info!("Additonal static roots: {:?}", ecx.machine.static_roots);
-        let leaks = ecx.leak_report(&ecx.machine.static_roots);
-        if leaks != 0 {
-            tcx.sess.err("the evaluated program leaked memory");
-            tcx.sess.note_without_error("pass `-Zmiri-ignore-leaks` to disable this check");
+        info!("Additional static roots: {:?}", ecx.machine.static_roots);
+        let leaks = ecx.find_leaked_allocations(&ecx.machine.static_roots);
+        if !leaks.is_empty() {
+            report_leaks(&ecx, leaks);
+            let leak_message = "the evaluated program leaked memory, pass `-Zmiri-ignore-leaks` to disable this check";
+            if ecx.machine.collect_leak_backtraces {
+                // If we are collecting leak backtraces, each leak is a distinct error diagnostic.
+                tcx.sess.note_without_error(leak_message);
+            } else {
+                // If we do not have backtraces, we just report an error without any span.
+                tcx.sess.err(leak_message);
+            };
             // Ignore the provided return code - let the reported error
             // determine the return code.
             return None;

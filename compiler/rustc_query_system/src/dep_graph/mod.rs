@@ -6,7 +6,8 @@ mod serialized;
 
 pub use dep_node::{DepKindStruct, DepNode, DepNodeParams, WorkProductId};
 pub use graph::{
-    hash_result, DepGraph, DepNodeColor, DepNodeIndex, TaskDeps, TaskDepsRef, WorkProduct,
+    hash_result, DepGraph, DepGraphData, DepNodeColor, DepNodeIndex, TaskDeps, TaskDepsRef,
+    WorkProduct,
 };
 pub use query::DepGraphQuery;
 pub use serialized::{SerializedDepGraph, SerializedDepNodeIndex};
@@ -16,14 +17,16 @@ use rustc_data_structures::profiling::SelfProfilerRef;
 use rustc_serialize::{opaque::FileEncoder, Encodable};
 use rustc_session::Session;
 
-use std::fmt;
 use std::hash::Hash;
+use std::{fmt, panic};
+
+use self::graph::{print_markframe_trace, MarkFrame};
 
 pub trait DepContext: Copy {
     type DepKind: self::DepKind;
 
     /// Create a hashing context for hashing new results.
-    fn with_stable_hashing_context<R>(&self, f: impl FnOnce(StableHashingContext<'_>) -> R) -> R;
+    fn with_stable_hashing_context<R>(self, f: impl FnOnce(StableHashingContext<'_>) -> R) -> R;
 
     /// Access the DepGraph.
     fn dep_graph(&self) -> &DepGraph<Self::DepKind>;
@@ -37,7 +40,7 @@ pub trait DepContext: Copy {
     fn dep_kind_info(&self, dep_node: Self::DepKind) -> &DepKindStruct<Self>;
 
     #[inline(always)]
-    fn fingerprint_style(&self, kind: Self::DepKind) -> FingerprintStyle {
+    fn fingerprint_style(self, kind: Self::DepKind) -> FingerprintStyle {
         let data = self.dep_kind_info(kind);
         if data.is_anon {
             return FingerprintStyle::Opaque;
@@ -47,16 +50,28 @@ pub trait DepContext: Copy {
 
     #[inline(always)]
     /// Return whether this kind always require evaluation.
-    fn is_eval_always(&self, kind: Self::DepKind) -> bool {
+    fn is_eval_always(self, kind: Self::DepKind) -> bool {
         self.dep_kind_info(kind).is_eval_always
     }
 
     /// Try to force a dep node to execute and see if it's green.
-    #[instrument(skip(self), level = "debug")]
-    fn try_force_from_dep_node(self, dep_node: DepNode<Self::DepKind>) -> bool {
+    #[inline]
+    #[instrument(skip(self, frame), level = "debug")]
+    fn try_force_from_dep_node(
+        self,
+        dep_node: DepNode<Self::DepKind>,
+        frame: Option<&MarkFrame<'_>>,
+    ) -> bool {
         let cb = self.dep_kind_info(dep_node.kind);
         if let Some(f) = cb.force_from_dep_node {
-            f(self, dep_node);
+            if let Err(value) = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                f(self, dep_node);
+            })) {
+                if !value.is::<rustc_errors::FatalErrorMarker>() {
+                    print_markframe_trace(self.dep_graph(), frame);
+                }
+                panic::resume_unwind(value)
+            }
             true
         } else {
             false
@@ -85,6 +100,15 @@ impl<T: DepContext> HasDepContext for T {
 
     fn dep_context(&self) -> &Self::DepContext {
         self
+    }
+}
+
+impl<T: HasDepContext, Q: Copy> HasDepContext for (T, Q) {
+    type DepKind = T::DepKind;
+    type DepContext = T::DepContext;
+
+    fn dep_context(&self) -> &Self::DepContext {
+        self.0.dep_context()
     }
 }
 

@@ -1,6 +1,6 @@
 use hir::GenericParamKind;
 use rustc_errors::{
-    fluent, AddToDiagnostic, Applicability, Diagnostic, DiagnosticMessage, DiagnosticStyledString,
+    AddToDiagnostic, Applicability, Diagnostic, DiagnosticMessage, DiagnosticStyledString,
     IntoDiagnosticArg, MultiSpan, SubdiagnosticMessage,
 };
 use rustc_hir as hir;
@@ -12,9 +12,10 @@ use rustc_span::symbol::kw;
 use rustc_span::Symbol;
 use rustc_span::{symbol::Ident, BytePos, Span};
 
-use crate::infer::error_reporting::nice_region_error::placeholder_error::Highlighted;
+use crate::fluent_generated as fluent;
 use crate::infer::error_reporting::{
     need_type_info::{GeneratorKindAsDiagArg, UnderspecifiedArgKind},
+    nice_region_error::placeholder_error::Highlighted,
     ObligationCauseAsDiagArg,
 };
 
@@ -26,9 +27,9 @@ pub struct OpaqueHiddenTypeDiag {
     #[primary_span]
     #[label]
     pub span: Span,
-    #[note(opaque_type)]
+    #[note(infer_opaque_type)]
     pub opaque_type: Span,
-    #[note(hidden_type)]
+    #[note(infer_hidden_type)]
     pub hidden_type: Span,
 }
 
@@ -52,7 +53,7 @@ pub struct AnnotationRequired<'a> {
 // Copy of `AnnotationRequired` for E0283
 #[derive(Diagnostic)]
 #[diag(infer_type_annotations_needed, code = "E0283")]
-pub struct AmbigousImpl<'a> {
+pub struct AmbiguousImpl<'a> {
     #[primary_span]
     pub span: Span,
     pub source_kind: &'static str,
@@ -70,7 +71,7 @@ pub struct AmbigousImpl<'a> {
 // Copy of `AnnotationRequired` for E0284
 #[derive(Diagnostic)]
 #[diag(infer_type_annotations_needed, code = "E0284")]
-pub struct AmbigousReturn<'a> {
+pub struct AmbiguousReturn<'a> {
     #[primary_span]
     pub span: Span,
     pub source_kind: &'static str,
@@ -181,18 +182,6 @@ pub enum SourceKindMultiSuggestion<'a> {
         #[suggestion_part(code = " }}")]
         end_span: Option<Span>,
     },
-}
-
-#[derive(Subdiagnostic)]
-#[suggestion(
-    infer_suggest_add_let_for_letchains,
-    style = "verbose",
-    applicability = "machine-applicable",
-    code = "let "
-)]
-pub(crate) struct SuggAddLetForLetChains {
-    #[primary_span]
-    pub span: Span,
 }
 
 impl<'a> SourceKindMultiSuggestion<'a> {
@@ -768,11 +757,11 @@ impl<'tcx> ActualImplExplNotes<'tcx> {
 pub struct TraitPlaceholderMismatch<'tcx> {
     #[primary_span]
     pub span: Span,
-    #[label(label_satisfy)]
+    #[label(infer_label_satisfy)]
     pub satisfy_span: Option<Span>,
-    #[label(label_where)]
+    #[label(infer_label_where)]
     pub where_span: Option<Span>,
-    #[label(label_dup)]
+    #[label(infer_label_dup)]
     pub dup_span: Option<Span>,
     pub def_id: String,
     pub trait_def_id: String,
@@ -808,11 +797,11 @@ pub struct RelationshipHelp;
 #[diag(infer_trait_impl_diff)]
 pub struct TraitImplDiff {
     #[primary_span]
-    #[label(found)]
+    #[label(infer_found)]
     pub sp: Span,
-    #[label(expected)]
+    #[label(infer_expected)]
     pub trait_sp: Span,
-    #[note(expected_found)]
+    #[note(infer_expected_found)]
     pub note: (),
     #[subdiagnostic]
     pub param_help: ConsiderBorrowingParamHelp,
@@ -852,10 +841,10 @@ impl AddToDiagnostic for DynTraitConstraintSuggestion {
 #[derive(Diagnostic)]
 #[diag(infer_but_calling_introduces, code = "E0772")]
 pub struct ButCallingIntroduces {
-    #[label(label1)]
+    #[label(infer_label1)]
     pub param_ty_span: Span,
     #[primary_span]
-    #[label(label2)]
+    #[label(infer_label2)]
     pub cause_span: Span,
 
     pub has_param_name: bool,
@@ -913,15 +902,15 @@ impl AddToDiagnostic for MoreTargeted {
 pub struct ButNeedsToSatisfy {
     #[primary_span]
     pub sp: Span,
-    #[label(influencer)]
+    #[label(infer_influencer)]
     pub influencer_point: Span,
-    #[label(used_here)]
+    #[label(infer_used_here)]
     pub spans: Vec<Span>,
-    #[label(require)]
+    #[label(infer_require)]
     pub require_span_as_label: Option<Span>,
-    #[note(require)]
+    #[note(infer_require)]
     pub require_span_as_note: Option<Span>,
-    #[note(introduced_by_bound)]
+    #[note(infer_introduced_by_bound)]
     pub bound: Option<Span>,
 
     #[subdiagnostic]
@@ -932,4 +921,580 @@ pub struct ButNeedsToSatisfy {
     pub spans_empty: bool,
     pub has_lifetime: bool,
     pub lifetime: String,
+}
+
+#[derive(Diagnostic)]
+#[diag(infer_outlives_content, code = "E0312")]
+pub struct OutlivesContent<'a> {
+    #[primary_span]
+    pub span: Span,
+    #[subdiagnostic]
+    pub notes: Vec<note_and_explain::RegionExplanation<'a>>,
+}
+
+#[derive(Diagnostic)]
+#[diag(infer_outlives_bound, code = "E0476")]
+pub struct OutlivesBound<'a> {
+    #[primary_span]
+    pub span: Span,
+    #[subdiagnostic]
+    pub notes: Vec<note_and_explain::RegionExplanation<'a>>,
+}
+
+#[derive(Diagnostic)]
+#[diag(infer_fulfill_req_lifetime, code = "E0477")]
+pub struct FulfillReqLifetime<'a> {
+    #[primary_span]
+    pub span: Span,
+    pub ty: Ty<'a>,
+    #[subdiagnostic]
+    pub note: Option<note_and_explain::RegionExplanation<'a>>,
+}
+
+#[derive(Diagnostic)]
+#[diag(infer_lf_bound_not_satisfied, code = "E0478")]
+pub struct LfBoundNotSatisfied<'a> {
+    #[primary_span]
+    pub span: Span,
+    #[subdiagnostic]
+    pub notes: Vec<note_and_explain::RegionExplanation<'a>>,
+}
+
+#[derive(Diagnostic)]
+#[diag(infer_ref_longer_than_data, code = "E0491")]
+pub struct RefLongerThanData<'a> {
+    #[primary_span]
+    pub span: Span,
+    pub ty: Ty<'a>,
+    #[subdiagnostic]
+    pub notes: Vec<note_and_explain::RegionExplanation<'a>>,
+}
+
+#[derive(Subdiagnostic)]
+pub enum WhereClauseSuggestions {
+    #[suggestion(
+        infer_where_remove,
+        code = "",
+        applicability = "machine-applicable",
+        style = "verbose"
+    )]
+    Remove {
+        #[primary_span]
+        span: Span,
+    },
+    #[suggestion(
+        infer_where_copy_predicates,
+        code = "{space}where {trait_predicates}",
+        applicability = "machine-applicable",
+        style = "verbose"
+    )]
+    CopyPredicates {
+        #[primary_span]
+        span: Span,
+        space: &'static str,
+        trait_predicates: String,
+    },
+}
+
+#[derive(Subdiagnostic)]
+pub enum SuggestRemoveSemiOrReturnBinding {
+    #[multipart_suggestion(infer_srs_remove_and_box, applicability = "machine-applicable")]
+    RemoveAndBox {
+        #[suggestion_part(code = "Box::new(")]
+        first_lo: Span,
+        #[suggestion_part(code = ")")]
+        first_hi: Span,
+        #[suggestion_part(code = "Box::new(")]
+        second_lo: Span,
+        #[suggestion_part(code = ")")]
+        second_hi: Span,
+        #[suggestion_part(code = "")]
+        sp: Span,
+    },
+    #[suggestion(
+        infer_srs_remove,
+        style = "short",
+        code = "",
+        applicability = "machine-applicable"
+    )]
+    Remove {
+        #[primary_span]
+        sp: Span,
+    },
+    #[suggestion(
+        infer_srs_add,
+        style = "verbose",
+        code = "{code}",
+        applicability = "maybe-incorrect"
+    )]
+    Add {
+        #[primary_span]
+        sp: Span,
+        code: String,
+        ident: Ident,
+    },
+    #[note(infer_srs_add_one)]
+    AddOne {
+        #[primary_span]
+        spans: MultiSpan,
+    },
+}
+
+#[derive(Subdiagnostic)]
+pub enum ConsiderAddingAwait {
+    #[help(infer_await_both_futures)]
+    BothFuturesHelp,
+    #[multipart_suggestion(infer_await_both_futures, applicability = "maybe-incorrect")]
+    BothFuturesSugg {
+        #[suggestion_part(code = ".await")]
+        first: Span,
+        #[suggestion_part(code = ".await")]
+        second: Span,
+    },
+    #[suggestion(
+        infer_await_future,
+        code = ".await",
+        style = "verbose",
+        applicability = "maybe-incorrect"
+    )]
+    FutureSugg {
+        #[primary_span]
+        span: Span,
+    },
+    #[note(infer_await_note)]
+    FutureSuggNote {
+        #[primary_span]
+        span: Span,
+    },
+    #[multipart_suggestion(
+        infer_await_future,
+        style = "verbose",
+        applicability = "maybe-incorrect"
+    )]
+    FutureSuggMultiple {
+        #[suggestion_part(code = ".await")]
+        spans: Vec<Span>,
+    },
+}
+
+#[derive(Diagnostic)]
+pub enum PlaceholderRelationLfNotSatisfied {
+    #[diag(infer_lf_bound_not_satisfied)]
+    HasBoth {
+        #[primary_span]
+        span: Span,
+        #[note(infer_prlf_defined_with_sub)]
+        sub_span: Span,
+        #[note(infer_prlf_must_outlive_with_sup)]
+        sup_span: Span,
+        sub_symbol: Symbol,
+        sup_symbol: Symbol,
+        #[note(infer_prlf_known_limitation)]
+        note: (),
+    },
+    #[diag(infer_lf_bound_not_satisfied)]
+    HasSub {
+        #[primary_span]
+        span: Span,
+        #[note(infer_prlf_defined_with_sub)]
+        sub_span: Span,
+        #[note(infer_prlf_must_outlive_without_sup)]
+        sup_span: Span,
+        sub_symbol: Symbol,
+        #[note(infer_prlf_known_limitation)]
+        note: (),
+    },
+    #[diag(infer_lf_bound_not_satisfied)]
+    HasSup {
+        #[primary_span]
+        span: Span,
+        #[note(infer_prlf_defined_without_sub)]
+        sub_span: Span,
+        #[note(infer_prlf_must_outlive_with_sup)]
+        sup_span: Span,
+        sup_symbol: Symbol,
+        #[note(infer_prlf_known_limitation)]
+        note: (),
+    },
+    #[diag(infer_lf_bound_not_satisfied)]
+    HasNone {
+        #[primary_span]
+        span: Span,
+        #[note(infer_prlf_defined_without_sub)]
+        sub_span: Span,
+        #[note(infer_prlf_must_outlive_without_sup)]
+        sup_span: Span,
+        #[note(infer_prlf_known_limitation)]
+        note: (),
+    },
+    #[diag(infer_lf_bound_not_satisfied)]
+    OnlyPrimarySpan {
+        #[primary_span]
+        span: Span,
+        #[note(infer_prlf_known_limitation)]
+        note: (),
+    },
+}
+
+#[derive(Diagnostic)]
+#[diag(infer_opaque_captures_lifetime, code = "E0700")]
+pub struct OpaqueCapturesLifetime<'tcx> {
+    #[primary_span]
+    pub span: Span,
+    #[label]
+    pub opaque_ty_span: Span,
+    pub opaque_ty: Ty<'tcx>,
+}
+
+#[derive(Subdiagnostic)]
+pub enum FunctionPointerSuggestion<'a> {
+    #[suggestion(
+        infer_fps_use_ref,
+        code = "&{fn_name}",
+        style = "verbose",
+        applicability = "maybe-incorrect"
+    )]
+    UseRef {
+        #[primary_span]
+        span: Span,
+        #[skip_arg]
+        fn_name: String,
+    },
+    #[suggestion(
+        infer_fps_remove_ref,
+        code = "{fn_name}",
+        style = "verbose",
+        applicability = "maybe-incorrect"
+    )]
+    RemoveRef {
+        #[primary_span]
+        span: Span,
+        #[skip_arg]
+        fn_name: String,
+    },
+    #[suggestion(
+        infer_fps_cast,
+        code = "&({fn_name} as {sig})",
+        style = "verbose",
+        applicability = "maybe-incorrect"
+    )]
+    CastRef {
+        #[primary_span]
+        span: Span,
+        #[skip_arg]
+        fn_name: String,
+        #[skip_arg]
+        sig: Binder<'a, FnSig<'a>>,
+    },
+    #[suggestion(
+        infer_fps_cast,
+        code = "{fn_name} as {sig}",
+        style = "verbose",
+        applicability = "maybe-incorrect"
+    )]
+    Cast {
+        #[primary_span]
+        span: Span,
+        #[skip_arg]
+        fn_name: String,
+        #[skip_arg]
+        sig: Binder<'a, FnSig<'a>>,
+    },
+    #[suggestion(
+        infer_fps_cast_both,
+        code = "{fn_name} as {found_sig}",
+        style = "hidden",
+        applicability = "maybe-incorrect"
+    )]
+    CastBoth {
+        #[primary_span]
+        span: Span,
+        #[skip_arg]
+        fn_name: String,
+        #[skip_arg]
+        found_sig: Binder<'a, FnSig<'a>>,
+        expected_sig: Binder<'a, FnSig<'a>>,
+    },
+    #[suggestion(
+        infer_fps_cast_both,
+        code = "&({fn_name} as {found_sig})",
+        style = "hidden",
+        applicability = "maybe-incorrect"
+    )]
+    CastBothRef {
+        #[primary_span]
+        span: Span,
+        #[skip_arg]
+        fn_name: String,
+        #[skip_arg]
+        found_sig: Binder<'a, FnSig<'a>>,
+        expected_sig: Binder<'a, FnSig<'a>>,
+    },
+}
+
+#[derive(Subdiagnostic)]
+#[note(infer_fps_items_are_distinct)]
+pub struct FnItemsAreDistinct;
+
+#[derive(Subdiagnostic)]
+#[note(infer_fn_uniq_types)]
+pub struct FnUniqTypes;
+
+#[derive(Subdiagnostic)]
+#[help(infer_fn_consider_casting)]
+pub struct FnConsiderCasting {
+    pub casting: String,
+}
+
+#[derive(Subdiagnostic)]
+pub enum SuggestAccessingField<'a> {
+    #[suggestion(
+        infer_suggest_accessing_field,
+        code = "{snippet}.{name}",
+        applicability = "maybe-incorrect"
+    )]
+    Safe {
+        #[primary_span]
+        span: Span,
+        snippet: String,
+        name: Symbol,
+        ty: Ty<'a>,
+    },
+    #[suggestion(
+        infer_suggest_accessing_field,
+        code = "unsafe {{ {snippet}.{name} }}",
+        applicability = "maybe-incorrect"
+    )]
+    Unsafe {
+        #[primary_span]
+        span: Span,
+        snippet: String,
+        name: Symbol,
+        ty: Ty<'a>,
+    },
+}
+
+#[derive(Subdiagnostic)]
+pub enum SuggestBoxingForReturnImplTrait {
+    #[multipart_suggestion(infer_sbfrit_change_return_type, applicability = "maybe-incorrect")]
+    ChangeReturnType {
+        #[suggestion_part(code = "Box<dyn")]
+        start_sp: Span,
+        #[suggestion_part(code = ">")]
+        end_sp: Span,
+    },
+    #[multipart_suggestion(infer_sbfrit_box_return_expr, applicability = "maybe-incorrect")]
+    BoxReturnExpr {
+        #[suggestion_part(code = "Box::new(")]
+        starts: Vec<Span>,
+        #[suggestion_part(code = ")")]
+        ends: Vec<Span>,
+    },
+}
+
+#[derive(Subdiagnostic)]
+#[multipart_suggestion(infer_stp_wrap_one, applicability = "maybe-incorrect")]
+pub struct SuggestTuplePatternOne {
+    pub variant: String,
+    #[suggestion_part(code = "{variant}(")]
+    pub span_low: Span,
+    #[suggestion_part(code = ")")]
+    pub span_high: Span,
+}
+
+pub struct SuggestTuplePatternMany {
+    pub path: String,
+    pub cause_span: Span,
+    pub compatible_variants: Vec<String>,
+}
+
+impl AddToDiagnostic for SuggestTuplePatternMany {
+    fn add_to_diagnostic_with<F>(self, diag: &mut rustc_errors::Diagnostic, f: F)
+    where
+        F: Fn(&mut Diagnostic, SubdiagnosticMessage) -> SubdiagnosticMessage,
+    {
+        diag.set_arg("path", self.path);
+        let message = f(diag, crate::fluent_generated::infer_stp_wrap_many.into());
+        diag.multipart_suggestions(
+            message,
+            self.compatible_variants.into_iter().map(|variant| {
+                vec![
+                    (self.cause_span.shrink_to_lo(), format!("{}(", variant)),
+                    (self.cause_span.shrink_to_hi(), ")".to_string()),
+                ]
+            }),
+            rustc_errors::Applicability::MaybeIncorrect,
+        );
+    }
+}
+
+#[derive(Subdiagnostic)]
+pub enum TypeErrorAdditionalDiags {
+    #[suggestion(
+        infer_meant_byte_literal,
+        code = "b'{code}'",
+        applicability = "machine-applicable"
+    )]
+    MeantByteLiteral {
+        #[primary_span]
+        span: Span,
+        code: String,
+    },
+    #[suggestion(
+        infer_meant_char_literal,
+        code = "'{code}'",
+        applicability = "machine-applicable"
+    )]
+    MeantCharLiteral {
+        #[primary_span]
+        span: Span,
+        code: String,
+    },
+    #[suggestion(
+        infer_meant_str_literal,
+        code = "\"{code}\"",
+        applicability = "machine-applicable"
+    )]
+    MeantStrLiteral {
+        #[primary_span]
+        span: Span,
+        code: String,
+    },
+    #[suggestion(
+        infer_consider_specifying_length,
+        code = "{length}",
+        applicability = "maybe-incorrect"
+    )]
+    ConsiderSpecifyingLength {
+        #[primary_span]
+        span: Span,
+        length: u64,
+    },
+    #[note(infer_try_cannot_convert)]
+    TryCannotConvert { found: String, expected: String },
+    #[suggestion(infer_tuple_trailing_comma, code = ",", applicability = "machine-applicable")]
+    TupleOnlyComma {
+        #[primary_span]
+        span: Span,
+    },
+    #[multipart_suggestion(infer_tuple_trailing_comma, applicability = "machine-applicable")]
+    TupleAlsoParentheses {
+        #[suggestion_part(code = "(")]
+        span_low: Span,
+        #[suggestion_part(code = ",)")]
+        span_high: Span,
+    },
+    #[suggestion(
+        infer_suggest_add_let_for_letchains,
+        style = "verbose",
+        applicability = "machine-applicable",
+        code = "let "
+    )]
+    AddLetForLetChains {
+        #[primary_span]
+        span: Span,
+    },
+}
+
+#[derive(Diagnostic)]
+pub enum ObligationCauseFailureCode {
+    #[diag(infer_oc_method_compat, code = "E0308")]
+    MethodCompat {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_type_compat, code = "E0308")]
+    TypeCompat {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_const_compat, code = "E0308")]
+    ConstCompat {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_try_compat, code = "E0308")]
+    TryCompat {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_match_compat, code = "E0308")]
+    MatchCompat {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_if_else_different, code = "E0308")]
+    IfElseDifferent {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_no_else, code = "E0317")]
+    NoElse {
+        #[primary_span]
+        span: Span,
+    },
+    #[diag(infer_oc_no_diverge, code = "E0308")]
+    NoDiverge {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_fn_main_correct_type, code = "E0580")]
+    FnMainCorrectType {
+        #[primary_span]
+        span: Span,
+    },
+    #[diag(infer_oc_fn_start_correct_type, code = "E0308")]
+    FnStartCorrectType {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_intrinsic_correct_type, code = "E0308")]
+    IntrinsicCorrectType {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_method_correct_type, code = "E0308")]
+    MethodCorrectType {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_closure_selfref, code = "E0644")]
+    ClosureSelfref {
+        #[primary_span]
+        span: Span,
+    },
+    #[diag(infer_oc_cant_coerce, code = "E0308")]
+    CantCoerce {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
+    #[diag(infer_oc_generic, code = "E0308")]
+    Generic {
+        #[primary_span]
+        span: Span,
+        #[subdiagnostic]
+        subdiags: Vec<TypeErrorAdditionalDiags>,
+    },
 }

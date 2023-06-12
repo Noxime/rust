@@ -2,7 +2,7 @@
 #![feature(let_chains)]
 #![feature(min_specialization)]
 #![feature(never_type)]
-#![feature(once_cell)]
+#![feature(lazy_cell)]
 #![feature(option_get_or_insert_default)]
 #![feature(rustc_attrs)]
 #![feature(map_many_mut)]
@@ -17,6 +17,9 @@ pub mod errors;
 
 #[macro_use]
 extern crate tracing;
+
+use rustc_errors::{DiagnosticMessage, SubdiagnosticMessage};
+use rustc_fluent_macro::fluent_messages;
 
 pub mod cgu_reuse_tracker;
 pub mod utils;
@@ -38,6 +41,8 @@ pub use session::*;
 pub mod output;
 
 pub use getopts;
+
+fluent_messages! { "../messages.ftl" }
 
 /// Requirements for a `StableHashingContext` to be used in this crate.
 /// This is a hack to allow using the `HashStable_Generic` derive macro

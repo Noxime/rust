@@ -1,6 +1,5 @@
 #![unstable(issue = "none", feature = "windows_stdio")]
 
-use crate::char::decode_utf16;
 use crate::cmp;
 use crate::io;
 use crate::mem::MaybeUninit;
@@ -11,6 +10,9 @@ use crate::sys::c;
 use crate::sys::cvt;
 use crate::sys::handle::Handle;
 use core::str::utf8_char_width;
+
+#[cfg(test)]
+mod tests;
 
 // Don't cache handles but get them fresh for every read/write. This allows us to track changes to
 // the value over time (such as if a process calls `SetStdHandle` while it's running). See #40490.
@@ -170,14 +172,27 @@ fn write(
 }
 
 fn write_valid_utf8_to_console(handle: c::HANDLE, utf8: &str) -> io::Result<usize> {
+    debug_assert!(!utf8.is_empty());
+
     let mut utf16 = [MaybeUninit::<u16>::uninit(); MAX_BUFFER_SIZE / 2];
-    let mut len_utf16 = 0;
-    for (chr, dest) in utf8.encode_utf16().zip(utf16.iter_mut()) {
-        *dest = MaybeUninit::new(chr);
-        len_utf16 += 1;
-    }
-    // Safety: We've initialized `len_utf16` values.
-    let utf16: &[u16] = unsafe { MaybeUninit::slice_assume_init_ref(&utf16[..len_utf16]) };
+    let utf8 = &utf8[..utf8.floor_char_boundary(utf16.len())];
+
+    let utf16: &[u16] = unsafe {
+        // Note that this theoretically checks validity twice in the (most common) case
+        // where the underlying byte sequence is valid utf-8 (given the check in `write()`).
+        let result = c::MultiByteToWideChar(
+            c::CP_UTF8,                      // CodePage
+            c::MB_ERR_INVALID_CHARS,         // dwFlags
+            utf8.as_ptr(),                   // lpMultiByteStr
+            utf8.len() as c::c_int,          // cbMultiByte
+            utf16.as_mut_ptr() as c::LPWSTR, // lpWideCharStr
+            utf16.len() as c::c_int,         // cchWideChar
+        );
+        assert!(result != 0, "Unexpected error in MultiByteToWideChar");
+
+        // Safety: MultiByteToWideChar initializes `result` values.
+        MaybeUninit::slice_assume_init_ref(&utf16[..result as usize])
+    };
 
     let mut written = write_u16s(handle, &utf16)?;
 
@@ -190,8 +205,8 @@ fn write_valid_utf8_to_console(handle: c::HANDLE, utf8: &str) -> io::Result<usiz
         // a missing surrogate can be produced (and also because of the UTF-8 validation above),
         // write the missing surrogate out now.
         // Buffering it would mean we have to lie about the number of bytes written.
-        let first_char_remaining = utf16[written];
-        if first_char_remaining >= 0xDCEE && first_char_remaining <= 0xDFFF {
+        let first_code_unit_remaining = utf16[written];
+        if first_code_unit_remaining >= 0xDCEE && first_code_unit_remaining <= 0xDFFF {
             // low surrogate
             // We just hope this works, and give up otherwise
             let _ = write_u16s(handle, &utf16[written..written + 1]);
@@ -213,6 +228,7 @@ fn write_valid_utf8_to_console(handle: c::HANDLE, utf8: &str) -> io::Result<usiz
 }
 
 fn write_u16s(handle: c::HANDLE, data: &[u16]) -> io::Result<usize> {
+    debug_assert!(data.len() < u32::MAX as usize);
     let mut written = 0;
     cvt(unsafe {
         c::WriteConsoleW(
@@ -331,7 +347,7 @@ fn read_u16s(handle: c::HANDLE, buf: &mut [MaybeUninit<u16>]) -> io::Result<usiz
     // See #38274 and https://stackoverflow.com/questions/43836040/win-api-readconsole.
     const CTRL_Z: u16 = 0x1A;
     const CTRL_Z_MASK: c::ULONG = 1 << CTRL_Z;
-    let mut input_control = c::CONSOLE_READCONSOLE_CONTROL {
+    let input_control = c::CONSOLE_READCONSOLE_CONTROL {
         nLength: crate::mem::size_of::<c::CONSOLE_READCONSOLE_CONTROL>() as c::ULONG,
         nInitialChars: 0,
         dwCtrlWakeupMask: CTRL_Z_MASK,
@@ -347,7 +363,7 @@ fn read_u16s(handle: c::HANDLE, buf: &mut [MaybeUninit<u16>]) -> io::Result<usiz
                 buf.as_mut_ptr() as c::LPVOID,
                 buf.len() as u32,
                 &mut amount,
-                &mut input_control as c::PCONSOLE_READCONSOLE_CONTROL,
+                &input_control,
             )
         })?;
 
@@ -366,26 +382,36 @@ fn read_u16s(handle: c::HANDLE, buf: &mut [MaybeUninit<u16>]) -> io::Result<usiz
     Ok(amount as usize)
 }
 
-#[allow(unused)]
 fn utf16_to_utf8(utf16: &[u16], utf8: &mut [u8]) -> io::Result<usize> {
-    let mut written = 0;
-    for chr in decode_utf16(utf16.iter().cloned()) {
-        match chr {
-            Ok(chr) => {
-                chr.encode_utf8(&mut utf8[written..]);
-                written += chr.len_utf8();
-            }
-            Err(_) => {
-                // We can't really do any better than forget all data and return an error.
-                return Err(io::const_io_error!(
-                    io::ErrorKind::InvalidData,
-                    "Windows stdin in console mode does not support non-UTF-16 input; \
-                     encountered unpaired surrogate",
-                ));
-            }
-        }
+    debug_assert!(utf16.len() <= c::c_int::MAX as usize);
+    debug_assert!(utf8.len() <= c::c_int::MAX as usize);
+
+    if utf16.is_empty() {
+        return Ok(0);
     }
-    Ok(written)
+
+    let result = unsafe {
+        c::WideCharToMultiByte(
+            c::CP_UTF8,              // CodePage
+            c::WC_ERR_INVALID_CHARS, // dwFlags
+            utf16.as_ptr(),          // lpWideCharStr
+            utf16.len() as c::c_int, // cchWideChar
+            utf8.as_mut_ptr(),       // lpMultiByteStr
+            utf8.len() as c::c_int,  // cbMultiByte
+            ptr::null(),             // lpDefaultChar
+            ptr::null_mut(),         // lpUsedDefaultChar
+        )
+    };
+    if result == 0 {
+        // We can't really do any better than forget all data and return an error.
+        Err(io::const_io_error!(
+            io::ErrorKind::InvalidData,
+            "Windows stdin in console mode does not support non-UTF-16 input; \
+            encountered unpaired surrogate",
+        ))
+    } else {
+        Ok(result as usize)
+    }
 }
 
 impl IncompleteUtf8 {

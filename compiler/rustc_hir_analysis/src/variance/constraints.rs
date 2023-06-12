@@ -92,7 +92,7 @@ impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
 
     fn build_constraints_for_item(&mut self, def_id: LocalDefId) {
         let tcx = self.tcx();
-        debug!("build_constraints_for_item({})", tcx.def_path_str(def_id.to_def_id()));
+        debug!("build_constraints_for_item({})", tcx.def_path_str(def_id));
 
         // Skip items with no generics - there's nothing to infer in them.
         if tcx.generics_of(def_id).count() == 0 {
@@ -101,7 +101,7 @@ impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
 
         let inferred_start = self.terms_cx.inferred_starts[&def_id];
         let current_item = &CurrentItem { inferred_start };
-        match tcx.type_of(def_id).kind() {
+        match tcx.type_of(def_id).subst_identity().kind() {
             ty::Adt(def, _) => {
                 // Not entirely obvious: constraints on structs/enums do not
                 // affect the variance of their type parameters. See discussion
@@ -112,7 +112,7 @@ impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
                 for field in def.all_fields() {
                     self.add_constraints_from_ty(
                         current_item,
-                        tcx.type_of(field.did),
+                        tcx.type_of(field.did).subst_identity(),
                         self.covariant,
                     );
                 }
@@ -408,6 +408,8 @@ impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
                 // Late-bound regions do not get substituted the same
                 // way early-bound regions do, so we skip them here.
             }
+
+            ty::ReError(_) => {}
 
             ty::ReFree(..) | ty::ReVar(..) | ty::RePlaceholder(..) | ty::ReErased => {
                 // We don't expect to see anything but 'static or bound

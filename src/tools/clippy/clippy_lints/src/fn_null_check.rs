@@ -25,7 +25,7 @@ declare_clippy_lint! {
     ///
     /// if fn_ptr.is_none() { ... }
     /// ```
-    #[clippy::version = "1.67.0"]
+    #[clippy::version = "1.68.0"]
     pub FN_NULL_CHECK,
     correctness,
     "`fn()` type assumed to be nullable"
@@ -89,11 +89,7 @@ impl<'tcx> LateLintPass<'tcx> for FnNullCheck {
 
                     // Catching:
                     // (fn_ptr as *<const/mut> <ty>) == <const that evaluates to null_ptr>
-                    _ if matches!(
-                        constant(cx, cx.typeck_results(), to_check),
-                        Some((Constant::RawPtr(0), _))
-                    ) =>
-                    {
+                    _ if matches!(constant(cx, cx.typeck_results(), to_check), Some(Constant::RawPtr(0))) => {
                         lint_expr(cx, expr);
                     },
 

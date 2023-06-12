@@ -15,8 +15,6 @@ use rustc_middle::ty::{self, TyCtxt};
 use rustc_span::symbol::{kw, sym, Symbol};
 use rustc_target::spec::abi::Abi;
 
-use std::iter;
-
 fn equate_intrinsic_type<'tcx>(
     tcx: TyCtxt<'tcx>,
     it: &hir::ForeignItem<'_>,
@@ -61,6 +59,7 @@ fn equate_intrinsic_type<'tcx>(
         require_same_types(
             tcx,
             &cause,
+            ty::ParamEnv::empty(), // FIXME: do all intrinsics have an empty param env?
             tcx.mk_fn_ptr(tcx.fn_sig(it.owner_id).subst_identity()),
             fty,
         );
@@ -122,10 +121,11 @@ pub fn intrinsic_operation_unsafety(tcx: TyCtxt<'_>, intrinsic_id: DefId) -> hir
     if has_safe_attr != is_in_list {
         tcx.sess.struct_span_err(
             tcx.def_span(intrinsic_id),
-            DiagnosticMessage::Str(format!(
-                    "intrinsic safety mismatch between list of intrinsics within the compiler and core library intrinsics for intrinsic `{}`",
-                    tcx.item_name(intrinsic_id)
-        ))).emit();
+            DiagnosticMessage::from(format!(
+                "intrinsic safety mismatch between list of intrinsics within the compiler and core library intrinsics for intrinsic `{}`",
+                tcx.item_name(intrinsic_id)
+            )
+        )).emit();
     }
 
     is_in_list
@@ -139,25 +139,23 @@ pub fn check_intrinsic_type(tcx: TyCtxt<'_>, it: &hir::ForeignItem<'_>) {
     let intrinsic_name = tcx.item_name(intrinsic_id);
     let name_str = intrinsic_name.as_str();
 
-    let bound_vars = tcx.mk_bound_variable_kinds(
-        [
-            ty::BoundVariableKind::Region(ty::BrAnon(0, None)),
-            ty::BoundVariableKind::Region(ty::BrEnv),
-        ]
-        .iter()
-        .copied(),
-    );
+    let bound_vars = tcx.mk_bound_variable_kinds(&[
+        ty::BoundVariableKind::Region(ty::BrAnon(None)),
+        ty::BoundVariableKind::Region(ty::BrEnv),
+    ]);
     let mk_va_list_ty = |mutbl| {
         tcx.lang_items().va_list().map(|did| {
-            let region = tcx.mk_region(ty::ReLateBound(
+            let region = ty::Region::new_late_bound(
+                tcx,
                 ty::INNERMOST,
-                ty::BoundRegion { var: ty::BoundVar::from_u32(0), kind: ty::BrAnon(0, None) },
-            ));
-            let env_region = tcx.mk_region(ty::ReLateBound(
+                ty::BoundRegion { var: ty::BoundVar::from_u32(0), kind: ty::BrAnon(None) },
+            );
+            let env_region = ty::Region::new_late_bound(
+                tcx,
                 ty::INNERMOST,
                 ty::BoundRegion { var: ty::BoundVar::from_u32(1), kind: ty::BrEnv },
-            ));
-            let va_list_ty = tcx.bound_type_of(did).subst(tcx, &[region.into()]);
+            );
+            let va_list_ty = tcx.type_of(did).subst(tcx, &[region.into()]);
             (tcx.mk_ref(env_region, ty::TypeAndMut { ty: va_list_ty, mutbl }), va_list_ty)
         })
     };
@@ -171,7 +169,7 @@ pub fn check_intrinsic_type(tcx: TyCtxt<'_>, it: &hir::ForeignItem<'_>) {
             "cxchg" | "cxchgweak" => (
                 1,
                 vec![tcx.mk_mut_ptr(param(0)), param(0), param(0)],
-                tcx.intern_tup(&[param(0), tcx.types.bool]),
+                tcx.mk_tup(&[param(0), tcx.types.bool]),
             ),
             "load" => (1, vec![tcx.mk_imm_ptr(param(0))], param(0)),
             "store" => (1, vec![tcx.mk_mut_ptr(param(0)), param(0)], tcx.mk_unit()),
@@ -203,7 +201,7 @@ pub fn check_intrinsic_type(tcx: TyCtxt<'_>, it: &hir::ForeignItem<'_>) {
             | sym::assert_zero_valid
             | sym::assert_mem_uninitialized_valid => (1, Vec::new(), tcx.mk_unit()),
             sym::forget => (1, vec![param(0)], tcx.mk_unit()),
-            sym::transmute => (2, vec![param(0)], param(1)),
+            sym::transmute | sym::transmute_unchecked => (2, vec![param(0)], param(1)),
             sym::prefetch_read_data
             | sym::prefetch_write_data
             | sym::prefetch_read_instruction
@@ -219,8 +217,9 @@ pub fn check_intrinsic_type(tcx: TyCtxt<'_>, it: &hir::ForeignItem<'_>) {
             sym::needs_drop => (1, Vec::new(), tcx.types.bool),
 
             sym::type_name => (1, Vec::new(), tcx.mk_static_str()),
-            sym::type_id => (1, Vec::new(), tcx.types.u64),
-            sym::offset | sym::arith_offset => (
+            sym::type_id => (1, Vec::new(), tcx.types.u128),
+            sym::offset => (2, vec![param(0), param(1)], param(0)),
+            sym::arith_offset => (
                 1,
                 vec![
                     tcx.mk_ptr(ty::TypeAndMut { ty: param(0), mutbl: hir::Mutability::Not }),
@@ -228,6 +227,21 @@ pub fn check_intrinsic_type(tcx: TyCtxt<'_>, it: &hir::ForeignItem<'_>) {
                 ],
                 tcx.mk_ptr(ty::TypeAndMut { ty: param(0), mutbl: hir::Mutability::Not }),
             ),
+            sym::option_payload_ptr => {
+                let option_def_id = tcx.require_lang_item(hir::LangItem::Option, None);
+                let p0 = param(0);
+                (
+                    1,
+                    vec![tcx.mk_ptr(ty::TypeAndMut {
+                        ty: tcx.mk_adt(
+                            tcx.adt_def(option_def_id),
+                            tcx.mk_substs_from_iter([ty::GenericArg::from(p0)].into_iter()),
+                        ),
+                        mutbl: hir::Mutability::Not,
+                    })],
+                    tcx.mk_ptr(ty::TypeAndMut { ty: p0, mutbl: hir::Mutability::Not }),
+                )
+            }
             sym::ptr_mask => (
                 1,
                 vec![
@@ -306,6 +320,8 @@ pub fn check_intrinsic_type(tcx: TyCtxt<'_>, it: &hir::ForeignItem<'_>) {
             sym::nearbyintf64 => (0, vec![tcx.types.f64], tcx.types.f64),
             sym::roundf32 => (0, vec![tcx.types.f32], tcx.types.f32),
             sym::roundf64 => (0, vec![tcx.types.f64], tcx.types.f64),
+            sym::roundevenf32 => (0, vec![tcx.types.f32], tcx.types.f32),
+            sym::roundevenf64 => (0, vec![tcx.types.f64], tcx.types.f64),
 
             sym::volatile_load | sym::unaligned_volatile_load => {
                 (1, vec![tcx.mk_imm_ptr(param(0))], param(0))
@@ -323,7 +339,7 @@ pub fn check_intrinsic_type(tcx: TyCtxt<'_>, it: &hir::ForeignItem<'_>) {
             | sym::bitreverse => (1, vec![param(0)], param(0)),
 
             sym::add_with_overflow | sym::sub_with_overflow | sym::mul_with_overflow => {
-                (1, vec![param(0), param(0)], tcx.intern_tup(&[param(0), tcx.types.bool]))
+                (1, vec![param(0), param(0)], tcx.mk_tup(&[param(0), tcx.types.bool]))
             }
 
             sym::ptr_guaranteed_cmp => {
@@ -367,34 +383,39 @@ pub fn check_intrinsic_type(tcx: TyCtxt<'_>, it: &hir::ForeignItem<'_>) {
             sym::likely => (0, vec![tcx.types.bool], tcx.types.bool),
             sym::unlikely => (0, vec![tcx.types.bool], tcx.types.bool),
 
+            sym::read_via_copy => (1, vec![tcx.mk_imm_ptr(param(0))], param(0)),
+            sym::write_via_move => (1, vec![tcx.mk_mut_ptr(param(0)), param(0)], tcx.mk_unit()),
+
             sym::discriminant_value => {
                 let assoc_items = tcx.associated_item_def_ids(
                     tcx.require_lang_item(hir::LangItem::DiscriminantKind, None),
                 );
                 let discriminant_def_id = assoc_items[0];
 
-                let br =
-                    ty::BoundRegion { var: ty::BoundVar::from_u32(0), kind: ty::BrAnon(0, None) };
+                let br = ty::BoundRegion { var: ty::BoundVar::from_u32(0), kind: ty::BrAnon(None) };
                 (
                     1,
                     vec![
-                        tcx.mk_imm_ref(tcx.mk_region(ty::ReLateBound(ty::INNERMOST, br)), param(0)),
+                        tcx.mk_imm_ref(
+                            ty::Region::new_late_bound(tcx, ty::INNERMOST, br),
+                            param(0),
+                        ),
                     ],
-                    tcx.mk_projection(discriminant_def_id, tcx.mk_substs([param(0).into()].iter())),
+                    tcx.mk_projection(discriminant_def_id, tcx.mk_substs(&[param(0).into()])),
                 )
             }
 
             kw::Try => {
                 let mut_u8 = tcx.mk_mut_ptr(tcx.types.u8);
                 let try_fn_ty = ty::Binder::dummy(tcx.mk_fn_sig(
-                    iter::once(mut_u8),
+                    [mut_u8],
                     tcx.mk_unit(),
                     false,
                     hir::Unsafety::Normal,
                     Abi::Rust,
                 ));
                 let catch_fn_ty = ty::Binder::dummy(tcx.mk_fn_sig(
-                    [mut_u8, mut_u8].iter().cloned(),
+                    [mut_u8, mut_u8],
                     tcx.mk_unit(),
                     false,
                     hir::Unsafety::Normal,
@@ -428,10 +449,9 @@ pub fn check_intrinsic_type(tcx: TyCtxt<'_>, it: &hir::ForeignItem<'_>) {
             sym::nontemporal_store => (1, vec![tcx.mk_mut_ptr(param(0)), param(0)], tcx.mk_unit()),
 
             sym::raw_eq => {
-                let br =
-                    ty::BoundRegion { var: ty::BoundVar::from_u32(0), kind: ty::BrAnon(0, None) };
+                let br = ty::BoundRegion { var: ty::BoundVar::from_u32(0), kind: ty::BrAnon(None) };
                 let param_ty =
-                    tcx.mk_imm_ref(tcx.mk_region(ty::ReLateBound(ty::INNERMOST, br)), param(0));
+                    tcx.mk_imm_ref(ty::Region::new_late_bound(tcx, ty::INNERMOST, br), param(0));
                 (1, vec![param_ty; 2], tcx.types.bool)
             }
 
@@ -450,7 +470,7 @@ pub fn check_intrinsic_type(tcx: TyCtxt<'_>, it: &hir::ForeignItem<'_>) {
         };
         (n_tps, 0, inputs, output, unsafety)
     };
-    let sig = tcx.mk_fn_sig(inputs.into_iter(), output, false, unsafety, Abi::RustIntrinsic);
+    let sig = tcx.mk_fn_sig(inputs, output, false, unsafety, Abi::RustIntrinsic);
     let sig = ty::Binder::bind_with_vars(sig, bound_vars);
     equate_intrinsic_type(tcx, it, n_tps, n_lts, sig)
 }
@@ -536,25 +556,19 @@ pub fn check_platform_intrinsic_type(tcx: TyCtxt<'_>, it: &hir::ForeignItem<'_>)
                 Err(_) => {
                     let msg =
                         format!("unrecognized platform-specific intrinsic function: `{name}`");
-                    tcx.sess.struct_span_err(it.span, &msg).emit();
+                    tcx.sess.struct_span_err(it.span, msg).emit();
                     return;
                 }
             }
         }
         _ => {
             let msg = format!("unrecognized platform-specific intrinsic function: `{name}`");
-            tcx.sess.struct_span_err(it.span, &msg).emit();
+            tcx.sess.struct_span_err(it.span, msg).emit();
             return;
         }
     };
 
-    let sig = tcx.mk_fn_sig(
-        inputs.into_iter(),
-        output,
-        false,
-        hir::Unsafety::Unsafe,
-        Abi::PlatformIntrinsic,
-    );
+    let sig = tcx.mk_fn_sig(inputs, output, false, hir::Unsafety::Unsafe, Abi::PlatformIntrinsic);
     let sig = ty::Binder::dummy(sig);
     equate_intrinsic_type(tcx, it, n_tps, 0, sig)
 }

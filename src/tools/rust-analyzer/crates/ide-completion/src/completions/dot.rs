@@ -23,7 +23,7 @@ pub(crate) fn complete_dot(
         let mut item =
             CompletionItem::new(CompletionItemKind::Keyword, ctx.source_range(), "await");
         item.detail("expr.await");
-        item.add_to(acc);
+        item.add_to(acc, ctx.db);
     }
 
     if let DotAccessKind::Method { .. } = dot_access.kind {
@@ -122,7 +122,7 @@ fn complete_methods(
     mut f: impl FnMut(hir::Function),
 ) {
     let mut seen_methods = FxHashSet::default();
-    receiver.iterate_method_candidates(
+    receiver.iterate_method_candidates_with_traits(
         ctx.db,
         &ctx.scope,
         &ctx.traits_in_scope(),
@@ -167,6 +167,43 @@ fn foo(s: S) { s.$0 }
 "#,
             expect![[r#"
                 fd foo   u32
+                me bar() fn(&self)
+            "#]],
+        );
+    }
+
+    #[test]
+    fn no_unstable_method_on_stable() {
+        check(
+            r#"
+//- /main.rs crate:main deps:std
+fn foo(s: std::S) { s.$0 }
+//- /std.rs crate:std
+pub struct S;
+impl S {
+    #[unstable]
+    pub fn bar(&self) {}
+}
+"#,
+            expect![""],
+        );
+    }
+
+    #[test]
+    fn unstable_method_on_nightly() {
+        check(
+            r#"
+//- toolchain:nightly
+//- /main.rs crate:main deps:std
+fn foo(s: std::S) { s.$0 }
+//- /std.rs crate:std
+pub struct S;
+impl S {
+    #[unstable]
+    pub fn bar(&self) {}
+}
+"#,
+            expect![[r#"
                 me bar() fn(&self)
             "#]],
         );
@@ -415,7 +452,6 @@ fn foo(a: lib::A) { a.$0 }
     fn test_local_impls() {
         check(
             r#"
-//- /lib.rs crate:lib
 pub struct A {}
 mod m {
     impl super::A {
@@ -427,9 +463,8 @@ mod m {
         }
     }
 }
-//- /main.rs crate:main deps:lib
-fn foo(a: lib::A) {
-    impl lib::A {
+fn foo(a: A) {
+    impl A {
         fn local_method(&self) {}
     }
     a.$0

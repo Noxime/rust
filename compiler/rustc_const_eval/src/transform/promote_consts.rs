@@ -18,10 +18,10 @@ use rustc_middle::mir::traversal::ReversePostorderIter;
 use rustc_middle::mir::visit::{MutVisitor, MutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::subst::InternalSubsts;
-use rustc_middle::ty::{self, List, TyCtxt, TypeVisitable};
+use rustc_middle::ty::{self, List, TyCtxt, TypeVisitableExt};
 use rustc_span::Span;
 
-use rustc_index::vec::{Idx, IndexVec};
+use rustc_index::{Idx, IndexSlice, IndexVec};
 
 use std::cell::Cell;
 use std::{cmp, iter, mem};
@@ -106,8 +106,9 @@ impl<'tcx> Visitor<'tcx> for Collector<'_, 'tcx> {
         debug!("visit_local: index={:?} context={:?} location={:?}", index, context, location);
         // We're only interested in temporaries and the return place
         match self.ccx.body.local_kind(index) {
-            LocalKind::Temp | LocalKind::ReturnPointer => {}
-            LocalKind::Arg | LocalKind::Var => return,
+            LocalKind::Arg => return,
+            LocalKind::Temp if self.ccx.body.local_decls[index].is_user_variable() => return,
+            LocalKind::ReturnPointer | LocalKind::Temp => {}
         }
 
         // Ignore drops, if the temp gets promoted,
@@ -183,7 +184,7 @@ pub fn collect_temps_and_candidates<'tcx>(
 /// This wraps an `Item`, and has access to all fields of that `Item` via `Deref` coercion.
 struct Validator<'a, 'tcx> {
     ccx: &'a ConstCx<'a, 'tcx>,
-    temps: &'a mut IndexVec<Local, TempState>,
+    temps: &'a mut IndexSlice<Local, TempState>,
 }
 
 impl<'a, 'tcx> std::ops::Deref for Validator<'a, 'tcx> {
@@ -364,31 +365,33 @@ impl<'tcx> Validator<'_, 'tcx> {
                     ProjectionElem::Index(local) => {
                         let mut promotable = false;
                         // Only accept if we can predict the index and are indexing an array.
-                        let val =
-                            if let TempState::Defined { location: loc, .. } = self.temps[local] {
-                                let block = &self.body[loc.block];
-                                if loc.statement_index < block.statements.len() {
-                                    let statement = &block.statements[loc.statement_index];
-                                    match &statement.kind {
-                                        StatementKind::Assign(box (
-                                            _,
-                                            Rvalue::Use(Operand::Constant(c)),
-                                        )) => c.literal.try_eval_usize(self.tcx, self.param_env),
-                                        _ => None,
-                                    }
-                                } else {
-                                    None
+                        let val = if let TempState::Defined { location: loc, .. } =
+                            self.temps[local]
+                        {
+                            let block = &self.body[loc.block];
+                            if loc.statement_index < block.statements.len() {
+                                let statement = &block.statements[loc.statement_index];
+                                match &statement.kind {
+                                    StatementKind::Assign(box (
+                                        _,
+                                        Rvalue::Use(Operand::Constant(c)),
+                                    )) => c.literal.try_eval_target_usize(self.tcx, self.param_env),
+                                    _ => None,
                                 }
                             } else {
                                 None
-                            };
+                            }
+                        } else {
+                            None
+                        };
                         if let Some(idx) = val {
                             // Determine the type of the thing we are indexing.
                             let ty = place_base.ty(self.body, self.tcx).ty;
                             match ty.kind() {
                                 ty::Array(_, len) => {
                                     // It's an array; determine its length.
-                                    if let Some(len) = len.try_eval_usize(self.tcx, self.param_env)
+                                    if let Some(len) =
+                                        len.try_eval_target_usize(self.tcx, self.param_env)
                                     {
                                         // If the index is in-bounds, go ahead.
                                         if idx < len {
@@ -470,7 +473,7 @@ impl<'tcx> Validator<'_, 'tcx> {
                 // mutably without consequences. However, only &mut []
                 // is allowed right now.
                 if let ty::Array(_, len) = ty.kind() {
-                    match len.try_eval_usize(self.tcx, self.param_env) {
+                    match len.try_eval_target_usize(self.tcx, self.param_env) {
                         Some(0) => {}
                         _ => return Err(Unpromotable),
                     }
@@ -511,6 +514,7 @@ impl<'tcx> Validator<'_, 'tcx> {
             Rvalue::NullaryOp(op, _) => match op {
                 NullOp::SizeOf => {}
                 NullOp::AlignOf => {}
+                NullOp::OffsetOf(_) => {}
             },
 
             Rvalue::ShallowInitBox(_, _) => return Err(Unpromotable),
@@ -666,7 +670,7 @@ impl<'tcx> Validator<'_, 'tcx> {
 // FIXME(eddyb) remove the differences for promotability in `static`, `const`, `const fn`.
 pub fn validate_candidates(
     ccx: &ConstCx<'_, '_>,
-    temps: &mut IndexVec<Local, TempState>,
+    temps: &mut IndexSlice<Local, TempState>,
     candidates: &[Candidate],
 ) -> Vec<Candidate> {
     let mut validator = Validator { ccx, temps };
@@ -704,7 +708,7 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
     }
 
     fn assign(&mut self, dest: Local, rvalue: Rvalue<'tcx>, span: Span) {
-        let last = self.promoted.basic_blocks.last().unwrap();
+        let last = self.promoted.basic_blocks.last_index().unwrap();
         let data = &mut self.promoted[last];
         data.statements.push(Statement {
             source_info: SourceInfo::outermost(span),
@@ -797,14 +801,14 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
                         self.visit_operand(arg, loc);
                     }
 
-                    let last = self.promoted.basic_blocks.last().unwrap();
+                    let last = self.promoted.basic_blocks.last_index().unwrap();
                     let new_target = self.new_block();
 
                     *self.promoted[last].terminator_mut() = Terminator {
                         kind: TerminatorKind::Call {
                             func,
                             args,
-                            cleanup: None,
+                            unwind: UnwindAction::Continue,
                             destination: Place::from(new_temp),
                             target: Some(new_target),
                             from_hir_call,
@@ -825,7 +829,7 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
     }
 
     fn promote_candidate(mut self, candidate: Candidate, next_promoted_id: usize) -> Body<'tcx> {
-        let def = self.source.source.with_opt_param();
+        let def = self.source.source.def_id();
         let mut rvalue = {
             let promoted = &mut self.promoted;
             let promoted_id = Promoted::new(next_promoted_id);
@@ -833,7 +837,7 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
             let mut promoted_operand = |ty, span| {
                 promoted.span = span;
                 promoted.local_decls[RETURN_PLACE] = LocalDecl::new(ty, span);
-                let substs = tcx.erase_regions(InternalSubsts::identity_for_item(tcx, def.did));
+                let substs = tcx.erase_regions(InternalSubsts::identity_for_item(tcx, def));
                 let uneval = mir::UnevaluatedConst { def, substs, promoted: Some(promoted_id) };
 
                 Operand::Constant(Box::new(Constant {
@@ -864,7 +868,7 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
 
             let mut projection = vec![PlaceElem::Deref];
             projection.extend(place.projection);
-            place.projection = tcx.intern_place_elems(&projection);
+            place.projection = tcx.mk_place_elems(&projection);
 
             // Create a temp to hold the promoted reference.
             // This is because `*r` requires `r` to be a local,
@@ -896,7 +900,7 @@ impl<'a, 'tcx> Promoter<'a, 'tcx> {
         assert_eq!(self.new_block(), START_BLOCK);
         self.visit_rvalue(
             &mut rvalue,
-            Location { block: BasicBlock::new(0), statement_index: usize::MAX },
+            Location { block: START_BLOCK, statement_index: usize::MAX },
         );
 
         let span = self.promoted.span;

@@ -8,14 +8,13 @@
 //!
 //! The documentation for this module describes how to use this feature. If you are interested in
 //! hacking on the implementation, most of that documentation lives at
-//! `rustc_mir_building/src/build/custom/mod.rs`.
+//! `rustc_mir_build/src/build/custom/mod.rs`.
 //!
 //! Typical usage will look like this:
 //!
 //! ```rust
 //! #![feature(core_intrinsics, custom_mir)]
 //!
-//! extern crate core;
 //! use core::intrinsics::mir::*;
 //!
 //! #[custom_mir(dialect = "built")]
@@ -42,13 +41,15 @@
 //! another function. The `dialect` and `phase` parameters indicate which [version of MIR][dialect
 //! docs] you are inserting here. Generally you'll want to use `#![custom_mir(dialect = "built")]`
 //! if you want your MIR to be modified by the full MIR pipeline, or `#![custom_mir(dialect =
-//! "runtime", phase = "optimized")] if you don't.
+//! "runtime", phase = "optimized")]` if you don't.
 //!
 //! [dialect docs]:
 //!     https://doc.rust-lang.org/nightly/nightly-rustc/rustc_middle/mir/enum.MirPhase.html
 //!
 //! The input to the [`mir!`] macro is:
 //!
+//!  - An optional return type annotation in the form of `type RET = ...;`. This may be required
+//!    if the compiler cannot infer the type of RET.
 //!  - A possibly empty list of local declarations. Locals can also be declared inline on
 //!    assignments via `let`. Type inference generally works. Shadowing does not.
 //!  - A list of basic blocks. The first of these is the start block and is where execution begins.
@@ -63,7 +64,6 @@
 //! ```rust
 //! #![feature(core_intrinsics, custom_mir)]
 //!
-//! extern crate core;
 //! use core::intrinsics::mir::*;
 //!
 //! #[custom_mir(dialect = "built")]
@@ -120,6 +120,18 @@
 //!         }
 //!
 //!         ret = {
+//!             Return()
+//!         }
+//!     )
+//! }
+//!
+//! #[custom_mir(dialect = "runtime", phase = "optimized")]
+//! fn annotated_return_type() -> (i32, bool) {
+//!     mir!(
+//!         type RET = (i32, bool);
+//!         {
+//!             RET.0 = 1;
+//!             RET.1 = true;
 //!             Return()
 //!         }
 //!     )
@@ -216,8 +228,9 @@
 //!
 //!  - Operands implicitly convert to `Use` rvalues.
 //!  - `&`, `&mut`, `addr_of!`, and `addr_of_mut!` all work to create their associated rvalue.
-//!  - [`Discriminant`] and [`Len`] have associated functions.
+//!  - [`Discriminant`], [`Len`], and [`CopyForDeref`] have associated functions.
 //!  - Unary and binary operations use their normal Rust syntax - `a * b`, `!c`, etc.
+//!  - The binary operation `Offset` can be created via [`Offset`].
 //!  - Checked binary operations are represented by wrapping the associated binop in [`Checked`].
 //!  - Array repetition syntax (`[foo; 10]`) creates the associated rvalue.
 //!
@@ -227,12 +240,12 @@
 //! are no resume and abort terminators, and terminators that might unwind do not have any way to
 //! indicate the unwind block.
 //!
-//!  - [`Goto`], [`Return`], [`Unreachable`], [`Drop`](Drop()), and [`DropAndReplace`] have associated functions.
+//!  - [`Goto`], [`Return`], [`Unreachable`] and [`Drop`](Drop()) have associated functions.
 //!  - `match some_int_operand` becomes a `SwitchInt`. Each arm should be `literal => basic_block`
 //!     - The exception is the last arm, which must be `_ => basic_block` and corresponds to the
 //!       otherwise branch.
 //!  - [`Call`] has an associated function as well. The third argument of this function is a normal
-//!    function call expresion, for example `my_other_function(a, 5)`.
+//!    function call expression, for example `my_other_function(a, 5)`.
 //!
 
 #![unstable(
@@ -250,6 +263,7 @@ pub struct BasicBlock;
 macro_rules! define {
     ($name:literal, $( #[ $meta:meta ] )* fn $($sig:tt)*) => {
         #[rustc_diagnostic_item = $name]
+        #[inline]
         $( #[ $meta ] )*
         pub fn $($sig)* { panic!() }
     }
@@ -259,13 +273,13 @@ define!("mir_return", fn Return() -> BasicBlock);
 define!("mir_goto", fn Goto(destination: BasicBlock) -> BasicBlock);
 define!("mir_unreachable", fn Unreachable() -> BasicBlock);
 define!("mir_drop", fn Drop<T>(place: T, goto: BasicBlock));
-define!("mir_drop_and_replace", fn DropAndReplace<T>(place: T, value: T, goto: BasicBlock));
 define!("mir_call", fn Call<T>(place: T, goto: BasicBlock, call: T));
 define!("mir_storage_live", fn StorageLive<T>(local: T));
 define!("mir_storage_dead", fn StorageDead<T>(local: T));
 define!("mir_deinit", fn Deinit<T>(place: T));
 define!("mir_checked", fn Checked<T>(binop: T) -> (T, bool));
 define!("mir_len", fn Len<T>(place: T) -> usize);
+define!("mir_copy_for_deref", fn CopyForDeref<T>(place: T) -> T);
 define!("mir_retag", fn Retag<T>(place: T));
 define!("mir_move", fn Move<T>(place: T) -> T);
 define!("mir_static", fn Static<T>(s: T) -> &'static T);
@@ -276,6 +290,7 @@ define!(
     fn Discriminant<T>(place: T) -> <T as ::core::marker::DiscriminantKind>::Discriminant
 );
 define!("mir_set_discriminant", fn SetDiscriminant<T>(place: T, index: u32));
+define!("mir_offset", fn Offset<T, U>(ptr: T, count: U) -> T);
 define!(
     "mir_field",
     /// Access the field with the given index of some place.
@@ -302,7 +317,6 @@ define!(
     /// ```rust
     /// #![feature(custom_mir, core_intrinsics)]
     ///
-    /// extern crate core;
     /// use core::intrinsics::mir::*;
     ///
     /// #[custom_mir(dialect = "built")]
@@ -331,6 +345,14 @@ define!(
     fn Variant<T>(place: T, index: u32) -> ()
 );
 define!(
+    "mir_cast_transmute",
+    /// Emits a `CastKind::Transmute` cast.
+    ///
+    /// Needed to test the UB when `sizeof(T) != sizeof(U)`, which can't be
+    /// generated via the normal `mem::transmute`.
+    fn CastTransmute<T, U>(operand: T) -> U
+);
+define!(
     "mir_make_place",
     #[doc(hidden)]
     fn __internal_make_place<T>(place: T) -> *mut T
@@ -343,6 +365,7 @@ define!(
 #[rustc_macro_transparency = "transparent"]
 pub macro mir {
     (
+        $(type RET = $ret_ty:ty ;)?
         $(let $local_decl:ident $(: $local_decl_ty:ty)? ;)*
 
         {
@@ -363,7 +386,7 @@ pub macro mir {
         {
             // Now all locals
             #[allow(non_snake_case)]
-            let RET;
+            let RET $(: $ret_ty)?;
             $(
                 let $local_decl $(: $local_decl_ty)? ;
             )*

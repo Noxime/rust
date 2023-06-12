@@ -11,11 +11,11 @@ use rustc_middle::mir::{
     visit::{TyContext, Visitor},
     Constant, ConstantKind, Local, LocalDecl, Location,
 };
+use rustc_middle::query::Providers;
 use rustc_middle::ty::{
     self,
-    query::Providers,
     subst::SubstsRef,
-    visit::{TypeSuperVisitable, TypeVisitable, TypeVisitor},
+    visit::{TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor},
     Const, Ty, TyCtxt, UnusedGenericParams,
 };
 use rustc_span::symbol::sym;
@@ -36,6 +36,8 @@ fn unused_generic_params<'tcx>(
     tcx: TyCtxt<'tcx>,
     instance: ty::InstanceDef<'tcx>,
 ) -> UnusedGenericParams {
+    assert!(instance.def_id().is_local());
+
     if !tcx.sess.opts.unstable_opts.polymorphize {
         // If polymorphization disabled, then all parameters are used.
         return UnusedGenericParams::new_all_used();
@@ -97,13 +99,6 @@ fn should_polymorphize<'tcx>(
 
     // Don't polymorphize intrinsics or virtual calls - calling `instance_mir` will panic.
     if matches!(instance, ty::InstanceDef::Intrinsic(..) | ty::InstanceDef::Virtual(..)) {
-        return false;
-    }
-
-    // Polymorphization results are stored in cross-crate metadata only when there are unused
-    // parameters, so assume that non-local items must have only used parameters (else this query
-    // would not be invoked, and the cross-crate metadata used instead).
-    if !def_id.is_local() {
         return false;
     }
 
@@ -172,7 +167,7 @@ fn mark_used_by_default_parameters<'tcx>(
         | DefKind::Field
         | DefKind::LifetimeParam
         | DefKind::GlobalAsm
-        | DefKind::Impl => {
+        | DefKind::Impl { .. } => {
             for param in &generics.params {
                 debug!(?param, "(other)");
                 if let ty::GenericParamDefKind::Lifetime = param.kind {
@@ -237,7 +232,7 @@ impl<'a, 'tcx> MarkUsedGenericParams<'a, 'tcx> {
     /// a closure, generator or constant).
     #[instrument(level = "debug", skip(self, def_id, substs))]
     fn visit_child_body(&mut self, def_id: DefId, substs: SubstsRef<'tcx>) {
-        let instance = ty::InstanceDef::Item(ty::WithOptConstParam::unknown(def_id));
+        let instance = ty::InstanceDef::Item(def_id);
         let unused = self.tcx.unused_generic_params(instance);
         debug!(?self.unused_parameters, ?unused);
         for (i, arg) in substs.iter().enumerate() {
@@ -277,10 +272,10 @@ impl<'a, 'tcx> Visitor<'tcx> for MarkUsedGenericParams<'a, 'tcx> {
                 // Avoid considering `T` unused when constants are of the form:
                 //   `<Self as Foo<T>>::foo::promoted[p]`
                 if let Some(p) = promoted {
-                    if self.def_id == def.did && !self.tcx.generics_of(def.did).has_self {
+                    if self.def_id == def && !self.tcx.generics_of(def).has_self {
                         // If there is a promoted, don't look at the substs - since it will always contain
                         // the generic parameters, instead, traverse the promoted MIR.
-                        let promoted = self.tcx.promoted_mir(def.did);
+                        let promoted = self.tcx.promoted_mir(def);
                         self.visit_body(&promoted[p]);
                     }
                 }
@@ -296,7 +291,7 @@ impl<'a, 'tcx> Visitor<'tcx> for MarkUsedGenericParams<'a, 'tcx> {
     }
 }
 
-impl<'a, 'tcx> TypeVisitor<'tcx> for MarkUsedGenericParams<'a, 'tcx> {
+impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for MarkUsedGenericParams<'a, 'tcx> {
     #[instrument(level = "debug", skip(self))]
     fn visit_const(&mut self, c: Const<'tcx>) -> ControlFlow<Self::BreakTy> {
         if !c.has_non_region_param() {
@@ -310,9 +305,9 @@ impl<'a, 'tcx> TypeVisitor<'tcx> for MarkUsedGenericParams<'a, 'tcx> {
                 ControlFlow::Continue(())
             }
             ty::ConstKind::Unevaluated(ty::UnevaluatedConst { def, substs })
-                if matches!(self.tcx.def_kind(def.did), DefKind::AnonConst) =>
+                if matches!(self.tcx.def_kind(def), DefKind::AnonConst) =>
             {
-                self.visit_child_body(def.did, substs);
+                self.visit_child_body(def, substs);
                 ControlFlow::Continue(())
             }
             _ => c.super_visit_with(self),

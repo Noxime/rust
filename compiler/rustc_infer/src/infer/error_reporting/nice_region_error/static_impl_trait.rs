@@ -104,7 +104,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
         let (mention_influencer, influencer_point) =
             if sup_origin.span().overlaps(param.param_ty_span) {
                 // Account for `async fn` like in `async-await/issues/issue-62097.rs`.
-                // The desugaring of `async `fn`s causes `sup_origin` and `param` to point at the same
+                // The desugaring of `async fn`s causes `sup_origin` and `param` to point at the same
                 // place (but with different `ctxt`, hence `overlaps` instead of `==` above).
                 //
                 // This avoids the following:
@@ -299,7 +299,7 @@ pub fn suggest_new_region_bound(
                     if let Some(explicit_static) = &explicit_static {
                         err.span_suggestion_verbose(
                             span,
-                            &format!("{consider} `{ty}`'s {explicit_static}"),
+                            format!("{consider} `{ty}`'s {explicit_static}"),
                             &lifetime_name,
                             Applicability::MaybeIncorrect,
                         );
@@ -312,13 +312,10 @@ pub fn suggest_new_region_bound(
                             Applicability::MaybeIncorrect,
                         );
                     }
-                } else if opaque.bounds.iter().any(|arg| match arg {
-                    GenericBound::Outlives(Lifetime { ident, .. })
-                        if ident.name.to_string() == lifetime_name =>
-                    {
-                        true
-                    }
-                    _ => false,
+                } else if opaque.bounds.iter().any(|arg| {
+                    matches!(arg,
+                        GenericBound::Outlives(Lifetime { ident, .. })
+                        if ident.name.to_string() == lifetime_name )
                 }) {
                 } else {
                     // get a lifetime name of existing named lifetimes if any
@@ -370,7 +367,7 @@ pub fn suggest_new_region_bound(
                         spans_suggs
                             .push((fn_return.span.shrink_to_hi(), format!(" + {name} ")));
                         err.multipart_suggestion_verbose(
-                            &format!(
+                            format!(
                                 "{declare} `{ty}` {captures}, {use_lt}",
                             ),
                             spans_suggs,
@@ -379,7 +376,7 @@ pub fn suggest_new_region_bound(
                     } else {
                         err.span_suggestion_verbose(
                             fn_return.span.shrink_to_hi(),
-                            &format!("{declare} `{ty}` {captures}, {explicit}",),
+                            format!("{declare} `{ty}` {captures}, {explicit}",),
                             &plus_lt,
                             Applicability::MaybeIncorrect,
                         );
@@ -390,7 +387,7 @@ pub fn suggest_new_region_bound(
                 if let LifetimeName::ImplicitObjectLifetimeDefault = lt.res {
                     err.span_suggestion_verbose(
                         fn_return.span.shrink_to_hi(),
-                        &format!(
+                        format!(
                             "{declare} the trait object {captures}, {explicit}",
                             declare = declare,
                             captures = captures,
@@ -407,7 +404,7 @@ pub fn suggest_new_region_bound(
                     if let Some(explicit_static) = &explicit_static {
                         err.span_suggestion_verbose(
                             lt.ident.span,
-                            &format!("{} the trait object's {}", consider, explicit_static),
+                            format!("{} the trait object's {}", consider, explicit_static),
                             &lifetime_name,
                             Applicability::MaybeIncorrect,
                         );
@@ -539,7 +536,7 @@ impl<'a, 'tcx> NiceRegionError<'a, 'tcx> {
 /// Collect all the trait objects in a type that could have received an implicit `'static` lifetime.
 pub struct TraitObjectVisitor(pub FxIndexSet<DefId>);
 
-impl<'tcx> TypeVisitor<'tcx> for TraitObjectVisitor {
+impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for TraitObjectVisitor {
     fn visit_ty(&mut self, t: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
         match t.kind() {
             ty::Dynamic(preds, re, _) if re.is_static() => {

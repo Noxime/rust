@@ -1,3 +1,5 @@
+#![cfg_attr(not(bootstrap), allow(invalid_from_utf8))]
+
 use std::assert_matches::assert_matches;
 use std::borrow::Cow;
 use std::cmp::Ordering::{Equal, Greater, Less};
@@ -1499,13 +1501,25 @@ fn test_split_whitespace() {
 
 #[test]
 fn test_lines() {
-    let data = "\nMäry häd ä little lämb\n\r\nLittle lämb\n";
-    let lines: Vec<&str> = data.lines().collect();
-    assert_eq!(lines, ["", "Märy häd ä little lämb", "", "Little lämb"]);
-
-    let data = "\r\nMäry häd ä little lämb\n\nLittle lämb"; // no trailing \n
-    let lines: Vec<&str> = data.lines().collect();
-    assert_eq!(lines, ["", "Märy häd ä little lämb", "", "Little lämb"]);
+    fn t(data: &str, expected: &[&str]) {
+        let lines: Vec<&str> = data.lines().collect();
+        assert_eq!(lines, expected);
+    }
+    t("", &[]);
+    t("\n", &[""]);
+    t("\n2nd", &["", "2nd"]);
+    t("\r\n", &[""]);
+    t("bare\r", &["bare\r"]);
+    t("bare\rcr", &["bare\rcr"]);
+    t("Text\n\r", &["Text", "\r"]);
+    t(
+        "\nMäry häd ä little lämb\n\r\nLittle lämb\n",
+        &["", "Märy häd ä little lämb", "", "Little lämb"],
+    );
+    t(
+        "\r\nMäry häd ä little lämb\n\nLittle lämb",
+        &["", "Märy häd ä little lämb", "", "Little lämb"],
+    );
 }
 
 #[test]

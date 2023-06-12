@@ -2,7 +2,6 @@
 // revisions: full min
 
 // regression test for #78180
-// compile-flags: -Zsave-analysis
 
 #![cfg_attr(full, feature(generic_const_exprs))]
 #![cfg_attr(full, allow(incomplete_features))]
@@ -12,7 +11,7 @@ fn test<const N: usize>() {}
 
 fn wow<'a>() -> &'a () {
     test::<{
-        let _: &'a (); //[min]~ ERROR a non-static lifetime
+        let _: &'a (); //[min]~ ERROR generic parameters may not be used in const operations
         3
     }>();
     &()

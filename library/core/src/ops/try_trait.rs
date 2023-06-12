@@ -128,8 +128,7 @@ use crate::ops::ControlFlow;
 )]
 #[doc(alias = "?")]
 #[lang = "Try"]
-#[const_trait]
-pub trait Try: ~const FromResidual {
+pub trait Try: FromResidual {
     /// The type of the value produced by `?` when *not* short-circuiting.
     #[unstable(feature = "try_trait_v2", issue = "84277")]
     type Output;
@@ -305,7 +304,6 @@ pub trait Try: ~const FromResidual {
 )]
 #[rustc_diagnostic_item = "FromResidual"]
 #[unstable(feature = "try_trait_v2", issue = "84277")]
-#[const_trait]
 pub trait FromResidual<R = <Self as Try>::Residual> {
     /// Constructs the type from a compatible `Residual` type.
     ///
@@ -358,11 +356,10 @@ where
 /// and in the other direction,
 /// `<Result<Infallible, E> as Residual<T>>::TryType = Result<T, E>`.
 #[unstable(feature = "try_trait_v2_residual", issue = "91285")]
-#[const_trait]
 pub trait Residual<O> {
     /// The "return" type of this meta-function.
     #[unstable(feature = "try_trait_v2_residual", issue = "91285")]
-    type TryType: ~const Try<Output = O, Residual = Self>;
+    type TryType: Try<Output = O, Residual = Self>;
 }
 
 #[unstable(feature = "pub_crate_should_not_need_unstable_attr", issue = "none")]
@@ -379,24 +376,24 @@ pub(crate) type ChangeOutputType<T, V> = <<T as Try>::Residual as Residual<V>>::
 pub(crate) struct NeverShortCircuit<T>(pub T);
 
 impl<T> NeverShortCircuit<T> {
+    /// Wraps a unary function to produce one that wraps the output into a `NeverShortCircuit`.
+    ///
+    /// This is useful for implementing infallible functions in terms of the `try_` ones,
+    /// without accidentally capturing extra generic parameters in a closure.
     #[inline]
-    pub fn wrap_mut_2<A, B>(
-        mut f: impl ~const FnMut(A, B) -> T,
-    ) -> impl ~const FnMut(A, B) -> Self {
-        cfg_if! {
-            if #[cfg(bootstrap)] {
-                #[allow(unused_parens)]
-                (const move |a, b| NeverShortCircuit(f(a, b)))
-            } else {
-                const move |a, b| NeverShortCircuit(f(a, b))
-            }
-        }
+    pub fn wrap_mut_1<A>(mut f: impl FnMut(A) -> T) -> impl FnMut(A) -> NeverShortCircuit<T> {
+        move |a| NeverShortCircuit(f(a))
+    }
+
+    #[inline]
+    pub fn wrap_mut_2<A, B>(mut f: impl FnMut(A, B) -> T) -> impl FnMut(A, B) -> Self {
+        move |a, b| NeverShortCircuit(f(a, b))
     }
 }
 
 pub(crate) enum NeverShortCircuitResidual {}
 
-impl<T> const Try for NeverShortCircuit<T> {
+impl<T> Try for NeverShortCircuit<T> {
     type Output = T;
     type Residual = NeverShortCircuitResidual;
 
@@ -411,14 +408,14 @@ impl<T> const Try for NeverShortCircuit<T> {
     }
 }
 
-impl<T> const FromResidual for NeverShortCircuit<T> {
+impl<T> FromResidual for NeverShortCircuit<T> {
     #[inline]
     fn from_residual(never: NeverShortCircuitResidual) -> Self {
         match never {}
     }
 }
 
-impl<T> const Residual<T> for NeverShortCircuitResidual {
+impl<T> Residual<T> for NeverShortCircuitResidual {
     type TryType = NeverShortCircuit<T>;
 }
 

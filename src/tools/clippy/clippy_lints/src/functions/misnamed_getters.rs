@@ -10,13 +10,7 @@ use std::iter;
 
 use super::MISNAMED_GETTERS;
 
-pub fn check_fn(
-    cx: &LateContext<'_>,
-    kind: FnKind<'_>,
-    decl: &FnDecl<'_>,
-    body: &Body<'_>,
-    span: Span,
-) {
+pub fn check_fn(cx: &LateContext<'_>, kind: FnKind<'_>, decl: &FnDecl<'_>, body: &Body<'_>, span: Span) {
     let FnKind::Method(ref ident, sig) = kind else {
             return;
         };
@@ -46,7 +40,7 @@ pub fn check_fn(
     };
 
     // Body must be &(mut) <self_data>.name
-    // self_data is not neccessarilly self, to also lint sub-getters, etc…
+    // self_data is not necessarily self, to also lint sub-getters, etc…
 
     let block_expr = if_chain! {
         if let ExprKind::Block(block,_) = body.value.kind;
@@ -103,7 +97,7 @@ pub fn check_fn(
 
     let Some(correct_field) = correct_field else {
         // There is no field corresponding to the getter name.
-        // FIXME: This can be a false positive if the correct field is reachable trought deeper autodereferences than used_field is
+        // FIXME: This can be a false positive if the correct field is reachable through deeper autodereferences than used_field is
         return;
     };
 

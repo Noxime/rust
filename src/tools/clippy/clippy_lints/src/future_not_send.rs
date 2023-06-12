@@ -4,12 +4,12 @@ use rustc_hir::intravisit::FnKind;
 use rustc_hir::{Body, FnDecl};
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::ty::{self, AliasTy, Clause, EarlyBinder, PredicateKind};
+use rustc_middle::ty::{self, AliasTy, Clause, PredicateKind};
 use rustc_session::{declare_lint_pass, declare_tool_lint};
 use rustc_span::def_id::LocalDefId;
 use rustc_span::{sym, Span};
 use rustc_trait_selection::traits::error_reporting::suggestions::TypeErrCtxtExt;
-use rustc_trait_selection::traits::{self, FulfillmentError};
+use rustc_trait_selection::traits::{self, FulfillmentError, ObligationCtxt};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -66,8 +66,7 @@ impl<'tcx> LateLintPass<'tcx> for FutureNotSend {
         if let ty::Alias(ty::Opaque, AliasTy { def_id, substs, .. }) = *ret_ty.kind() {
             let preds = cx.tcx.explicit_item_bounds(def_id);
             let mut is_future = false;
-            for &(p, _span) in preds {
-                let p = EarlyBinder(p).subst(cx.tcx, substs);
+            for (p, _span) in preds.subst_iter_copied(cx.tcx, substs) {
                 if let Some(trait_pred) = p.to_opt_poly_trait_pred() {
                     if Some(trait_pred.skip_binder().trait_ref.def_id) == cx.tcx.lang_items().future_trait() {
                         is_future = true;
@@ -79,8 +78,10 @@ impl<'tcx> LateLintPass<'tcx> for FutureNotSend {
                 let send_trait = cx.tcx.get_diagnostic_item(sym::Send).unwrap();
                 let span = decl.output.span();
                 let infcx = cx.tcx.infer_ctxt().build();
+                let ocx = ObligationCtxt::new(&infcx);
                 let cause = traits::ObligationCause::misc(span, fn_def_id);
-                let send_errors = traits::fully_solve_bound(&infcx, cause, cx.param_env, ret_ty, send_trait);
+                ocx.register_bound(cause, cx.param_env, ret_ty, send_trait);
+                let send_errors = ocx.select_all_or_error();
                 if !send_errors.is_empty() {
                     span_lint_and_then(
                         cx,
@@ -95,7 +96,7 @@ impl<'tcx> LateLintPass<'tcx> for FutureNotSend {
                                 if let PredicateKind::Clause(Clause::Trait(trait_pred)) =
                                     obligation.predicate.kind().skip_binder()
                                 {
-                                    db.note(&format!(
+                                    db.note(format!(
                                         "`{}` doesn't implement `{}`",
                                         trait_pred.self_ty(),
                                         trait_pred.trait_ref.print_only_trait_path(),

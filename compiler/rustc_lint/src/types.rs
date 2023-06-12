@@ -1,19 +1,25 @@
-use crate::lints::{
-    AtomicOrderingFence, AtomicOrderingLoad, AtomicOrderingStore, ImproperCTypes,
-    InvalidAtomicOrderingDiag, OnlyCastu8ToChar, OverflowingBinHex, OverflowingBinHexSign,
-    OverflowingBinHexSub, OverflowingInt, OverflowingIntHelp, OverflowingLiteral, OverflowingUInt,
-    RangeEndpointOutOfRange, UnusedComparisons, VariantSizeDifferencesDiag,
+use crate::{
+    fluent_generated as fluent,
+    lints::{
+        AtomicOrderingFence, AtomicOrderingLoad, AtomicOrderingStore, ImproperCTypes,
+        InvalidAtomicOrderingDiag, InvalidNanComparisons, InvalidNanComparisonsSuggestion,
+        OnlyCastu8ToChar, OverflowingBinHex, OverflowingBinHexSign, OverflowingBinHexSub,
+        OverflowingInt, OverflowingIntHelp, OverflowingLiteral, OverflowingUInt,
+        RangeEndpointOutOfRange, UnusedComparisons, UseInclusiveRange, VariantSizeDifferencesDiag,
+    },
 };
 use crate::{LateContext, LateLintPass, LintContext};
 use rustc_ast as ast;
 use rustc_attr as attr;
 use rustc_data_structures::fx::FxHashSet;
-use rustc_errors::{fluent, DiagnosticMessage};
+use rustc_errors::DiagnosticMessage;
 use rustc_hir as hir;
 use rustc_hir::{is_range_literal, Expr, ExprKind, Node};
 use rustc_middle::ty::layout::{IntegerExt, LayoutOf, SizeSkeleton};
 use rustc_middle::ty::subst::SubstsRef;
-use rustc_middle::ty::{self, AdtKind, DefIdTree, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable};
+use rustc_middle::ty::{
+    self, AdtKind, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitableExt,
+};
 use rustc_span::def_id::LocalDefId;
 use rustc_span::source_map;
 use rustc_span::symbol::sym;
@@ -107,13 +113,35 @@ declare_lint! {
     "detects enums with widely varying variant sizes"
 }
 
+declare_lint! {
+    /// The `invalid_nan_comparisons` lint checks comparison with `f32::NAN` or `f64::NAN`
+    /// as one of the operand.
+    ///
+    /// ### Example
+    ///
+    /// ```rust
+    /// let a = 2.3f32;
+    /// if a == f32::NAN {}
+    /// ```
+    ///
+    /// {{produces}}
+    ///
+    /// ### Explanation
+    ///
+    /// NaN does not compare meaningfully to anything – not
+    /// even itself – so those comparisons are always false.
+    INVALID_NAN_COMPARISONS,
+    Warn,
+    "detects invalid floating point NaN comparisons"
+}
+
 #[derive(Copy, Clone)]
 pub struct TypeLimits {
     /// Id of the last visited negated expression
     negated_expr_id: Option<hir::HirId>,
 }
 
-impl_lint_pass!(TypeLimits => [UNUSED_COMPARISONS, OVERFLOWING_LITERALS]);
+impl_lint_pass!(TypeLimits => [UNUSED_COMPARISONS, OVERFLOWING_LITERALS, INVALID_NAN_COMPARISONS]);
 
 impl TypeLimits {
     pub fn new() -> TypeLimits {
@@ -131,6 +159,14 @@ fn lint_overflowing_range_endpoint<'tcx>(
     expr: &'tcx hir::Expr<'tcx>,
     ty: &str,
 ) -> bool {
+    // Look past casts to support cases like `0..256 as u8`
+    let (expr, lit_span) = if let Node::Expr(par_expr) = cx.tcx.hir().get(cx.tcx.hir().parent_id(expr.hir_id))
+      && let ExprKind::Cast(_, _) = par_expr.kind {
+        (par_expr, expr.span)
+    } else {
+        (expr, expr.span)
+    };
+
     // We only want to handle exclusive (`..`) ranges,
     // which are represented as `ExprKind::Struct`.
     let par_id = cx.tcx.hir().parent_id(expr.hir_id);
@@ -150,7 +186,6 @@ fn lint_overflowing_range_endpoint<'tcx>(
     if !(eps[1].expr.hir_id == expr.hir_id && lit_val - 1 == max) {
         return false;
     };
-    let Ok(start) = cx.sess().source_map().span_to_snippet(eps[0].span) else { return false };
 
     use rustc_ast::{LitIntType, LitKind};
     let suffix = match lit.node {
@@ -159,16 +194,28 @@ fn lint_overflowing_range_endpoint<'tcx>(
         LitKind::Int(_, LitIntType::Unsuffixed) => "",
         _ => bug!(),
     };
-    cx.emit_spanned_lint(
-        OVERFLOWING_LITERALS,
-        struct_expr.span,
-        RangeEndpointOutOfRange {
-            ty,
-            suggestion: struct_expr.span,
+
+    let sub_sugg = if expr.span.lo() == lit_span.lo() {
+        let Ok(start) = cx.sess().source_map().span_to_snippet(eps[0].span) else { return false };
+        UseInclusiveRange::WithoutParen {
+            sugg: struct_expr.span.shrink_to_lo().to(lit_span.shrink_to_hi()),
             start,
             literal: lit_val - 1,
             suffix,
-        },
+        }
+    } else {
+        UseInclusiveRange::WithParen {
+            eq_sugg: expr.span.shrink_to_lo(),
+            lit_sugg: lit_span,
+            literal: lit_val - 1,
+            suffix,
+        }
+    };
+
+    cx.emit_spanned_lint(
+        OVERFLOWING_LITERALS,
+        struct_expr.span,
+        RangeEndpointOutOfRange { ty, sub: sub_sugg },
     );
 
     // We've just emitted a lint, special cased for `(...)..MAX+1` ranges,
@@ -461,6 +508,68 @@ fn lint_literal<'tcx>(
     }
 }
 
+fn lint_nan<'tcx>(
+    cx: &LateContext<'tcx>,
+    e: &'tcx hir::Expr<'tcx>,
+    binop: hir::BinOp,
+    l: &'tcx hir::Expr<'tcx>,
+    r: &'tcx hir::Expr<'tcx>,
+) {
+    fn is_nan(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> bool {
+        let expr = expr.peel_blocks().peel_borrows();
+        match expr.kind {
+            ExprKind::Path(qpath) => {
+                let Some(def_id) = cx.typeck_results().qpath_res(&qpath, expr.hir_id).opt_def_id() else { return false; };
+
+                matches!(cx.tcx.get_diagnostic_name(def_id), Some(sym::f32_nan | sym::f64_nan))
+            }
+            _ => false,
+        }
+    }
+
+    fn eq_ne(
+        e: &hir::Expr<'_>,
+        l: &hir::Expr<'_>,
+        r: &hir::Expr<'_>,
+        f: impl FnOnce(Span, Span) -> InvalidNanComparisonsSuggestion,
+    ) -> InvalidNanComparisons {
+        let suggestion =
+            if let Some(l_span) = l.span.find_ancestor_inside(e.span) &&
+                let Some(r_span) = r.span.find_ancestor_inside(e.span) {
+                f(l_span, r_span)
+            } else {
+                InvalidNanComparisonsSuggestion::Spanless
+            };
+
+        InvalidNanComparisons::EqNe { suggestion }
+    }
+
+    let lint = match binop.node {
+        hir::BinOpKind::Eq | hir::BinOpKind::Ne if is_nan(cx, l) => {
+            eq_ne(e, l, r, |l_span, r_span| InvalidNanComparisonsSuggestion::Spanful {
+                nan_plus_binop: l_span.until(r_span),
+                float: r_span.shrink_to_hi(),
+                neg: (binop.node == hir::BinOpKind::Ne).then(|| r_span.shrink_to_lo()),
+            })
+        }
+        hir::BinOpKind::Eq | hir::BinOpKind::Ne if is_nan(cx, r) => {
+            eq_ne(e, l, r, |l_span, r_span| InvalidNanComparisonsSuggestion::Spanful {
+                nan_plus_binop: l_span.shrink_to_hi().to(r_span),
+                float: l_span.shrink_to_hi(),
+                neg: (binop.node == hir::BinOpKind::Ne).then(|| l_span.shrink_to_lo()),
+            })
+        }
+        hir::BinOpKind::Lt | hir::BinOpKind::Le | hir::BinOpKind::Gt | hir::BinOpKind::Ge
+            if is_nan(cx, l) || is_nan(cx, r) =>
+        {
+            InvalidNanComparisons::LtLeGtGe
+        }
+        _ => return,
+    };
+
+    cx.emit_spanned_lint(INVALID_NAN_COMPARISONS, e.span, lint);
+}
+
 impl<'tcx> LateLintPass<'tcx> for TypeLimits {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, e: &'tcx hir::Expr<'tcx>) {
         match e.kind {
@@ -471,8 +580,12 @@ impl<'tcx> LateLintPass<'tcx> for TypeLimits {
                 }
             }
             hir::ExprKind::Binary(binop, ref l, ref r) => {
-                if is_comparison(binop) && !check_limits(cx, binop, &l, &r) {
-                    cx.emit_spanned_lint(UNUSED_COMPARISONS, e.span, UnusedComparisons);
+                if is_comparison(binop) {
+                    if !check_limits(cx, binop, &l, &r) {
+                        cx.emit_spanned_lint(UNUSED_COMPARISONS, e.span, UnusedComparisons);
+                    } else {
+                        lint_nan(cx, e, binop, l, r);
+                    }
                 }
             }
             hir::ExprKind::Lit(ref lit) => lint_literal(cx, self, e, lit),
@@ -651,8 +764,8 @@ pub fn transparent_newtype_field<'a, 'tcx>(
 ) -> Option<&'a ty::FieldDef> {
     let param_env = tcx.param_env(variant.def_id);
     variant.fields.iter().find(|field| {
-        let field_ty = tcx.type_of(field.did);
-        let is_zst = tcx.layout_of(param_env.and(field_ty)).map_or(false, |layout| layout.is_zst());
+        let field_ty = tcx.type_of(field.did).subst_identity();
+        let is_zst = tcx.layout_of(param_env.and(field_ty)).is_ok_and(|layout| layout.is_zst());
         !is_zst
     })
 }
@@ -745,7 +858,7 @@ pub(crate) fn repr_nullable_ptr<'tcx>(
     debug!("is_repr_nullable_ptr(cx, ty = {:?})", ty);
     if let ty::Adt(ty_def, substs) = ty.kind() {
         let field_ty = match &ty_def.variants().raw[..] {
-            [var_one, var_two] => match (&var_one.fields[..], &var_two.fields[..]) {
+            [var_one, var_two] => match (&var_one.fields.raw[..], &var_two.fields.raw[..]) {
                 ([], [field]) | ([field], []) => field.ty(cx.tcx, substs),
                 _ => return None,
             },
@@ -1094,14 +1207,14 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
 
             // `extern "C" fn` functions can have type parameters, which may or may not be FFI-safe,
             //  so they are currently ignored for the purposes of this lint.
-            ty::Param(..) | ty::Alias(ty::Projection, ..)
+            ty::Param(..) | ty::Alias(ty::Projection | ty::Inherent, ..)
                 if matches!(self.mode, CItemKind::Definition) =>
             {
                 FfiSafe
             }
 
             ty::Param(..)
-            | ty::Alias(ty::Projection, ..)
+            | ty::Alias(ty::Projection | ty::Inherent, ..)
             | ty::Infer(..)
             | ty::Bound(..)
             | ty::Error(_)
@@ -1144,7 +1257,7 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
 
     fn check_for_opaque_ty(&mut self, sp: Span, ty: Ty<'tcx>) -> bool {
         struct ProhibitOpaqueTypes;
-        impl<'tcx> ty::visit::TypeVisitor<'tcx> for ProhibitOpaqueTypes {
+        impl<'tcx> ty::visit::TypeVisitor<TyCtxt<'tcx>> for ProhibitOpaqueTypes {
             type BreakTy = Ty<'tcx>;
 
             fn visit_ty(&mut self, ty: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
@@ -1240,7 +1353,7 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
     }
 
     fn check_foreign_static(&mut self, id: hir::OwnerId, span: Span) {
-        let ty = self.cx.tcx.type_of(id);
+        let ty = self.cx.tcx.type_of(id).subst_identity();
         self.check_type_for_ffi_and_report_errors(span, ty, true, false);
     }
 
@@ -1301,7 +1414,7 @@ declare_lint_pass!(VariantSizeDifferences => [VARIANT_SIZE_DIFFERENCES]);
 impl<'tcx> LateLintPass<'tcx> for VariantSizeDifferences {
     fn check_item(&mut self, cx: &LateContext<'_>, it: &hir::Item<'_>) {
         if let hir::ItemKind::Enum(ref enum_definition, _) = it.kind {
-            let t = cx.tcx.type_of(it.owner_id);
+            let t = cx.tcx.type_of(it.owner_id).subst_identity();
             let ty = cx.tcx.erase_regions(t);
             let Ok(layout) = cx.layout_of(ty) else { return };
             let Variants::Multiple {
@@ -1421,7 +1534,7 @@ impl InvalidAtomicOrdering {
             && recognized_names.contains(&method_path.ident.name)
             && let Some(m_def_id) = cx.typeck_results().type_dependent_def_id(expr.hir_id)
             && let Some(impl_did) = cx.tcx.impl_of_method(m_def_id)
-            && let Some(adt) = cx.tcx.type_of(impl_did).ty_adt_def()
+            && let Some(adt) = cx.tcx.type_of(impl_did).subst_identity().ty_adt_def()
             // skip extension traits, only lint functions from the standard library
             && cx.tcx.trait_id_of_impl(impl_did).is_none()
             && let parent = cx.tcx.parent(adt.did())

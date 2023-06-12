@@ -12,7 +12,7 @@ use crate::util::t;
 
 use crate::dist;
 use crate::tarball::GeneratedTarball;
-use crate::Compiler;
+use crate::{Compiler, Kind};
 
 use crate::builder::{Builder, RunConfig, ShouldRun, Step};
 use crate::config::{Config, TargetSelection};
@@ -52,7 +52,7 @@ fn install_sh(
     host: Option<TargetSelection>,
     tarball: &GeneratedTarball,
 ) {
-    builder.info(&format!("Install {} stage{} ({:?})", package, stage, host));
+    let _guard = builder.msg(Kind::Install, stage, package, host, host);
 
     let prefix = default_path(&builder.config.prefix, "/usr/local");
     let sysconfdir = prefix.join(default_path(&builder.config.sysconfdir, "/etc"));
@@ -210,10 +210,13 @@ install!((self, builder, _config),
         }
     };
     LlvmTools, alias = "llvm-tools", Self::should_build(_config), only_hosts: true, {
-        let tarball = builder
-            .ensure(dist::LlvmTools { target: self.target })
-            .expect("missing llvm-tools");
-        install_sh(builder, "llvm-tools", self.compiler.stage, Some(self.target), &tarball);
+        if let Some(tarball) = builder.ensure(dist::LlvmTools { target: self.target }) {
+            install_sh(builder, "llvm-tools", self.compiler.stage, Some(self.target), &tarball);
+        } else {
+            builder.info(
+                &format!("skipping llvm-tools stage{} ({}): external LLVM", self.compiler.stage, self.target),
+            );
+        }
     };
     Rustfmt, alias = "rustfmt", Self::should_build(_config), only_hosts: true, {
         if let Some(tarball) = builder.ensure(dist::Rustfmt {
@@ -242,18 +245,6 @@ install!((self, builder, _config),
                          self.compiler.stage, self.target),
             );
         }
-    };
-    Analysis, alias = "analysis", Self::should_build(_config), only_hosts: false, {
-        // `expect` should be safe, only None with host != build, but this
-        // only uses the `build` compiler
-        let tarball = builder.ensure(dist::Analysis {
-            // Find the actual compiler (handling the full bootstrap option) which
-            // produced the save-analysis data because that data isn't copied
-            // through the sysroot uplifting.
-            compiler: builder.compiler_for(builder.top_stage, builder.config.build, self.target),
-            target: self.target
-        }).expect("missing analysis");
-        install_sh(builder, "analysis", self.compiler.stage, Some(self.target), &tarball);
     };
     Rustc, path = "compiler/rustc", true, only_hosts: true, {
         let tarball = builder.ensure(dist::Rustc {

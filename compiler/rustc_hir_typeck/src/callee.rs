@@ -21,7 +21,7 @@ use rustc_middle::ty::adjustment::{
     Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability,
 };
 use rustc_middle::ty::SubstsRef;
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitable};
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitableExt};
 use rustc_span::def_id::LocalDefId;
 use rustc_span::symbol::{sym, Ident};
 use rustc_span::Span;
@@ -156,7 +156,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 // fnmut vs fnonce. If so, we have to defer further processing.
                 if self.closure_kind(substs).is_none() {
                     let closure_sig = substs.as_closure().sig();
-                    let closure_sig = self.replace_bound_vars_with_fresh_vars(
+                    let closure_sig = self.instantiate_binder_with_fresh_vars(
                         call_expr.span,
                         infer::FnCall,
                         closure_sig,
@@ -232,7 +232,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             let Some(trait_def_id) = opt_trait_def_id else { continue };
 
             let opt_input_type = opt_arg_exprs.map(|arg_exprs| {
-                self.tcx.mk_tup(arg_exprs.iter().map(|e| {
+                self.tcx.mk_tup_from_iter(arg_exprs.iter().map(|e| {
                     self.next_ty_var(TypeVariableOrigin {
                         kind: TypeVariableOriginKind::TypeInference,
                         span: e.span,
@@ -247,6 +247,15 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 adjusted_ty,
                 opt_input_type.as_ref().map(slice::from_ref),
             ) {
+                // Check for `self` receiver on the method, otherwise we can't use this as a `Fn*` trait.
+                if !self.tcx.associated_item(ok.value.def_id).fn_has_self_parameter {
+                    self.tcx.sess.delay_span_bug(
+                        call_expr.span,
+                        "input to overloaded call fn is not a self receiver",
+                    );
+                    return None;
+                }
+
                 let method = self.register_infer_ok_obligations(ok);
                 let mut autoref = None;
                 if borrow {
@@ -257,7 +266,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         // caused an error elsewhere.
                         self.tcx
                             .sess
-                            .delay_span_bug(call_expr.span, "input to call/call_mut is not a ref?");
+                            .delay_span_bug(call_expr.span, "input to call/call_mut is not a ref");
                         return None;
                     };
 
@@ -271,6 +280,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         target: method.sig.inputs()[0],
                     });
                 }
+
                 return Some((autoref, method));
             }
         }
@@ -301,9 +311,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             let fn_decl_span = if hir.body(body).generator_kind
                 == Some(hir::GeneratorKind::Async(hir::AsyncGeneratorKind::Closure))
             {
-                // Actually need to unwrap a few more layers of HIR to get to
+                // Actually need to unwrap one more layer of HIR to get to
                 // the _real_ closure...
-                let async_closure = hir.parent_id(hir.parent_id(parent_hir_id));
+                let async_closure = hir.parent_id(parent_hir_id);
                 if let hir::Node::Expr(hir::Expr {
                     kind: hir::ExprKind::Closure(&hir::Closure { fn_decl_span, .. }),
                     ..
@@ -387,7 +397,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             .sess
                             .struct_span_err(
                                 callee_expr.span,
-                                &format!("evaluate({:?}) = {:?}", predicate, result),
+                                format!("evaluate({:?}) = {:?}", predicate, result),
                             )
                             .span_label(predicate_span, "predicate")
                             .emit();
@@ -410,25 +420,19 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                         .steal_diagnostic(segment.ident.span, StashKey::CallIntoMethod)
                 {
                     // Try suggesting `foo(a)` -> `a.foo()` if possible.
-                    if let Some(ty) =
-                        self.suggest_call_as_method(
-                            &mut diag,
-                            segment,
-                            arg_exprs,
-                            call_expr,
-                            expected
-                        )
-                    {
-                        diag.emit();
-                        return ty;
-                    } else {
-                        diag.emit();
-                    }
+                    self.suggest_call_as_method(
+                        &mut diag,
+                        segment,
+                        arg_exprs,
+                        call_expr,
+                        expected
+                    );
+                    diag.emit();
                 }
 
                 let err = self.report_invalid_callee(call_expr, callee_expr, callee_ty, arg_exprs);
 
-                return self.tcx.ty_error_with_guaranteed(err);
+                return self.tcx.ty_error(err);
             }
         };
 
@@ -437,7 +441,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // renormalize the associated types at this point, since they
         // previously appeared within a `Binder<>` and hence would not
         // have been normalized before.
-        let fn_sig = self.replace_bound_vars_with_fresh_vars(call_expr.span, infer::FnCall, fn_sig);
+        let fn_sig = self.instantiate_binder_with_fresh_vars(call_expr.span, infer::FnCall, fn_sig);
         let fn_sig = self.normalize(call_expr.span, fn_sig);
 
         // Call the generic checker.
@@ -486,9 +490,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         arg_exprs: &'tcx [hir::Expr<'tcx>],
         call_expr: &'tcx hir::Expr<'tcx>,
         expected: Expectation<'tcx>,
-    ) -> Option<Ty<'tcx>> {
+    ) {
         if let [callee_expr, rest @ ..] = arg_exprs {
-            let callee_ty = self.typeck_results.borrow().expr_ty_adjusted_opt(callee_expr)?;
+            let Some(callee_ty) = self.typeck_results.borrow().expr_ty_adjusted_opt(callee_expr) else {
+                return;
+            };
 
             // First, do a probe with `IsSuggestion(true)` to avoid emitting
             // any strange errors. If it's successful, then we'll do a true
@@ -503,7 +509,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 ProbeScope::AllTraits,
                 expected.only_has_type(self),
             ) else {
-                return None;
+                return;
             };
 
             let pick = self.confirm_method(
@@ -515,7 +521,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 segment,
             );
             if pick.illegal_sized_bound.is_some() {
-                return None;
+                return;
             }
 
             let up_to_rcvr_span = segment.ident.span.until(callee_expr.span);
@@ -557,22 +563,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     sugg,
                     Applicability::MaybeIncorrect,
                 );
-
-                // Let's check the method fully now
-                let return_ty = self.check_method_argument_types(
-                    segment.ident.span,
-                    call_expr,
-                    Ok(pick.callee),
-                    rest,
-                    TupleArgumentsFlag::DontTupleArguments,
-                    expected,
-                );
-
-                return Some(return_ty);
             }
         }
-
-        None
     }
 
     fn report_invalid_callee(
@@ -620,7 +612,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         if let Some((removal_span, kind, path)) = &unit_variant {
             err.span_suggestion_verbose(
                 *removal_span,
-                &format!(
+                format!(
                     "`{path}` is a unit {kind}, and does not take parentheses to be constructed",
                 ),
                 "",
@@ -658,10 +650,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         if !self.maybe_suggest_bad_array_definition(&mut err, call_expr, callee_expr) {
             if let Some((maybe_def, output_ty, _)) = self.extract_callable_info(callee_ty)
-                && !self.type_is_sized_modulo_regions(self.param_env, output_ty, callee_expr.span)
+                && !self.type_is_sized_modulo_regions(self.param_env, output_ty)
             {
                 let descr = match maybe_def {
-                    DefIdOrName::DefId(def_id) => self.tcx.def_kind(def_id).descr(def_id),
+                    DefIdOrName::DefId(def_id) => self.tcx.def_descr(def_id),
                     DefIdOrName::Name(name) => name,
                 };
                 err.span_label(
@@ -823,7 +815,7 @@ impl<'a, 'tcx> DeferredCallResolution<'tcx> {
                 );
                 err.help(
                     "make sure the `fn`/`fn_mut`/`fn_once` lang items are defined \
-                     and have associated `call`/`call_mut`/`call_once` functions",
+                     and have correctly defined `call`/`call_mut`/`call_once` methods",
                 );
                 err.emit();
             }

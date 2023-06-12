@@ -2,6 +2,7 @@
 	--main-background-color: white;
 	--main-color: black;
 	--settings-input-color: #2196f3;
+	--settings-input-border-color: #717171;
 	--settings-button-color: #000;
 	--settings-button-border-focus: #717171;
 	--sidebar-background-color: #F5F5F5;
@@ -38,6 +39,7 @@
 	--search-result-link-focus-background-color: #ccc;
 	--search-result-border-color: #aaa3;
 	--search-color: #000;
+	--search-error-code-background-color: #d0cccc;
 	--search-results-alias-color: #000;
 	--search-results-grey-color: #999;
 	--search-tab-title-count-color: #888;
@@ -69,8 +71,6 @@
 	--test-arrow-hover-background-color: #4e8bca;
 	--target-background-color: #fdffd3;
 	--target-border-color: #ad7c37;
-	--tooltip-background-color: #000;
-	--tooltip-color: #fff;
 	--kbd-color: #000;
 	--kbd-background: #fafbfc;
 	--kbd-box-shadow-color: #c6cbd1;

@@ -2,10 +2,11 @@ use cranelift_codegen::isa::TargetFrontendConfig;
 use gimli::write::FileId;
 
 use rustc_data_structures::sync::Lrc;
-use rustc_index::vec::IndexVec;
+use rustc_index::IndexVec;
 use rustc_middle::ty::layout::{
     FnAbiError, FnAbiOfHelpers, FnAbiRequest, LayoutError, LayoutOfHelpers,
 };
+use rustc_span::source_map::Spanned;
 use rustc_span::SourceFile;
 use rustc_target::abi::call::FnAbi;
 use rustc_target::abi::{Integer, Primitive};
@@ -72,19 +73,6 @@ fn clif_type_from_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<types::Typ
                 pointer_ty(tcx)
             }
         }
-        ty::Adt(adt_def, _) if adt_def.repr().simd() => {
-            let (element, count) = match &tcx.layout_of(ParamEnv::reveal_all().and(ty)).unwrap().abi
-            {
-                Abi::Vector { element, count } => (element.clone(), *count),
-                _ => unreachable!(),
-            };
-
-            match scalar_to_clif_type(tcx, element).by(u32::try_from(count).unwrap()) {
-                // Cranelift currently only implements icmp for 128bit vectors.
-                Some(vector_ty) if vector_ty.bits() == 128 => vector_ty,
-                _ => return None,
-            }
-        }
         ty::Param(_) => bug!("ty param {:?}", ty),
         _ => return None,
     })
@@ -96,12 +84,7 @@ fn clif_pair_type_from_ty<'tcx>(
 ) -> Option<(types::Type, types::Type)> {
     Some(match ty.kind() {
         ty::Tuple(types) if types.len() == 2 => {
-            let a = clif_type_from_ty(tcx, types[0])?;
-            let b = clif_type_from_ty(tcx, types[1])?;
-            if a.is_vector() || b.is_vector() {
-                return None;
-            }
-            (a, b)
+            (clif_type_from_ty(tcx, types[0])?, clif_type_from_ty(tcx, types[1])?)
         }
         ty::RawPtr(TypeAndMut { ty: pointee_ty, mutbl: _ }) | ty::Ref(_, pointee_ty, _) => {
             if has_ptr_meta(tcx, *pointee_ty) {
@@ -254,6 +237,44 @@ pub(crate) fn type_sign(ty: Ty<'_>) -> bool {
     }
 }
 
+pub(crate) fn create_wrapper_function(
+    module: &mut dyn Module,
+    unwind_context: &mut UnwindContext,
+    sig: Signature,
+    wrapper_name: &str,
+    callee_name: &str,
+) {
+    let wrapper_func_id = module.declare_function(wrapper_name, Linkage::Export, &sig).unwrap();
+    let callee_func_id = module.declare_function(callee_name, Linkage::Import, &sig).unwrap();
+
+    let mut ctx = Context::new();
+    ctx.func.signature = sig;
+    {
+        let mut func_ctx = FunctionBuilderContext::new();
+        let mut bcx = FunctionBuilder::new(&mut ctx.func, &mut func_ctx);
+
+        let block = bcx.create_block();
+        bcx.switch_to_block(block);
+        let func = &mut bcx.func.stencil;
+        let args = func
+            .signature
+            .params
+            .iter()
+            .map(|param| func.dfg.append_block_param(block, param.value_type))
+            .collect::<Vec<Value>>();
+
+        let callee_func_ref = module.declare_func_in_func(callee_func_id, &mut bcx.func);
+        let call_inst = bcx.ins().call(callee_func_ref, &args);
+        let results = bcx.inst_results(call_inst).to_vec(); // Clone to prevent borrow error
+
+        bcx.ins().return_(&results);
+        bcx.seal_all_blocks();
+        bcx.finalize();
+    }
+    module.define_function(wrapper_func_id, &mut ctx).unwrap();
+    unwind_context.add_function(wrapper_func_id, &ctx, module.isa());
+}
+
 pub(crate) struct FunctionCx<'m, 'clif, 'tcx: 'm> {
     pub(crate) cx: &'clif mut crate::CodegenCx,
     pub(crate) module: &'m mut dyn Module,
@@ -336,12 +357,12 @@ impl<'tcx> HasTargetSpec for FunctionCx<'_, '_, 'tcx> {
 impl<'tcx> FunctionCx<'_, '_, 'tcx> {
     pub(crate) fn monomorphize<T>(&self, value: T) -> T
     where
-        T: TypeFoldable<'tcx> + Copy,
+        T: TypeFoldable<TyCtxt<'tcx>> + Copy,
     {
         self.instance.subst_mir_and_normalize_erasing_regions(
             self.tcx,
             ty::ParamEnv::reveal_all(),
-            value,
+            ty::EarlyBinder::bind(value),
         )
     }
 
@@ -457,7 +478,7 @@ impl<'tcx> LayoutOfHelpers<'tcx> for RevealAllLayoutCx<'tcx> {
     #[inline]
     fn handle_layout_err(&self, err: LayoutError<'tcx>, span: Span, ty: Ty<'tcx>) -> ! {
         if let layout::LayoutError::SizeOverflow(_) = err {
-            self.0.sess.span_fatal(span, &err.to_string())
+            self.0.sess.span_fatal(span, err.to_string())
         } else {
             span_bug!(span, "failed to get layout for `{}`: {}", ty, err)
         }
@@ -475,25 +496,16 @@ impl<'tcx> FnAbiOfHelpers<'tcx> for RevealAllLayoutCx<'tcx> {
         fn_abi_request: FnAbiRequest<'tcx>,
     ) -> ! {
         if let FnAbiError::Layout(LayoutError::SizeOverflow(_)) = err {
-            self.0.sess.span_fatal(span, &err.to_string())
+            self.0.sess.emit_fatal(Spanned { span, node: err })
         } else {
             match fn_abi_request {
                 FnAbiRequest::OfFnPtr { sig, extra_args } => {
-                    span_bug!(
-                        span,
-                        "`fn_abi_of_fn_ptr({}, {:?})` failed: {}",
-                        sig,
-                        extra_args,
-                        err
-                    );
+                    span_bug!(span, "`fn_abi_of_fn_ptr({sig}, {extra_args:?})` failed: {err:?}");
                 }
                 FnAbiRequest::OfInstance { instance, extra_args } => {
                     span_bug!(
                         span,
-                        "`fn_abi_of_instance({}, {:?})` failed: {}",
-                        instance,
-                        extra_args,
-                        err
+                        "`fn_abi_of_instance({instance}, {extra_args:?})` failed: {err:?}"
                     );
                 }
             }

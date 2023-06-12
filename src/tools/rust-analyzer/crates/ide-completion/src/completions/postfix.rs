@@ -6,7 +6,7 @@ use hir::{Documentation, HasAttrs};
 use ide_db::{imports::insert_use::ImportScope, ty_filter::TryEnum, SnippetCap};
 use syntax::{
     ast::{self, make, AstNode, AstToken},
-    SyntaxKind::{EXPR_STMT, STMT_LIST},
+    SyntaxKind::{BLOCK_EXPR, EXPR_STMT, FOR_EXPR, IF_EXPR, LOOP_EXPR, STMT_LIST, WHILE_EXPR},
     TextRange, TextSize,
 };
 use text_edit::TextEdit;
@@ -64,7 +64,7 @@ pub(crate) fn complete_postfix(
                     &format!("drop($0{receiver_text})"),
                 );
                 item.set_documentation(drop_fn.docs(ctx.db));
-                item.add_to(acc);
+                item.add_to(acc, ctx.db);
             }
         }
     }
@@ -78,14 +78,14 @@ pub(crate) fn complete_postfix(
                     "if let Ok {}",
                     &format!("if let Ok($1) = {receiver_text} {{\n    $0\n}}"),
                 )
-                .add_to(acc);
+                .add_to(acc, ctx.db);
 
                 postfix_snippet(
                     "while",
                     "while let Ok {}",
                     &format!("while let Ok($1) = {receiver_text} {{\n    $0\n}}"),
                 )
-                .add_to(acc);
+                .add_to(acc, ctx.db);
             }
             TryEnum::Option => {
                 postfix_snippet(
@@ -93,22 +93,22 @@ pub(crate) fn complete_postfix(
                     "if let Some {}",
                     &format!("if let Some($1) = {receiver_text} {{\n    $0\n}}"),
                 )
-                .add_to(acc);
+                .add_to(acc, ctx.db);
 
                 postfix_snippet(
                     "while",
                     "while let Some {}",
                     &format!("while let Some($1) = {receiver_text} {{\n    $0\n}}"),
                 )
-                .add_to(acc);
+                .add_to(acc, ctx.db);
             }
         }
     } else if receiver_ty.is_bool() || receiver_ty.is_unknown() {
         postfix_snippet("if", "if expr {}", &format!("if {receiver_text} {{\n    $0\n}}"))
-            .add_to(acc);
+            .add_to(acc, ctx.db);
         postfix_snippet("while", "while expr {}", &format!("while {receiver_text} {{\n    $0\n}}"))
-            .add_to(acc);
-        postfix_snippet("not", "!expr", &format!("!{receiver_text}")).add_to(acc);
+            .add_to(acc, ctx.db);
+        postfix_snippet("not", "!expr", &format!("!{receiver_text}")).add_to(acc, ctx.db);
     } else if let Some(trait_) = ctx.famous_defs().core_iter_IntoIterator() {
         if receiver_ty.impls_trait(ctx.db, trait_, &[]) {
             postfix_snippet(
@@ -116,12 +116,28 @@ pub(crate) fn complete_postfix(
                 "for ele in expr {}",
                 &format!("for ele in {receiver_text} {{\n    $0\n}}"),
             )
-            .add_to(acc);
+            .add_to(acc, ctx.db);
         }
     }
 
-    postfix_snippet("ref", "&expr", &format!("&{receiver_text}")).add_to(acc);
-    postfix_snippet("refm", "&mut expr", &format!("&mut {receiver_text}")).add_to(acc);
+    postfix_snippet("ref", "&expr", &format!("&{receiver_text}")).add_to(acc, ctx.db);
+    postfix_snippet("refm", "&mut expr", &format!("&mut {receiver_text}")).add_to(acc, ctx.db);
+
+    let mut unsafe_should_be_wrapped = true;
+    if dot_receiver.syntax().kind() == BLOCK_EXPR {
+        unsafe_should_be_wrapped = false;
+        if let Some(parent) = dot_receiver.syntax().parent() {
+            if matches!(parent.kind(), IF_EXPR | WHILE_EXPR | LOOP_EXPR | FOR_EXPR) {
+                unsafe_should_be_wrapped = true;
+            }
+        }
+    };
+    let unsafe_completion_string = if unsafe_should_be_wrapped {
+        format!("unsafe {{ {receiver_text} }}")
+    } else {
+        format!("unsafe {receiver_text}")
+    };
+    postfix_snippet("unsafe", "unsafe {}", &unsafe_completion_string).add_to(acc, ctx.db);
 
     // The rest of the postfix completions create an expression that moves an argument,
     // so it's better to consider references now to avoid breaking the compilation
@@ -146,7 +162,7 @@ pub(crate) fn complete_postfix(
                     "match expr {}",
                     &format!("match {receiver_text} {{\n    Ok(${{1:_}}) => {{$2}},\n    Err(${{3:_}}) => {{$0}},\n}}"),
                 )
-                .add_to(acc);
+                .add_to(acc, ctx.db);
             }
             TryEnum::Option => {
                 postfix_snippet(
@@ -156,7 +172,7 @@ pub(crate) fn complete_postfix(
                         "match {receiver_text} {{\n    Some(${{1:_}}) => {{$2}},\n    None => {{$0}},\n}}"
                     ),
                 )
-                .add_to(acc);
+                .add_to(acc, ctx.db);
             }
         },
         None => {
@@ -165,20 +181,23 @@ pub(crate) fn complete_postfix(
                 "match expr {}",
                 &format!("match {receiver_text} {{\n    ${{1:_}} => {{$0}},\n}}"),
             )
-            .add_to(acc);
+            .add_to(acc, ctx.db);
         }
     }
 
-    postfix_snippet("box", "Box::new(expr)", &format!("Box::new({receiver_text})")).add_to(acc);
-    postfix_snippet("dbg", "dbg!(expr)", &format!("dbg!({receiver_text})")).add_to(acc); // fixme
-    postfix_snippet("dbgr", "dbg!(&expr)", &format!("dbg!(&{receiver_text})")).add_to(acc);
-    postfix_snippet("call", "function(expr)", &format!("${{1}}({receiver_text})")).add_to(acc);
+    postfix_snippet("box", "Box::new(expr)", &format!("Box::new({receiver_text})"))
+        .add_to(acc, ctx.db);
+    postfix_snippet("dbg", "dbg!(expr)", &format!("dbg!({receiver_text})")).add_to(acc, ctx.db); // fixme
+    postfix_snippet("dbgr", "dbg!(&expr)", &format!("dbg!(&{receiver_text})")).add_to(acc, ctx.db);
+    postfix_snippet("call", "function(expr)", &format!("${{1}}({receiver_text})"))
+        .add_to(acc, ctx.db);
 
     if let Some(parent) = dot_receiver.syntax().parent().and_then(|p| p.parent()) {
         if matches!(parent.kind(), STMT_LIST | EXPR_STMT) {
-            postfix_snippet("let", "let", &format!("let $0 = {receiver_text};")).add_to(acc);
+            postfix_snippet("let", "let", &format!("let $0 = {receiver_text};"))
+                .add_to(acc, ctx.db);
             postfix_snippet("letm", "let mut", &format!("let mut $0 = {receiver_text};"))
-                .add_to(acc);
+                .add_to(acc, ctx.db);
         }
     }
 
@@ -299,7 +318,7 @@ fn add_custom_postfix_completions(
             for import in imports.into_iter() {
                 builder.add_import(import);
             }
-            builder.add_to(acc);
+            builder.add_to(acc, ctx.db);
         },
     );
     None
@@ -329,18 +348,19 @@ fn main() {
 }
 "#,
             expect![[r#"
-                sn box   Box::new(expr)
-                sn call  function(expr)
-                sn dbg   dbg!(expr)
-                sn dbgr  dbg!(&expr)
-                sn if    if expr {}
-                sn let   let
-                sn letm  let mut
-                sn match match expr {}
-                sn not   !expr
-                sn ref   &expr
-                sn refm  &mut expr
-                sn while while expr {}
+                sn box    Box::new(expr)
+                sn call   function(expr)
+                sn dbg    dbg!(expr)
+                sn dbgr   dbg!(&expr)
+                sn if     if expr {}
+                sn let    let
+                sn letm   let mut
+                sn match  match expr {}
+                sn not    !expr
+                sn ref    &expr
+                sn refm   &mut expr
+                sn unsafe unsafe {}
+                sn while  while expr {}
             "#]],
         );
     }
@@ -359,16 +379,17 @@ fn main() {
 }
 "#,
             expect![[r#"
-                sn box   Box::new(expr)
-                sn call  function(expr)
-                sn dbg   dbg!(expr)
-                sn dbgr  dbg!(&expr)
-                sn if    if expr {}
-                sn match match expr {}
-                sn not   !expr
-                sn ref   &expr
-                sn refm  &mut expr
-                sn while while expr {}
+                sn box    Box::new(expr)
+                sn call   function(expr)
+                sn dbg    dbg!(expr)
+                sn dbgr   dbg!(&expr)
+                sn if     if expr {}
+                sn match  match expr {}
+                sn not    !expr
+                sn ref    &expr
+                sn refm   &mut expr
+                sn unsafe unsafe {}
+                sn while  while expr {}
             "#]],
         );
     }
@@ -383,15 +404,16 @@ fn main() {
 }
 "#,
             expect![[r#"
-                sn box   Box::new(expr)
-                sn call  function(expr)
-                sn dbg   dbg!(expr)
-                sn dbgr  dbg!(&expr)
-                sn let   let
-                sn letm  let mut
-                sn match match expr {}
-                sn ref   &expr
-                sn refm  &mut expr
+                sn box    Box::new(expr)
+                sn call   function(expr)
+                sn dbg    dbg!(expr)
+                sn dbgr   dbg!(&expr)
+                sn let    let
+                sn letm   let mut
+                sn match  match expr {}
+                sn ref    &expr
+                sn refm   &mut expr
+                sn unsafe unsafe {}
             "#]],
         )
     }
@@ -406,18 +428,19 @@ fn main() {
 }
 "#,
             expect![[r#"
-                sn box   Box::new(expr)
-                sn call  function(expr)
-                sn dbg   dbg!(expr)
-                sn dbgr  dbg!(&expr)
-                sn if    if expr {}
-                sn let   let
-                sn letm  let mut
-                sn match match expr {}
-                sn not   !expr
-                sn ref   &expr
-                sn refm  &mut expr
-                sn while while expr {}
+                sn box    Box::new(expr)
+                sn call   function(expr)
+                sn dbg    dbg!(expr)
+                sn dbgr   dbg!(&expr)
+                sn if     if expr {}
+                sn let    let
+                sn letm   let mut
+                sn match  match expr {}
+                sn not    !expr
+                sn ref    &expr
+                sn refm   &mut expr
+                sn unsafe unsafe {}
+                sn while  while expr {}
             "#]],
         );
     }
@@ -515,6 +538,49 @@ fn main() {
 }
 "#,
         )
+    }
+
+    #[test]
+    fn postfix_completion_for_unsafe() {
+        check_edit("unsafe", r#"fn main() { foo.$0 }"#, r#"fn main() { unsafe { foo } }"#);
+        check_edit("unsafe", r#"fn main() { { foo }.$0 }"#, r#"fn main() { unsafe { foo } }"#);
+        check_edit(
+            "unsafe",
+            r#"fn main() { if x { foo }.$0 }"#,
+            r#"fn main() { unsafe { if x { foo } } }"#,
+        );
+        check_edit(
+            "unsafe",
+            r#"fn main() { loop { foo }.$0 }"#,
+            r#"fn main() { unsafe { loop { foo } } }"#,
+        );
+        check_edit(
+            "unsafe",
+            r#"fn main() { if true {}.$0 }"#,
+            r#"fn main() { unsafe { if true {} } }"#,
+        );
+        check_edit(
+            "unsafe",
+            r#"fn main() { while true {}.$0 }"#,
+            r#"fn main() { unsafe { while true {} } }"#,
+        );
+        check_edit(
+            "unsafe",
+            r#"fn main() { for i in 0..10 {}.$0 }"#,
+            r#"fn main() { unsafe { for i in 0..10 {} } }"#,
+        );
+        check_edit(
+            "unsafe",
+            r#"fn main() { let x = if true {1} else {2}.$0 }"#,
+            r#"fn main() { let x = unsafe { if true {1} else {2} } }"#,
+        );
+
+        // completion will not be triggered
+        check_edit(
+            "unsafe",
+            r#"fn main() { let x = true else {panic!()}.$0}"#,
+            r#"fn main() { let x = true else {panic!()}.unsafe}"#,
+        );
     }
 
     #[test]
@@ -682,6 +748,18 @@ fn main() {
     Ok(&a.a)
 }
             "#,
+        );
+    }
+
+    #[test]
+    fn no_postfix_completions_in_if_block_that_has_an_else() {
+        check(
+            r#"
+fn test() {
+    if true {}.$0 else {}
+}
+"#,
+            expect![[r#""#]],
         );
     }
 }

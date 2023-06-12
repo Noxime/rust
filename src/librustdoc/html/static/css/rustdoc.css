@@ -6,6 +6,10 @@
 	3. Copy the filenames with updated suffixes from the directory.
 */
 
+:root {
+	--nav-sub-mobile-padding: 8px;
+}
+
 /* See FiraSans-LICENSE.txt for the Fira Sans license. */
 @font-face {
 	font-family: 'Fira Sans';
@@ -87,21 +91,6 @@
 	box-sizing: border-box;
 }
 
-/* This part handles the "default" theme being used depending on the system one. */
-html {
-	content: "";
-}
-@media (prefers-color-scheme: light) {
-	html {
-		content: "light";
-	}
-}
-@media (prefers-color-scheme: dark) {
-	html {
-		content: "dark";
-	}
-}
-
 /* General structure and fonts */
 
 body {
@@ -174,6 +163,14 @@ h1, h2, h3, h4 {
 .top-doc .docblock > h4 {
 	border-bottom: 1px solid var(--headings-border-bottom-color);
 }
+/* while line-height 1.5 is required for any "block of text",
+	which WCAG defines as more than one sentence, it looks weird for
+	very large main headers */
+h1, h2 {
+	line-height: 1.25;
+	padding-top: 3px;
+	padding-bottom: 9px;
+}
 h3.code-header {
 	font-size: 1.125rem; /* 18px */
 }
@@ -193,7 +190,7 @@ h1, h2, h3, h4, h5, h6,
 .mobile-topbar,
 .search-input,
 .search-results .result-name,
-.item-left > a,
+.item-name > a,
 .out-of-band,
 span.since,
 a.srclink,
@@ -209,7 +206,7 @@ ul.all-items {
 a.anchor,
 .small-section-header a,
 #source-sidebar a,
-pre.rust a,
+.rust a,
 .sidebar h2 a,
 .sidebar h3 a,
 .mobile-topbar h2 a,
@@ -220,43 +217,43 @@ h1 a,
 	color: var(--main-color);
 }
 
-.content span.enum, .content a.enum,
-.content span.struct, .content a.struct,
-.content span.union, .content a.union,
-.content span.primitive, .content a.primitive,
-.content span.type, .content a.type,
-.content span.foreigntype, .content a.foreigntype {
+span.enum, a.enum,
+span.struct, a.struct,
+span.union, a.union,
+span.primitive, a.primitive,
+span.type, a.type,
+span.foreigntype, a.foreigntype {
 	color: var(--type-link-color);
 }
 
-.content span.trait, .content a.trait,
-.content span.traitalias, .content a.traitalias {
+span.trait, a.trait,
+span.traitalias, a.traitalias {
 	color: var(--trait-link-color);
 }
 
-.content span.associatedtype, .content a.associatedtype,
-.content span.constant, .content a.constant,
-.content span.static, .content a.static {
+span.associatedtype, a.associatedtype,
+span.constant, a.constant,
+span.static, a.static {
 	color: var(--assoc-item-link-color);
 }
 
-.content span.fn, .content a.fn,
-.content span.method, .content a.method,
-.content span.tymethod, .content a.tymethod {
+span.fn, a.fn,
+span.method, a.method,
+span.tymethod, a.tymethod {
 	color: var(--function-link-color);
 }
 
-.content span.attr, .content a.attr,
-.content span.derive, .content a.derive,
-.content span.macro, .content a.macro {
+span.attr, a.attr,
+span.derive, a.derive,
+span.macro, a.macro {
 	color: var(--macro-link-color);
 }
 
-.content span.mod, .content a.mod {
+span.mod, a.mod {
 	color: var(--mod-link-color);
 }
 
-.content span.keyword, .content a.keyword {
+span.keyword, a.keyword {
 	color: var(--keyword-link-color);
 }
 
@@ -355,7 +352,7 @@ pre.item-decl {
 .source .content pre {
 	padding: 20px;
 }
-.rustdoc.source .example-wrap > pre.src-line-numbers  {
+.rustdoc.source .example-wrap pre.src-line-numbers  {
 	padding: 20px 0 20px 4px;
 }
 
@@ -387,6 +384,7 @@ img {
 	font-size: 0.875rem;
 	flex: 0 0 200px;
 	overflow-y: scroll;
+	overscroll-behavior: contain;
 	position: sticky;
 	height: 100vh;
 	top: 0;
@@ -399,6 +397,7 @@ img {
 	overflow-x: hidden;
 	/* The sidebar is by default hidden  */
 	overflow-y: hidden;
+	z-index: 1;
 }
 
 .sidebar, .mobile-topbar, .sidebar-menu-toggle,
@@ -539,14 +538,17 @@ ul.block, .block li {
 	margin-bottom: 0px;
 }
 
-.rustdoc .example-wrap > pre {
+.rustdoc .example-wrap pre {
 	margin: 0;
 	flex-grow: 1;
+}
+
+.rustdoc:not(.source) .example-wrap pre {
 	overflow: auto hidden;
 }
 
-.rustdoc .example-wrap > pre.example-line-numbers,
-.rustdoc .example-wrap > pre.src-line-numbers {
+.rustdoc .example-wrap pre.example-line-numbers,
+.rustdoc .example-wrap pre.src-line-numbers {
 	flex-grow: 0;
 	min-width: fit-content; /* prevent collapsing into nothing in truncated scraped examples */
 	overflow: initial;
@@ -557,7 +559,7 @@ ul.block, .block li {
 	color: var(--src-line-numbers-span-color);
 }
 
-.rustdoc .example-wrap > pre.src-line-numbers {
+.rustdoc .example-wrap pre.src-line-numbers {
 	padding: 14px 0;
 }
 .src-line-numbers a, .src-line-numbers span {
@@ -705,10 +707,10 @@ h2.small-section-header > .anchor {
 }
 
 .main-heading a:hover,
-.example-wrap > pre.rust a:hover,
+.example-wrap .rust a:hover,
 .all-items a:hover,
-.docblock a:not(.test-arrow):not(.scrape-help):hover,
-.docblock-short a:not(.test-arrow):not(.scrape-help):hover,
+.docblock a:not(.test-arrow):not(.scrape-help):not(.tooltip):hover,
+.docblock-short a:not(.test-arrow):not(.scrape-help):not(.tooltip):hover,
 .item-info a {
 	text-decoration: underline;
 }
@@ -742,14 +744,16 @@ table,
 
 .item-table {
 	display: table;
+	padding: 0;
+	margin: 0;
 }
-.item-row {
+.item-table > li {
 	display: table-row;
 }
-.item-left, .item-right {
+.item-table > li > div {
 	display: table-cell;
 }
-.item-left {
+.item-table > li > .item-name {
 	padding-right: 1.25rem;
 }
 
@@ -954,7 +958,7 @@ so that we can apply CSS-filters to change the arrow color in themes */
 	padding: 3px;
 	margin-bottom: 5px;
 }
-.item-left .stab {
+.item-name .stab {
 	margin-left: 0.3125em;
 }
 .stab {
@@ -1101,44 +1105,8 @@ pre.rust .doccomment {
 	display: block;
 	left: -25px;
 	top: 5px;
-}
-
-.example-wrap .tooltip:hover::after {
-	padding: 5px 3px 3px 3px;
-	border-radius: 6px;
-	margin-left: 5px;
-	font-size: 1rem;
-	border: 1px solid var(--border-color);
-	position: absolute;
-	width: max-content;
-	top: -2px;
-	z-index: 1;
-	background-color: var(--tooltip-background-color);
-	color: var(--tooltip-color);
-}
-
-.example-wrap .tooltip:hover::before {
-	content: " ";
-	position: absolute;
-	top: 50%;
-	left: 16px;
-	margin-top: -5px;
-	z-index: 1;
-	border: 5px solid transparent;
-	border-right-color: var(--tooltip-background-color);
-}
-
-.example-wrap.ignore .tooltip:hover::after {
-	content: "This example is not tested";
-}
-.example-wrap.compile_fail .tooltip:hover::after {
-	content: "This example deliberately fails to compile";
-}
-.example-wrap.should_panic .tooltip:hover::after {
-	content: "This example panics";
-}
-.example-wrap.edition .tooltip:hover::after {
-	content: "This code runs with edition " attr(data-edition);
+	margin: 0;
+	line-height: 1;
 }
 
 .example-wrap.compile_fail .tooltip,
@@ -1176,6 +1144,7 @@ a.test-arrow:hover {
 .item-spacer {
 	width: 100%;
 	height: 12px;
+	display: block;
 }
 
 .out-of-band > span.since {
@@ -1204,16 +1173,20 @@ a.test-arrow:hover {
 	border-right: 3px solid var(--target-border-color);
 }
 
-.notable-traits {
+.code-header a.tooltip {
 	color: inherit;
 	margin-right: 15px;
 	position: relative;
 }
 
+.code-header a.tooltip:hover {
+	color: var(--link-color);
+}
+
 /* placeholder thunk so that the mouse can easily travel from "(i)" to popover
 	the resulting "hover tunnel" is a stepped triangle, approximating
 	https://bjk5.com/post/44698559168/breaking-down-amazons-mega-dropdown */
-.notable-traits:hover::after {
+a.tooltip:hover::after {
 	position: absolute;
 	top: calc(100% - 10px);
 	left: -15px;
@@ -1222,11 +1195,19 @@ a.test-arrow:hover {
 	content: "\00a0";
 }
 
-.notable .content {
+/* This animation is layered onto the mistake-proofing delay for dismissing
+	a hovered tooltip, to ensure it feels responsive even with the delay.
+	*/
+.fade-out {
+	opacity: 0;
+	transition: opacity 0.45s cubic-bezier(0, 0, 0.1, 1.0);
+}
+
+.popover.tooltip .content {
 	margin: 0.25em 0.5em;
 }
 
-.notable .content pre, .notable .content code {
+.popover.tooltip .content pre, .popover.tooltip .content code {
 	background: transparent;
 	margin: 0;
 	padding: 0;
@@ -1234,7 +1215,7 @@ a.test-arrow:hover {
 	white-space: pre-wrap;
 }
 
-.notable .content > h3:first-child {
+.popover.tooltip .content > h3:first-child {
 	margin: 0 0 5px 0;
 }
 
@@ -1283,6 +1264,15 @@ a.test-arrow:hover {
 #search-tabs .count {
 	font-size: 1rem;
 	color: var(--search-tab-title-count-color);
+}
+
+#search .error code {
+	border-radius: 3px;
+	background-color: var(--search-error-code-background-color);
+}
+
+.search-corrections {
+	font-weight: normal;
 }
 
 #src-sidebar-toggle {
@@ -1558,7 +1548,7 @@ However, it's not needed with smaller screen width because the doc/code block is
 /*
 WARNING: RUSTDOC_MOBILE_BREAKPOINT MEDIA QUERY
 If you update this line, then you also need to update the line with the same warning
-in storage.js
+in source-script.js
 */
 @media (max-width: 700px) {
 	/* When linking to an item with an `id` (for instance, by clicking a link in the sidebar,
@@ -1722,7 +1712,7 @@ in storage.js
 	}
 
 	/* Display an alternating layout on tablets and phones */
-	.item-table, .item-row, .item-left, .item-right,
+	.item-table, .item-row, .item-table > li, .item-table > li > div,
 	.search-results > a, .search-results > a > div {
 		display: block;
 	}
@@ -1731,7 +1721,7 @@ in storage.js
 	.search-results > a {
 		padding: 5px 0px;
 	}
-	.search-results > a > div.desc, .item-right {
+	.search-results > a > div.desc, .item-table > li > div.desc {
 		padding-left: 2em;
 	}
 
@@ -1757,7 +1747,7 @@ in storage.js
 
 	.source nav.sub {
 		margin: 0;
-		padding: 8px;
+		padding: var(--nav-sub-mobile-padding);
 	}
 }
 
@@ -1814,6 +1804,7 @@ in storage.js
 	.sub-logo-container > img {
 		height: 35px;
 		width: 35px;
+		margin-bottom: var(--nav-sub-mobile-padding);
 	}
 }
 

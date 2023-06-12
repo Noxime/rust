@@ -5,7 +5,7 @@
 #![feature(io_error_uncategorized)]
 
 use std::convert::TryInto;
-use std::ffi::{CStr, CString};
+use std::ffi::{c_char, CStr, CString};
 use std::fs::{canonicalize, remove_dir_all, remove_file, File};
 use std::io::{Error, ErrorKind, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -31,7 +31,11 @@ fn tmp() -> PathBuf {
 
     unsafe {
         extern "Rust" {
-            fn miri_host_to_target_path(path: *const i8, out: *mut i8, out_size: usize) -> usize;
+            fn miri_host_to_target_path(
+                path: *const c_char,
+                out: *mut c_char,
+                out_size: usize,
+            ) -> usize;
         }
         let ret = miri_host_to_target_path(path.as_ptr(), out.as_mut_ptr(), out.capacity());
         assert_eq!(ret, 0);
@@ -126,7 +130,7 @@ fn test_readlink() {
     let mut large_buf = vec![0xFF; expected_path.len() + 1];
     let res =
         unsafe { libc::readlink(symlink_c_ptr, large_buf.as_mut_ptr().cast(), large_buf.len()) };
-    // Check that the resovled path was properly written into the buf.
+    // Check that the resolved path was properly written into the buf.
     assert_eq!(&large_buf[..(large_buf.len() - 1)], expected_path);
     assert_eq!(large_buf.last(), Some(&0xFF));
     assert_eq!(res, large_buf.len() as isize - 1);

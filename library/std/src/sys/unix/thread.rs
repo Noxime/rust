@@ -9,7 +9,7 @@ use crate::time::Duration;
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 use crate::sys::weak::dlsym;
-#[cfg(any(target_os = "solaris", target_os = "illumos"))]
+#[cfg(any(target_os = "solaris", target_os = "illumos", target_os = "nto"))]
 use crate::sys::weak::weak;
 #[cfg(not(any(target_os = "l4re", target_os = "vxworks", target_os = "espidf")))]
 pub const DEFAULT_MIN_STACK_SIZE: usize = 2 * 1024 * 1024;
@@ -163,17 +163,16 @@ impl Thread {
     #[cfg(target_os = "netbsd")]
     pub fn set_name(name: &CStr) {
         unsafe {
-            let cname = CStr::from_bytes_with_nul_unchecked(b"%s\0".as_slice());
             let res = libc::pthread_setname_np(
                 libc::pthread_self(),
-                cname.as_ptr(),
+                c"%s".as_ptr(),
                 name.as_ptr() as *mut libc::c_void,
             );
             debug_assert_eq!(res, 0);
         }
     }
 
-    #[cfg(any(target_os = "solaris", target_os = "illumos"))]
+    #[cfg(any(target_os = "solaris", target_os = "illumos", target_os = "nto"))]
     pub fn set_name(name: &CStr) {
         weak! {
             fn pthread_setname_np(
@@ -326,6 +325,25 @@ pub fn available_parallelism() -> io::Result<NonZeroUsize> {
         } else if #[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd"))] {
             use crate::ptr;
 
+            #[cfg(target_os = "freebsd")]
+            {
+                let mut set: libc::cpuset_t = unsafe { mem::zeroed() };
+                unsafe {
+                    if libc::cpuset_getaffinity(
+                        libc::CPU_LEVEL_WHICH,
+                        libc::CPU_WHICH_PID,
+                        -1,
+                        mem::size_of::<libc::cpuset_t>(),
+                        &mut set,
+                    ) == 0 {
+                        let count = libc::CPU_COUNT(&set) as usize;
+                        if count > 0 {
+                            return Ok(NonZeroUsize::new_unchecked(count));
+                        }
+                    }
+                }
+            }
+
             let mut cpus: libc::c_uint = 0;
             let mut cpus_size = crate::mem::size_of_val(&cpus);
 
@@ -381,6 +399,17 @@ pub fn available_parallelism() -> io::Result<NonZeroUsize> {
             }
 
             Ok(unsafe { NonZeroUsize::new_unchecked(cpus as usize) })
+        } else if #[cfg(target_os = "nto")] {
+            unsafe {
+                use libc::_syspage_ptr;
+                if _syspage_ptr.is_null() {
+                    Err(io::const_io_error!(io::ErrorKind::NotFound, "No syspage available"))
+                } else {
+                    let cpus = (*_syspage_ptr).num_cpu;
+                    NonZeroUsize::new(cpus as usize)
+                        .ok_or(io::const_io_error!(io::ErrorKind::NotFound, "The number of hardware threads is not known for the target platform"))
+                }
+            }
         } else if #[cfg(target_os = "haiku")] {
             // system_info cpu_count field gets the static data set at boot time with `smp_set_num_cpus`
             // `get_system_info` calls then `smp_get_num_cpus`

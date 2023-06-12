@@ -1,17 +1,21 @@
+use crate::error::UnsupportedFnAbi;
 use crate::middle::codegen_fn_attrs::CodegenFnAttrFlags;
+use crate::query::TyCtxtAt;
 use crate::ty::normalize_erasing_regions::NormalizationError;
-use crate::ty::{self, ReprOptions, Ty, TyCtxt, TypeVisitable};
+use crate::ty::{self, ReprOptions, Ty, TyCtxt, TypeVisitableExt};
+use rustc_error_messages::DiagnosticMessage;
 use rustc_errors::{DiagnosticBuilder, Handler, IntoDiagnostic};
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
-use rustc_index::vec::Idx;
+use rustc_index::IndexVec;
 use rustc_session::config::OptLevel;
+use rustc_span::symbol::{sym, Symbol};
 use rustc_span::{Span, DUMMY_SP};
 use rustc_target::abi::call::FnAbi;
 use rustc_target::abi::*;
 use rustc_target::spec::{abi::Abi as SpecAbi, HasTargetSpec, PanicStrategy, Target};
 
-use std::cmp::{self};
+use std::cmp;
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::ops::Bound;
@@ -91,7 +95,7 @@ impl IntegerExt for Integer {
             if discr < fit {
                 bug!(
                     "Integer::repr_discr: `#[repr]` hint too small for \
-                      discriminant range of enum `{}",
+                      discriminant range of enum `{}`",
                     ty
                 )
             }
@@ -168,37 +172,76 @@ pub const FAT_PTR_EXTRA: usize = 1;
 /// * Cranelift stores the base-2 log of the lane count in a 4 bit integer.
 pub const MAX_SIMD_LANES: u64 = 1 << 0xF;
 
+/// Used in `check_validity_requirement` to indicate the kind of initialization
+/// that is checked to be valid
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, HashStable)]
+pub enum ValidityRequirement {
+    Inhabited,
+    Zero,
+    /// The return value of mem::uninitialized, 0x01
+    /// (unless -Zstrict-init-checks is on, in which case it's the same as Uninit).
+    UninitMitigated0x01Fill,
+    /// True uninitialized memory.
+    Uninit,
+}
+
+impl ValidityRequirement {
+    pub fn from_intrinsic(intrinsic: Symbol) -> Option<Self> {
+        match intrinsic {
+            sym::assert_inhabited => Some(Self::Inhabited),
+            sym::assert_zero_valid => Some(Self::Zero),
+            sym::assert_mem_uninitialized_valid => Some(Self::UninitMitigated0x01Fill),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ValidityRequirement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inhabited => f.write_str("is inhabited"),
+            Self::Zero => f.write_str("allows being left zeroed"),
+            Self::UninitMitigated0x01Fill => f.write_str("allows being filled with 0x01"),
+            Self::Uninit => f.write_str("allows being left uninitialized"),
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, HashStable, TyEncodable, TyDecodable)]
 pub enum LayoutError<'tcx> {
     Unknown(Ty<'tcx>),
     SizeOverflow(Ty<'tcx>),
     NormalizationFailure(Ty<'tcx>, NormalizationError<'tcx>),
+    Cycle,
 }
 
-impl IntoDiagnostic<'_, !> for LayoutError<'_> {
-    fn into_diagnostic(self, handler: &Handler) -> DiagnosticBuilder<'_, !> {
-        let mut diag = handler.struct_fatal("");
-
+impl<'tcx> LayoutError<'tcx> {
+    pub fn diagnostic_message(&self) -> DiagnosticMessage {
+        use crate::fluent_generated::*;
+        use LayoutError::*;
         match self {
-            LayoutError::Unknown(ty) => {
-                diag.set_arg("ty", ty);
-                diag.set_primary_message(rustc_errors::fluent::middle_unknown_layout);
-            }
-            LayoutError::SizeOverflow(ty) => {
-                diag.set_arg("ty", ty);
-                diag.set_primary_message(rustc_errors::fluent::middle_values_too_big);
-            }
-            LayoutError::NormalizationFailure(ty, e) => {
-                diag.set_arg("ty", ty);
-                diag.set_arg("failure_ty", e.get_type_for_failure());
-                diag.set_primary_message(rustc_errors::fluent::middle_cannot_be_normalized);
-            }
+            Unknown(_) => middle_unknown_layout,
+            SizeOverflow(_) => middle_values_too_big,
+            NormalizationFailure(_, _) => middle_cannot_be_normalized,
+            Cycle => middle_cycle,
         }
-        diag
+    }
+
+    pub fn into_diagnostic(self) -> crate::error::LayoutError<'tcx> {
+        use crate::error::LayoutError as E;
+        use LayoutError::*;
+        match self {
+            Unknown(ty) => E::Unknown { ty },
+            SizeOverflow(ty) => E::Overflow { ty },
+            NormalizationFailure(ty, e) => {
+                E::NormalizationFailure { ty, failure_ty: e.get_type_for_failure() }
+            }
+            Cycle => E::Cycle,
+        }
     }
 }
 
-// FIXME: Once the other errors that embed this error have been converted to translateable
+// FIXME: Once the other errors that embed this error have been converted to translatable
 // diagnostics, this Display impl should be removed.
 impl<'tcx> fmt::Display for LayoutError<'tcx> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -213,6 +256,7 @@ impl<'tcx> fmt::Display for LayoutError<'tcx> {
                 t,
                 e.get_type_for_failure()
             ),
+            LayoutError::Cycle => write!(f, "a cycle occurred during layout computation"),
         }
     }
 }
@@ -226,7 +270,7 @@ pub struct LayoutCx<'tcx, C> {
 impl<'tcx> LayoutCalculator for LayoutCx<'tcx, TyCtxt<'tcx>> {
     type TargetDataLayoutRef = &'tcx TargetDataLayout;
 
-    fn delay_bug(&self, txt: &str) {
+    fn delay_bug(&self, txt: String) {
         self.tcx.sess.delay_span_bug(DUMMY_SP, txt);
     }
 
@@ -243,6 +287,12 @@ impl<'tcx> LayoutCalculator for LayoutCx<'tcx, TyCtxt<'tcx>> {
 pub enum SizeSkeleton<'tcx> {
     /// Any statically computable Layout.
     Known(Size),
+
+    /// This is a generic const expression (i.e. N * 2), which may contain some parameters.
+    /// It must be of type usize, and represents the size of a type in bytes.
+    /// It is not required to be evaluatable to a concrete value, but can be used to check
+    /// that another SizeSkeleton is of equal size.
+    Generic(ty::Const<'tcx>),
 
     /// A potentially-fat pointer.
     Pointer {
@@ -276,17 +326,45 @@ impl<'tcx> SizeSkeleton<'tcx> {
                 let non_zero = !ty.is_unsafe_ptr();
                 let tail = tcx.struct_tail_erasing_lifetimes(pointee, param_env);
                 match tail.kind() {
-                    ty::Param(_) | ty::Alias(ty::Projection, _) => {
+                    ty::Param(_) | ty::Alias(ty::Projection | ty::Inherent, _) => {
                         debug_assert!(tail.has_non_region_param());
                         Ok(SizeSkeleton::Pointer { non_zero, tail: tcx.erase_regions(tail) })
                     }
                     _ => bug!(
-                        "SizeSkeleton::compute({}): layout errored ({}), yet \
-                              tail `{}` is not a type parameter or a projection",
-                        ty,
-                        err,
-                        tail
+                        "SizeSkeleton::compute({ty}): layout errored ({err:?}), yet \
+                              tail `{tail}` is not a type parameter or a projection",
                     ),
+                }
+            }
+            ty::Array(inner, len)
+                if len.ty() == tcx.types.usize && tcx.features().transmute_generic_consts =>
+            {
+                match SizeSkeleton::compute(inner, tcx, param_env)? {
+                    // This may succeed because the multiplication of two types may overflow
+                    // but a single size of a nested array will not.
+                    SizeSkeleton::Known(s) => {
+                        if let Some(c) = len.try_eval_target_usize(tcx, param_env) {
+                            let size = s
+                                .bytes()
+                                .checked_mul(c)
+                                .ok_or_else(|| LayoutError::SizeOverflow(ty))?;
+                            return Ok(SizeSkeleton::Known(Size::from_bytes(size)));
+                        }
+                        let len = tcx.expand_abstract_consts(len);
+                        let prev = ty::Const::from_target_usize(tcx, s.bytes());
+                        let Some(gen_size) = mul_sorted_consts(tcx, param_env, len, prev) else {
+                            return Err(LayoutError::SizeOverflow(ty));
+                        };
+                        Ok(SizeSkeleton::Generic(gen_size))
+                    }
+                    SizeSkeleton::Pointer { .. } => Err(err),
+                    SizeSkeleton::Generic(g) => {
+                        let len = tcx.expand_abstract_consts(len);
+                        let Some(gen_size) = mul_sorted_consts(tcx, param_env, len, g) else {
+                            return Err(LayoutError::SizeOverflow(ty));
+                        };
+                        Ok(SizeSkeleton::Generic(gen_size))
+                    }
                 }
             }
 
@@ -298,7 +376,7 @@ impl<'tcx> SizeSkeleton<'tcx> {
 
                 // Get a zero-sized variant or a pointer newtype.
                 let zero_or_ptr_variant = |i| {
-                    let i = VariantIdx::new(i);
+                    let i = VariantIdx::from_usize(i);
                     let fields =
                         def.variant(i).fields.iter().map(|field| {
                             SizeSkeleton::compute(field.ty(tcx, substs), tcx, param_env)
@@ -317,6 +395,9 @@ impl<'tcx> SizeSkeleton<'tcx> {
                                     return Err(err);
                                 }
                                 ptr = Some(field);
+                            }
+                            SizeSkeleton::Generic(_) => {
+                                return Err(err);
                             }
                         }
                     }
@@ -373,9 +454,64 @@ impl<'tcx> SizeSkeleton<'tcx> {
             (SizeSkeleton::Pointer { tail: a, .. }, SizeSkeleton::Pointer { tail: b, .. }) => {
                 a == b
             }
+            // constants are always pre-normalized into a canonical form so this
+            // only needs to check if their pointers are identical.
+            (SizeSkeleton::Generic(a), SizeSkeleton::Generic(b)) => a == b,
             _ => false,
         }
     }
+}
+
+/// When creating the layout for types with abstract consts in their size (i.e. [usize; 4 * N]),
+/// to ensure that they have a canonical order and can be compared directly we combine all
+/// constants, and sort the other terms. This allows comparison of expressions of sizes,
+/// allowing for things like transmuting between types that depend on generic consts.
+/// This returns `None` if multiplication of constants overflows.
+fn mul_sorted_consts<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    param_env: ty::ParamEnv<'tcx>,
+    a: ty::Const<'tcx>,
+    b: ty::Const<'tcx>,
+) -> Option<ty::Const<'tcx>> {
+    use crate::mir::BinOp::Mul;
+    use ty::ConstKind::Expr;
+    use ty::Expr::Binop;
+
+    let mut work = vec![a, b];
+    let mut done = vec![];
+    while let Some(n) = work.pop() {
+        if let Expr(Binop(Mul, l, r)) = n.kind() {
+            work.push(l);
+            work.push(r)
+        } else {
+            done.push(n);
+        }
+    }
+    let mut k = 1;
+    let mut overflow = false;
+    done.retain(|c| {
+        let Some(c) = c.try_eval_target_usize(tcx, param_env) else {
+            return true;
+        };
+        let Some(next) = c.checked_mul(k) else {
+            overflow = true;
+            return false;
+        };
+        k = next;
+        false
+    });
+    if overflow {
+        return None;
+    }
+    if k != 1 {
+        done.push(ty::Const::from_target_usize(tcx, k));
+    } else if k == 0 {
+        return Some(ty::Const::from_target_usize(tcx, 0));
+    }
+    done.sort_unstable();
+
+    // create a single tree from the buffer
+    done.into_iter().reduce(|acc, n| tcx.mk_const(Expr(Binop(Mul, n, acc)), n.ty()))
 }
 
 pub trait HasTyCtxt<'tcx>: HasDataLayout {
@@ -406,20 +542,20 @@ impl<'tcx> HasTyCtxt<'tcx> for TyCtxt<'tcx> {
     }
 }
 
-impl<'tcx> HasDataLayout for ty::query::TyCtxtAt<'tcx> {
+impl<'tcx> HasDataLayout for TyCtxtAt<'tcx> {
     #[inline]
     fn data_layout(&self) -> &TargetDataLayout {
         &self.data_layout
     }
 }
 
-impl<'tcx> HasTargetSpec for ty::query::TyCtxtAt<'tcx> {
+impl<'tcx> HasTargetSpec for TyCtxtAt<'tcx> {
     fn target_spec(&self) -> &Target {
         &self.sess.target
     }
 }
 
-impl<'tcx> HasTyCtxt<'tcx> for ty::query::TyCtxtAt<'tcx> {
+impl<'tcx> HasTyCtxt<'tcx> for TyCtxtAt<'tcx> {
     #[inline]
     fn tcx(&self) -> TyCtxt<'tcx> {
         **self
@@ -546,7 +682,7 @@ impl<'tcx> LayoutOfHelpers<'tcx> for LayoutCx<'tcx, TyCtxt<'tcx>> {
     }
 }
 
-impl<'tcx> LayoutOfHelpers<'tcx> for LayoutCx<'tcx, ty::query::TyCtxtAt<'tcx>> {
+impl<'tcx> LayoutOfHelpers<'tcx> for LayoutCx<'tcx, TyCtxtAt<'tcx>> {
     type LayoutOfResult = Result<TyAndLayout<'tcx>, LayoutError<'tcx>>;
 
     #[inline]
@@ -595,11 +731,11 @@ where
                     ty::Adt(def, _) => def.variant(variant_index).fields.len(),
                     _ => bug!(),
                 };
-                tcx.intern_layout(LayoutS {
+                tcx.mk_layout(LayoutS {
                     variants: Variants::Single { index: variant_index },
                     fields: match NonZeroUsize::new(fields) {
                         Some(fields) => FieldsShape::Union(fields),
-                        None => FieldsShape::Arbitrary { offsets: vec![], memory_index: vec![] },
+                        None => FieldsShape::Arbitrary { offsets: IndexVec::new(), memory_index: IndexVec::new() },
                     },
                     abi: Abi::Uninhabited,
                     largest_niche: None,
@@ -608,7 +744,7 @@ where
                 })
             }
 
-            Variants::Multiple { ref variants, .. } => cx.tcx().intern_layout(variants[variant_index].clone()),
+            Variants::Multiple { ref variants, .. } => cx.tcx().mk_layout(variants[variant_index].clone()),
         };
 
         assert_eq!(*layout.variants(), Variants::Single { index: variant_index });
@@ -630,7 +766,7 @@ where
             let tcx = cx.tcx();
             let tag_layout = |tag: Scalar| -> TyAndLayout<'tcx> {
                 TyAndLayout {
-                    layout: tcx.intern_layout(LayoutS::scalar(cx, tag)),
+                    layout: tcx.mk_layout(LayoutS::scalar(cx, tag)),
                     ty: tag.primitive().to_ty(tcx),
                 }
             };
@@ -693,7 +829,11 @@ where
                         */
                     };
 
-                    let metadata = if let Some(metadata_def_id) = tcx.lang_items().metadata_type() {
+                    let metadata = if let Some(metadata_def_id) = tcx.lang_items().metadata_type()
+                        // Projection eagerly bails out when the pointee references errors,
+                        // fall back to structurally deducing metadata.
+                        && !pointee.references_error()
+                    {
                         let metadata = tcx.normalize_erasing_regions(
                             cx.param_env(),
                             tcx.mk_projection(metadata_def_id, [pointee]),
@@ -757,7 +897,8 @@ where
                 ty::Adt(def, substs) => {
                     match this.variants {
                         Variants::Single { index } => {
-                            TyMaybeWithLayout::Ty(def.variant(index).fields[i].ty(tcx, substs))
+                            let field = &def.variant(index).fields[FieldIdx::from_usize(i)];
+                            TyMaybeWithLayout::Ty(field.ty(tcx, substs))
                         }
 
                         // Discriminant field for enums (where applicable).
@@ -770,7 +911,7 @@ where
 
                 ty::Dynamic(_, _, ty::DynStar) => {
                     if i == 0 {
-                        TyMaybeWithLayout::Ty(tcx.types.usize)
+                        TyMaybeWithLayout::Ty(tcx.mk_mut_ptr(tcx.types.unit))
                     } else if i == 1 {
                         // FIXME(dyn-star) same FIXME as above applies here too
                         TyMaybeWithLayout::Ty(
@@ -797,12 +938,8 @@ where
             TyMaybeWithLayout::Ty(field_ty) => {
                 cx.tcx().layout_of(cx.param_env().and(field_ty)).unwrap_or_else(|e| {
                     bug!(
-                        "failed to get layout for `{}`: {},\n\
-                         despite it being a field (#{}) of an existing layout: {:#?}",
-                        field_ty,
-                        e,
-                        i,
-                        this
+                        "failed to get layout for `{field_ty}`: {e:?},\n\
+                         despite it being a field (#{i}) of an existing layout: {this:#?}",
                     )
                 })
             }
@@ -818,125 +955,114 @@ where
         let tcx = cx.tcx();
         let param_env = cx.param_env();
 
-        let pointee_info =
-            match *this.ty.kind() {
-                ty::RawPtr(mt) if offset.bytes() == 0 => {
-                    tcx.layout_of(param_env.and(mt.ty)).ok().map(|layout| PointeeInfo {
-                        size: layout.size,
-                        align: layout.align.abi,
-                        safe: None,
-                    })
+        let pointee_info = match *this.ty.kind() {
+            ty::RawPtr(mt) if offset.bytes() == 0 => {
+                tcx.layout_of(param_env.and(mt.ty)).ok().map(|layout| PointeeInfo {
+                    size: layout.size,
+                    align: layout.align.abi,
+                    safe: None,
+                })
+            }
+            ty::FnPtr(fn_sig) if offset.bytes() == 0 => {
+                tcx.layout_of(param_env.and(tcx.mk_fn_ptr(fn_sig))).ok().map(|layout| PointeeInfo {
+                    size: layout.size,
+                    align: layout.align.abi,
+                    safe: None,
+                })
+            }
+            ty::Ref(_, ty, mt) if offset.bytes() == 0 => {
+                // Use conservative pointer kind if not optimizing. This saves us the
+                // Freeze/Unpin queries, and can save time in the codegen backend (noalias
+                // attributes in LLVM have compile-time cost even in unoptimized builds).
+                let optimize = tcx.sess.opts.optimize != OptLevel::No;
+                let kind = match mt {
+                    hir::Mutability::Not => PointerKind::SharedRef {
+                        frozen: optimize && ty.is_freeze(tcx, cx.param_env()),
+                    },
+                    hir::Mutability::Mut => PointerKind::MutableRef {
+                        unpin: optimize && ty.is_unpin(tcx, cx.param_env()),
+                    },
+                };
+
+                tcx.layout_of(param_env.and(ty)).ok().map(|layout| PointeeInfo {
+                    size: layout.size,
+                    align: layout.align.abi,
+                    safe: Some(kind),
+                })
+            }
+
+            _ => {
+                let mut data_variant = match this.variants {
+                    // Within the discriminant field, only the niche itself is
+                    // always initialized, so we only check for a pointer at its
+                    // offset.
+                    //
+                    // If the niche is a pointer, it's either valid (according
+                    // to its type), or null (which the niche field's scalar
+                    // validity range encodes). This allows using
+                    // `dereferenceable_or_null` for e.g., `Option<&T>`, and
+                    // this will continue to work as long as we don't start
+                    // using more niches than just null (e.g., the first page of
+                    // the address space, or unaligned pointers).
+                    Variants::Multiple {
+                        tag_encoding: TagEncoding::Niche { untagged_variant, .. },
+                        tag_field,
+                        ..
+                    } if this.fields.offset(tag_field) == offset => {
+                        Some(this.for_variant(cx, untagged_variant))
+                    }
+                    _ => Some(this),
+                };
+
+                if let Some(variant) = data_variant {
+                    // We're not interested in any unions.
+                    if let FieldsShape::Union(_) = variant.fields {
+                        data_variant = None;
+                    }
                 }
-                ty::FnPtr(fn_sig) if offset.bytes() == 0 => {
-                    tcx.layout_of(param_env.and(tcx.mk_fn_ptr(fn_sig))).ok().map(|layout| {
-                        PointeeInfo { size: layout.size, align: layout.align.abi, safe: None }
-                    })
-                }
-                ty::Ref(_, ty, mt) if offset.bytes() == 0 => {
-                    let kind = if tcx.sess.opts.optimize == OptLevel::No {
-                        // Use conservative pointer kind if not optimizing. This saves us the
-                        // Freeze/Unpin queries, and can save time in the codegen backend (noalias
-                        // attributes in LLVM have compile-time cost even in unoptimized builds).
-                        PointerKind::SharedMutable
-                    } else {
-                        match mt {
-                            hir::Mutability::Not => {
-                                if ty.is_freeze(tcx, cx.param_env()) {
-                                    PointerKind::Frozen
+
+                let mut result = None;
+
+                if let Some(variant) = data_variant {
+                    // FIXME(erikdesjardins): handle non-default addrspace ptr sizes
+                    // (requires passing in the expected address space from the caller)
+                    let ptr_end = offset + Pointer(AddressSpace::DATA).size(cx);
+                    for i in 0..variant.fields.count() {
+                        let field_start = variant.fields.offset(i);
+                        if field_start <= offset {
+                            let field = variant.field(cx, i);
+                            result = field.to_result().ok().and_then(|field| {
+                                if ptr_end <= field_start + field.size {
+                                    // We found the right field, look inside it.
+                                    let field_info =
+                                        field.pointee_info_at(cx, offset - field_start);
+                                    field_info
                                 } else {
-                                    PointerKind::SharedMutable
+                                    None
                                 }
-                            }
-                            hir::Mutability::Mut => {
-                                // References to self-referential structures should not be considered
-                                // noalias, as another pointer to the structure can be obtained, that
-                                // is not based-on the original reference. We consider all !Unpin
-                                // types to be potentially self-referential here.
-                                if ty.is_unpin(tcx, cx.param_env()) {
-                                    PointerKind::UniqueBorrowed
-                                } else {
-                                    PointerKind::UniqueBorrowedPinned
-                                }
+                            });
+                            if result.is_some() {
+                                break;
                             }
                         }
-                    };
-
-                    tcx.layout_of(param_env.and(ty)).ok().map(|layout| PointeeInfo {
-                        size: layout.size,
-                        align: layout.align.abi,
-                        safe: Some(kind),
-                    })
+                    }
                 }
 
-                _ => {
-                    let mut data_variant = match this.variants {
-                        // Within the discriminant field, only the niche itself is
-                        // always initialized, so we only check for a pointer at its
-                        // offset.
-                        //
-                        // If the niche is a pointer, it's either valid (according
-                        // to its type), or null (which the niche field's scalar
-                        // validity range encodes). This allows using
-                        // `dereferenceable_or_null` for e.g., `Option<&T>`, and
-                        // this will continue to work as long as we don't start
-                        // using more niches than just null (e.g., the first page of
-                        // the address space, or unaligned pointers).
-                        Variants::Multiple {
-                            tag_encoding: TagEncoding::Niche { untagged_variant, .. },
-                            tag_field,
-                            ..
-                        } if this.fields.offset(tag_field) == offset => {
-                            Some(this.for_variant(cx, untagged_variant))
-                        }
-                        _ => Some(this),
-                    };
-
-                    if let Some(variant) = data_variant {
-                        // We're not interested in any unions.
-                        if let FieldsShape::Union(_) = variant.fields {
-                            data_variant = None;
+                // FIXME(eddyb) This should be for `ptr::Unique<T>`, not `Box<T>`.
+                if let Some(ref mut pointee) = result {
+                    if let ty::Adt(def, _) = this.ty.kind() {
+                        if def.is_box() && offset.bytes() == 0 {
+                            let optimize = tcx.sess.opts.optimize != OptLevel::No;
+                            pointee.safe = Some(PointerKind::Box {
+                                unpin: optimize && this.ty.boxed_ty().is_unpin(tcx, cx.param_env()),
+                            });
                         }
                     }
-
-                    let mut result = None;
-
-                    if let Some(variant) = data_variant {
-                        // FIXME(erikdesjardins): handle non-default addrspace ptr sizes
-                        // (requires passing in the expected address space from the caller)
-                        let ptr_end = offset + Pointer(AddressSpace::DATA).size(cx);
-                        for i in 0..variant.fields.count() {
-                            let field_start = variant.fields.offset(i);
-                            if field_start <= offset {
-                                let field = variant.field(cx, i);
-                                result = field.to_result().ok().and_then(|field| {
-                                    if ptr_end <= field_start + field.size {
-                                        // We found the right field, look inside it.
-                                        let field_info =
-                                            field.pointee_info_at(cx, offset - field_start);
-                                        field_info
-                                    } else {
-                                        None
-                                    }
-                                });
-                                if result.is_some() {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    // FIXME(eddyb) This should be for `ptr::Unique<T>`, not `Box<T>`.
-                    if let Some(ref mut pointee) = result {
-                        if let ty::Adt(def, _) = this.ty.kind() {
-                            if def.is_box() && offset.bytes() == 0 {
-                                pointee.safe = Some(PointerKind::UniqueOwned);
-                            }
-                        }
-                    }
-
-                    result
                 }
-            };
+
+                result
+            }
+        };
 
         debug!(
             "pointee_info_at (offset={:?}, type kind: {:?}) => {:?}",
@@ -1100,10 +1226,11 @@ pub fn fn_can_unwind(tcx: TyCtxt<'_>, fn_def_id: Option<DefId>, abi: SpecAbi) ->
         | AvrNonBlockingInterrupt
         | CCmseNonSecureCall
         | Wasm
-        | RustIntrinsic
         | PlatformIntrinsic
         | Unadjusted => false,
-        Rust | RustCall | RustCold => tcx.sess.panic_strategy() == PanicStrategy::Unwind,
+        Rust | RustCall | RustCold | RustIntrinsic => {
+            tcx.sess.panic_strategy() == PanicStrategy::Unwind
+        }
     }
 }
 
@@ -1129,18 +1256,15 @@ impl From<call::AdjustForForeignAbiError> for FnAbiError<'_> {
     }
 }
 
-impl<'tcx> fmt::Display for FnAbiError<'tcx> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl<'a, 'b> IntoDiagnostic<'a, !> for FnAbiError<'b> {
+    fn into_diagnostic(self, handler: &'a Handler) -> DiagnosticBuilder<'a, !> {
         match self {
-            Self::Layout(err) => err.fmt(f),
-            Self::AdjustForForeignAbi(err) => err.fmt(f),
+            Self::Layout(e) => e.into_diagnostic().into_diagnostic(handler),
+            Self::AdjustForForeignAbi(call::AdjustForForeignAbiError::Unsupported {
+                arch,
+                abi,
+            }) => UnsupportedFnAbi { arch, abi: abi.name() }.into_diagnostic(handler),
         }
-    }
-}
-
-impl IntoDiagnostic<'_, !> for FnAbiError<'_> {
-    fn into_diagnostic(self, handler: &Handler) -> DiagnosticBuilder<'_, !> {
-        handler.struct_fatal(self.to_string())
     }
 }
 

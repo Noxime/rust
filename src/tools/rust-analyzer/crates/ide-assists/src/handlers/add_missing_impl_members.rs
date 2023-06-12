@@ -1,7 +1,5 @@
 use hir::HasSource;
-use ide_db::{
-    syntax_helpers::insert_whitespace_into_node::insert_ws_into, traits::resolve_target_trait,
-};
+use ide_db::syntax_helpers::insert_whitespace_into_node::insert_ws_into;
 use syntax::ast::{self, make, AstNode};
 
 use crate::{
@@ -107,16 +105,19 @@ fn add_missing_impl_members_inner(
 ) -> Option<()> {
     let _p = profile::span("add_missing_impl_members_inner");
     let impl_def = ctx.find_node_at_offset::<ast::Impl>()?;
+    let impl_ = ctx.sema.to_def(&impl_def)?;
 
     if ctx.token_at_offset().all(|t| {
         t.parent_ancestors()
+            .take_while(|node| node != impl_def.syntax())
             .any(|s| ast::BlockExpr::can_cast(s.kind()) || ast::ParamList::can_cast(s.kind()))
     }) {
         return None;
     }
 
     let target_scope = ctx.sema.scope(impl_def.syntax())?;
-    let trait_ = resolve_target_trait(&ctx.sema, &impl_def)?;
+    let trait_ref = impl_.trait_ref(ctx.db())?;
+    let trait_ = trait_ref.trait_();
 
     let missing_items = filter_assoc_items(
         &ctx.sema,
@@ -155,7 +156,7 @@ fn add_missing_impl_members_inner(
                 let placeholder;
                 if let DefaultMethods::No = mode {
                     if let ast::AssocItem::Fn(func) = &first_new_item {
-                        if try_gen_trait_body(ctx, func, &trait_, &impl_def).is_none() {
+                        if try_gen_trait_body(ctx, func, trait_ref, &impl_def).is_none() {
                             if let Some(m) =
                                 func.syntax().descendants().find_map(ast::MacroCall::cast)
                             {
@@ -180,13 +181,14 @@ fn add_missing_impl_members_inner(
 fn try_gen_trait_body(
     ctx: &AssistContext<'_>,
     func: &ast::Fn,
-    trait_: &hir::Trait,
+    trait_ref: hir::TraitRef,
     impl_def: &ast::Impl,
 ) -> Option<()> {
-    let trait_path = make::ext::ident_path(&trait_.name(ctx.db()).to_string());
+    let trait_path =
+        make::ext::ident_path(&trait_ref.trait_().name(ctx.db()).display(ctx.db()).to_string());
     let hir_ty = ctx.sema.resolve_type(&impl_def.self_ty()?)?;
     let adt = hir_ty.as_adt()?.source(ctx.db())?;
-    gen_trait_fn_body(func, &trait_path, &adt.value)
+    gen_trait_fn_body(func, &trait_path, &adt.value, Some(trait_ref))
 }
 
 #[cfg(test)]
@@ -251,7 +253,7 @@ impl Foo for S {
     }
 
     #[test]
-    fn test_copied_overriden_members() {
+    fn test_copied_overridden_members() {
         check_assist(
             add_missing_impl_members,
             r#"
@@ -1345,8 +1347,52 @@ struct SomeStruct {
 }
 impl PartialEq for SomeStruct {
     $0fn ne(&self, other: &Self) -> bool {
-            !self.eq(other)
-        }
+        !self.eq(other)
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_partial_eq_body_when_types_semantically_match() {
+        check_assist(
+            add_missing_impl_members,
+            r#"
+//- minicore: eq
+struct S<T, U>(T, U);
+type Alias<T> = S<T, T>;
+impl<T> PartialEq<Alias<T>> for S<T, T> {$0}
+"#,
+            r#"
+struct S<T, U>(T, U);
+type Alias<T> = S<T, T>;
+impl<T> PartialEq<Alias<T>> for S<T, T> {
+    $0fn eq(&self, other: &Alias<T>) -> bool {
+        self.0 == other.0 && self.1 == other.1
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_partial_eq_body_when_types_dont_match() {
+        check_assist(
+            add_missing_impl_members,
+            r#"
+//- minicore: eq
+struct S<T, U>(T, U);
+type Alias<T> = S<T, T>;
+impl<T> PartialEq<Alias<T>> for S<T, i32> {$0}
+"#,
+            r#"
+struct S<T, U>(T, U);
+type Alias<T> = S<T, T>;
+impl<T> PartialEq<Alias<T>> for S<T, i32> {
+    fn eq(&self, other: &Alias<T>) -> bool {
+        ${0:todo!()}
+    }
 }
 "#,
         );
@@ -1439,6 +1485,201 @@ impl Trait for () {
     fn foo(&self) {}
 
     $0fn bar(&self) {}
+}"#,
+        )
+    }
+
+    #[test]
+    fn test_works_inside_function() {
+        check_assist(
+            add_missing_impl_members,
+            r#"
+trait Tr {
+    fn method();
+}
+fn main() {
+    struct S;
+    impl Tr for S {
+        $0
+    }
+}
+"#,
+            r#"
+trait Tr {
+    fn method();
+}
+fn main() {
+    struct S;
+    impl Tr for S {
+        fn method() {
+            ${0:todo!()}
+        }
+    }
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn test_add_missing_preserves_indentation() {
+        // in different modules
+        check_assist(
+            add_missing_impl_members,
+            r#"
+mod m {
+    pub trait Foo {
+        const CONST_MULTILINE: (
+            i32,
+            i32
+        );
+
+        fn foo(&self);
+    }
+}
+struct S;
+impl m::Foo for S { $0 }"#,
+            r#"
+mod m {
+    pub trait Foo {
+        const CONST_MULTILINE: (
+            i32,
+            i32
+        );
+
+        fn foo(&self);
+    }
+}
+struct S;
+impl m::Foo for S {
+    $0const CONST_MULTILINE: (
+        i32,
+        i32
+    );
+
+    fn foo(&self) {
+        todo!()
+    }
+}"#,
+        );
+        // in the same module
+        check_assist(
+            add_missing_impl_members,
+            r#"
+mod m {
+    trait Foo {
+        type Output;
+
+        const CONST: usize = 42;
+        const CONST_2: i32;
+        const CONST_MULTILINE: (
+            i32,
+            i32
+        );
+
+        fn foo(&self);
+        fn bar(&self);
+        fn baz(&self);
+    }
+
+    struct S;
+
+    impl Foo for S {
+        fn bar(&self) {}
+$0
+    }
+}"#,
+            r#"
+mod m {
+    trait Foo {
+        type Output;
+
+        const CONST: usize = 42;
+        const CONST_2: i32;
+        const CONST_MULTILINE: (
+            i32,
+            i32
+        );
+
+        fn foo(&self);
+        fn bar(&self);
+        fn baz(&self);
+    }
+
+    struct S;
+
+    impl Foo for S {
+        fn bar(&self) {}
+
+        $0type Output;
+
+        const CONST_2: i32;
+
+        const CONST_MULTILINE: (
+            i32,
+            i32
+        );
+
+        fn foo(&self) {
+            todo!()
+        }
+
+        fn baz(&self) {
+            todo!()
+        }
+
+    }
+}"#,
+        );
+    }
+
+    #[test]
+    fn test_add_default_preserves_indentation() {
+        check_assist(
+            add_missing_default_members,
+            r#"
+mod m {
+    pub trait Foo {
+        type Output;
+
+        const CONST: usize = 42;
+        const CONST_2: i32;
+        const CONST_MULTILINE: = (
+            i32,
+            i32,
+        ) = (3, 14);
+
+        fn valid(some: u32) -> bool { false }
+        fn foo(some: u32) -> bool;
+    }
+}
+struct S;
+impl m::Foo for S { $0 }"#,
+            r#"
+mod m {
+    pub trait Foo {
+        type Output;
+
+        const CONST: usize = 42;
+        const CONST_2: i32;
+        const CONST_MULTILINE: = (
+            i32,
+            i32,
+        ) = (3, 14);
+
+        fn valid(some: u32) -> bool { false }
+        fn foo(some: u32) -> bool;
+    }
+}
+struct S;
+impl m::Foo for S {
+    $0const CONST: usize = 42;
+
+    const CONST_MULTILINE: = (
+        i32,
+        i32,
+    ) = (3, 14);
+
+    fn valid(some: u32) -> bool { false }
 }"#,
         )
     }

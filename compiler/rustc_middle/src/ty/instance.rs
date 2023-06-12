@@ -1,7 +1,7 @@
 use crate::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use crate::ty::print::{FmtPrinter, Printer};
-use crate::ty::{self, Ty, TyCtxt, TypeFoldable, TypeSuperFoldable, TypeVisitable};
-use crate::ty::{EarlyBinder, InternalSubsts, SubstsRef};
+use crate::ty::{self, Ty, TyCtxt, TypeFoldable, TypeSuperFoldable};
+use crate::ty::{EarlyBinder, InternalSubsts, SubstsRef, TypeVisitableExt};
 use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def::Namespace;
 use rustc_hir::def_id::{CrateNum, DefId};
@@ -34,7 +34,7 @@ pub enum InstanceDef<'tcx> {
     /// - `fn` items
     /// - closures
     /// - generators
-    Item(ty::WithOptConstParam<DefId>),
+    Item(DefId),
 
     /// An intrinsic `fn` item (with `"rust-intrinsic"` or `"platform-intrinsic"` ABI).
     ///
@@ -82,6 +82,11 @@ pub enum InstanceDef<'tcx> {
     /// The `DefId` is the ID of the `call_once` method in `FnOnce`.
     ClosureOnceShim { call_once: DefId, track_caller: bool },
 
+    /// Compiler-generated accessor for thread locals which returns a reference to the thread local
+    /// the `DefId` defines. This is used to export thread locals from dylibs on platforms lacking
+    /// native support.
+    ThreadLocalShim(DefId),
+
     /// `core::ptr::drop_in_place::<T>`.
     ///
     /// The `DefId` is for `core::ptr::drop_in_place`.
@@ -96,6 +101,13 @@ pub enum InstanceDef<'tcx> {
     ///
     /// The `DefId` is for `Clone::clone`, the `Ty` is the type `T` with the builtin `Clone` impl.
     CloneShim(DefId, Ty<'tcx>),
+
+    /// Compiler-generated `<T as FnPtr>::addr` implementation.
+    ///
+    /// Automatically generated for all potentially higher-ranked `fn(I) -> R` types.
+    ///
+    /// The `DefId` is for `FnPtr::addr`, the `Ty` is the type `T`.
+    FnPtrAddrShim(DefId, Ty<'tcx>),
 }
 
 impl<'tcx> Instance<'tcx> {
@@ -131,7 +143,7 @@ impl<'tcx> Instance<'tcx> {
 
         match self.def {
             InstanceDef::Item(def) => tcx
-                .upstream_monomorphizations_for(def.did)
+                .upstream_monomorphizations_for(def)
                 .and_then(|monos| monos.get(&self.substs).cloned()),
             InstanceDef::DropGlue(_, Some(_)) => tcx.upstream_drop_glue_for(self.substs),
             _ => None,
@@ -143,23 +155,27 @@ impl<'tcx> InstanceDef<'tcx> {
     #[inline]
     pub fn def_id(self) -> DefId {
         match self {
-            InstanceDef::Item(def) => def.did,
-            InstanceDef::VTableShim(def_id)
+            InstanceDef::Item(def_id)
+            | InstanceDef::VTableShim(def_id)
             | InstanceDef::ReifyShim(def_id)
             | InstanceDef::FnPtrShim(def_id, _)
             | InstanceDef::Virtual(def_id, _)
             | InstanceDef::Intrinsic(def_id)
+            | InstanceDef::ThreadLocalShim(def_id)
             | InstanceDef::ClosureOnceShim { call_once: def_id, track_caller: _ }
             | InstanceDef::DropGlue(def_id, _)
-            | InstanceDef::CloneShim(def_id, _) => def_id,
+            | InstanceDef::CloneShim(def_id, _)
+            | InstanceDef::FnPtrAddrShim(def_id, _) => def_id,
         }
     }
 
     /// Returns the `DefId` of instances which might not require codegen locally.
     pub fn def_id_if_not_guaranteed_local_codegen(self) -> Option<DefId> {
         match self {
-            ty::InstanceDef::Item(def) => Some(def.did),
-            ty::InstanceDef::DropGlue(def_id, Some(_)) => Some(def_id),
+            ty::InstanceDef::Item(def) => Some(def),
+            ty::InstanceDef::DropGlue(def_id, Some(_)) | InstanceDef::ThreadLocalShim(def_id) => {
+                Some(def_id)
+            }
             InstanceDef::VTableShim(..)
             | InstanceDef::ReifyShim(..)
             | InstanceDef::FnPtrShim(..)
@@ -167,27 +183,17 @@ impl<'tcx> InstanceDef<'tcx> {
             | InstanceDef::Intrinsic(..)
             | InstanceDef::ClosureOnceShim { .. }
             | InstanceDef::DropGlue(..)
-            | InstanceDef::CloneShim(..) => None,
+            | InstanceDef::CloneShim(..)
+            | InstanceDef::FnPtrAddrShim(..) => None,
         }
     }
 
     #[inline]
-    pub fn with_opt_param(self) -> ty::WithOptConstParam<DefId> {
-        match self {
-            InstanceDef::Item(def) => def,
-            InstanceDef::VTableShim(def_id)
-            | InstanceDef::ReifyShim(def_id)
-            | InstanceDef::FnPtrShim(def_id, _)
-            | InstanceDef::Virtual(def_id, _)
-            | InstanceDef::Intrinsic(def_id)
-            | InstanceDef::ClosureOnceShim { call_once: def_id, track_caller: _ }
-            | InstanceDef::DropGlue(def_id, _)
-            | InstanceDef::CloneShim(def_id, _) => ty::WithOptConstParam::unknown(def_id),
-        }
-    }
-
-    #[inline]
-    pub fn get_attrs(&self, tcx: TyCtxt<'tcx>, attr: Symbol) -> ty::Attributes<'tcx> {
+    pub fn get_attrs(
+        &self,
+        tcx: TyCtxt<'tcx>,
+        attr: Symbol,
+    ) -> impl Iterator<Item = &'tcx rustc_ast::Attribute> {
         tcx.get_attrs(self.def_id(), attr)
     }
 
@@ -199,8 +205,9 @@ impl<'tcx> InstanceDef<'tcx> {
     pub fn requires_inline(&self, tcx: TyCtxt<'tcx>) -> bool {
         use rustc_hir::definitions::DefPathData;
         let def_id = match *self {
-            ty::InstanceDef::Item(def) => def.did,
+            ty::InstanceDef::Item(def) => def,
             ty::InstanceDef::DropGlue(_, Some(_)) => return false,
+            ty::InstanceDef::ThreadLocalShim(_) => return false,
             _ => return true,
         };
         matches!(
@@ -241,13 +248,15 @@ impl<'tcx> InstanceDef<'tcx> {
                 )
             });
         }
+        if let ty::InstanceDef::ThreadLocalShim(..) = *self {
+            return false;
+        }
         tcx.codegen_fn_attrs(self.def_id()).requests_inline()
     }
 
     pub fn requires_caller_location(&self, tcx: TyCtxt<'_>) -> bool {
         match *self {
-            InstanceDef::Item(ty::WithOptConstParam { did: def_id, .. })
-            | InstanceDef::Virtual(def_id, _) => {
+            InstanceDef::Item(def_id) | InstanceDef::Virtual(def_id, _) => {
                 tcx.body_codegen_attrs(def_id).flags.contains(CodegenFnAttrFlags::TRACK_CALLER)
             }
             InstanceDef::ClosureOnceShim { call_once: _, track_caller } => track_caller,
@@ -264,6 +273,8 @@ impl<'tcx> InstanceDef<'tcx> {
     pub fn has_polymorphic_mir_body(&self) -> bool {
         match *self {
             InstanceDef::CloneShim(..)
+            | InstanceDef::ThreadLocalShim(..)
+            | InstanceDef::FnPtrAddrShim(..)
             | InstanceDef::FnPtrShim(..)
             | InstanceDef::DropGlue(_, Some(_)) => false,
             InstanceDef::ClosureOnceShim { .. }
@@ -295,6 +306,7 @@ fn fmt_instance(
         InstanceDef::Item(_) => Ok(()),
         InstanceDef::VTableShim(_) => write!(f, " - shim(vtable)"),
         InstanceDef::ReifyShim(_) => write!(f, " - shim(reify)"),
+        InstanceDef::ThreadLocalShim(_) => write!(f, " - shim(tls)"),
         InstanceDef::Intrinsic(_) => write!(f, " - intrinsic"),
         InstanceDef::Virtual(_, num) => write!(f, " - virtual#{}", num),
         InstanceDef::FnPtrShim(_, ty) => write!(f, " - shim({})", ty),
@@ -302,6 +314,7 @@ fn fmt_instance(
         InstanceDef::DropGlue(_, None) => write!(f, " - shim(None)"),
         InstanceDef::DropGlue(_, Some(ty)) => write!(f, " - shim(Some({}))", ty),
         InstanceDef::CloneShim(_, ty) => write!(f, " - shim({})", ty),
+        InstanceDef::FnPtrAddrShim(_, ty) => write!(f, " - shim({})", ty),
     }
 }
 
@@ -327,7 +340,7 @@ impl<'tcx> Instance<'tcx> {
             def_id,
             substs
         );
-        Instance { def: InstanceDef::Item(ty::WithOptConstParam::unknown(def_id)), substs }
+        Instance { def: InstanceDef::Item(def_id), substs }
     }
 
     pub fn mono(tcx: TyCtxt<'tcx>, def_id: DefId) -> Instance<'tcx> {
@@ -372,18 +385,21 @@ impl<'tcx> Instance<'tcx> {
     /// couldn't complete due to errors elsewhere - this is distinct
     /// from `Ok(None)` to avoid misleading diagnostics when an error
     /// has already been/will be emitted, for the original cause
+    #[instrument(level = "debug", skip(tcx), ret)]
     pub fn resolve(
         tcx: TyCtxt<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
         def_id: DefId,
         substs: SubstsRef<'tcx>,
     ) -> Result<Option<Instance<'tcx>>, ErrorGuaranteed> {
-        Instance::resolve_opt_const_arg(
-            tcx,
-            param_env,
-            ty::WithOptConstParam::unknown(def_id),
-            substs,
-        )
+        // All regions in the result of this query are erased, so it's
+        // fine to erase all of the input regions.
+
+        // HACK(eddyb) erase regions in `substs` first, so that `param_env.and(...)`
+        // below is more likely to ignore the bounds in scope (e.g. if the only
+        // generic parameters mentioned by `substs` were lifetime ones).
+        let substs = tcx.erase_regions(substs);
+        tcx.resolve_instance(tcx.erase_regions(param_env.and((def_id, substs))))
     }
 
     pub fn expect_resolve(
@@ -401,31 +417,6 @@ impl<'tcx> Instance<'tcx> {
         }
     }
 
-    // This should be kept up to date with `resolve`.
-    pub fn resolve_opt_const_arg(
-        tcx: TyCtxt<'tcx>,
-        param_env: ty::ParamEnv<'tcx>,
-        def: ty::WithOptConstParam<DefId>,
-        substs: SubstsRef<'tcx>,
-    ) -> Result<Option<Instance<'tcx>>, ErrorGuaranteed> {
-        // All regions in the result of this query are erased, so it's
-        // fine to erase all of the input regions.
-
-        // HACK(eddyb) erase regions in `substs` first, so that `param_env.and(...)`
-        // below is more likely to ignore the bounds in scope (e.g. if the only
-        // generic parameters mentioned by `substs` were lifetime ones).
-        let substs = tcx.erase_regions(substs);
-
-        // FIXME(eddyb) should this always use `param_env.with_reveal_all()`?
-        if let Some((did, param_did)) = def.as_const_arg() {
-            tcx.resolve_instance_of_const_arg(
-                tcx.erase_regions(param_env.and((did, param_did, substs))),
-            )
-        } else {
-            tcx.resolve_instance(tcx.erase_regions(param_env.and((def.did, substs))))
-        }
-    }
-
     pub fn resolve_for_fn_ptr(
         tcx: TyCtxt<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
@@ -439,7 +430,7 @@ impl<'tcx> Instance<'tcx> {
             match resolved.def {
                 InstanceDef::Item(def) if resolved.def.requires_caller_location(tcx) => {
                     debug!(" => fn pointer created for function with #[track_caller]");
-                    resolved.def = InstanceDef::ReifyShim(def.did);
+                    resolved.def = InstanceDef::ReifyShim(def);
                 }
                 InstanceDef::Virtual(def_id, _) => {
                     debug!(" => fn pointer created for virtual call");
@@ -482,23 +473,23 @@ impl<'tcx> Instance<'tcx> {
                         if resolved.def.requires_caller_location(tcx)
                             // 2) The caller location parameter comes from having `#[track_caller]`
                             // on the implementation, and *not* on the trait method.
-                            && !tcx.should_inherit_track_caller(def.did)
+                            && !tcx.should_inherit_track_caller(def)
                             // If the method implementation comes from the trait definition itself
                             // (e.g. `trait Foo { #[track_caller] my_fn() { /* impl */ } }`),
                             // then we don't need to generate a shim. This check is needed because
                             // `should_inherit_track_caller` returns `false` if our method
                             // implementation comes from the trait block, and not an impl block
                             && !matches!(
-                                tcx.opt_associated_item(def.did),
+                                tcx.opt_associated_item(def),
                                 Some(ty::AssocItem {
                                     container: ty::AssocItemContainer::TraitContainer,
                                     ..
                                 })
                             )
                         {
-                            if tcx.is_closure(def.did) {
+                            if tcx.is_closure(def) {
                                 debug!(" => vtable fn pointer created for closure with #[track_caller]: {:?} for method {:?} {:?}",
-                                       def.did, def_id, substs);
+                                       def, def_id, substs);
 
                                 // Create a shim for the `FnOnce/FnMut/Fn` method we are calling
                                 // - unlike functions, invoking a closure always goes through a
@@ -506,9 +497,9 @@ impl<'tcx> Instance<'tcx> {
                                 resolved = Instance { def: InstanceDef::ReifyShim(def_id), substs };
                             } else {
                                 debug!(
-                                    " => vtable fn pointer created for function with #[track_caller]: {:?}", def.did
+                                    " => vtable fn pointer created for function with #[track_caller]: {:?}", def
                                 );
-                                resolved.def = InstanceDef::ReifyShim(def.did);
+                                resolved.def = InstanceDef::ReifyShim(def);
                             }
                         }
                     }
@@ -540,7 +531,7 @@ impl<'tcx> Instance<'tcx> {
 
     pub fn resolve_drop_in_place(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> ty::Instance<'tcx> {
         let def_id = tcx.require_lang_item(LangItem::DropInPlace, None);
-        let substs = tcx.intern_substs(&[ty.into()]);
+        let substs = tcx.mk_substs(&[ty.into()]);
         Instance::expect_resolve(tcx, ty::ParamEnv::reveal_all(), def_id, substs)
     }
 
@@ -584,17 +575,18 @@ impl<'tcx> Instance<'tcx> {
     /// this function returns `None`, then the MIR body does not require substitution during
     /// codegen.
     fn substs_for_mir_body(&self) -> Option<SubstsRef<'tcx>> {
-        if self.def.has_polymorphic_mir_body() { Some(self.substs) } else { None }
+        self.def.has_polymorphic_mir_body().then_some(self.substs)
     }
 
-    pub fn subst_mir<T>(&self, tcx: TyCtxt<'tcx>, v: &T) -> T
+    pub fn subst_mir<T>(&self, tcx: TyCtxt<'tcx>, v: EarlyBinder<&T>) -> T
     where
-        T: TypeFoldable<'tcx> + Copy,
+        T: TypeFoldable<TyCtxt<'tcx>> + Copy,
     {
+        let v = v.map_bound(|v| *v);
         if let Some(substs) = self.substs_for_mir_body() {
-            EarlyBinder(*v).subst(tcx, substs)
+            v.subst(tcx, substs)
         } else {
-            *v
+            v.subst_identity()
         }
     }
 
@@ -603,15 +595,15 @@ impl<'tcx> Instance<'tcx> {
         &self,
         tcx: TyCtxt<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
-        v: T,
+        v: EarlyBinder<T>,
     ) -> T
     where
-        T: TypeFoldable<'tcx> + Clone,
+        T: TypeFoldable<TyCtxt<'tcx>> + Clone,
     {
         if let Some(substs) = self.substs_for_mir_body() {
             tcx.subst_and_normalize_erasing_regions(substs, param_env, v)
         } else {
-            tcx.normalize_erasing_regions(param_env, v)
+            tcx.normalize_erasing_regions(param_env, v.skip_binder())
         }
     }
 
@@ -620,15 +612,15 @@ impl<'tcx> Instance<'tcx> {
         &self,
         tcx: TyCtxt<'tcx>,
         param_env: ty::ParamEnv<'tcx>,
-        v: T,
+        v: EarlyBinder<T>,
     ) -> Result<T, NormalizationError<'tcx>>
     where
-        T: TypeFoldable<'tcx> + Clone,
+        T: TypeFoldable<TyCtxt<'tcx>> + Clone,
     {
         if let Some(substs) = self.substs_for_mir_body() {
             tcx.try_subst_and_normalize_erasing_regions(substs, param_env, v)
         } else {
-            tcx.try_normalize_erasing_regions(param_env, v)
+            tcx.try_normalize_erasing_regions(param_env, v.skip_binder())
         }
     }
 
@@ -662,20 +654,20 @@ fn polymorphize<'tcx>(
     let def_id = instance.def_id();
     let upvars_ty = if tcx.is_closure(def_id) {
         Some(substs.as_closure().tupled_upvars_ty())
-    } else if tcx.type_of(def_id).is_generator() {
+    } else if tcx.type_of(def_id).skip_binder().is_generator() {
         Some(substs.as_generator().tupled_upvars_ty())
     } else {
         None
     };
-    let has_upvars = upvars_ty.map_or(false, |ty| !ty.tuple_fields().is_empty());
+    let has_upvars = upvars_ty.is_some_and(|ty| !ty.tuple_fields().is_empty());
     debug!("polymorphize: upvars_ty={:?} has_upvars={:?}", upvars_ty, has_upvars);
 
     struct PolymorphizationFolder<'tcx> {
         tcx: TyCtxt<'tcx>,
     }
 
-    impl<'tcx> ty::TypeFolder<'tcx> for PolymorphizationFolder<'tcx> {
-        fn tcx<'a>(&'a self) -> TyCtxt<'tcx> {
+    impl<'tcx> ty::TypeFolder<TyCtxt<'tcx>> for PolymorphizationFolder<'tcx> {
+        fn interner(&self) -> TyCtxt<'tcx> {
             self.tcx
         }
 
@@ -683,11 +675,8 @@ fn polymorphize<'tcx>(
             debug!("fold_ty: ty={:?}", ty);
             match *ty.kind() {
                 ty::Closure(def_id, substs) => {
-                    let polymorphized_substs = polymorphize(
-                        self.tcx,
-                        ty::InstanceDef::Item(ty::WithOptConstParam::unknown(def_id)),
-                        substs,
-                    );
+                    let polymorphized_substs =
+                        polymorphize(self.tcx, ty::InstanceDef::Item(def_id), substs);
                     if substs == polymorphized_substs {
                         ty
                     } else {
@@ -695,11 +684,8 @@ fn polymorphize<'tcx>(
                     }
                 }
                 ty::Generator(def_id, substs, movability) => {
-                    let polymorphized_substs = polymorphize(
-                        self.tcx,
-                        ty::InstanceDef::Item(ty::WithOptConstParam::unknown(def_id)),
-                        substs,
-                    );
+                    let polymorphized_substs =
+                        polymorphize(self.tcx, ty::InstanceDef::Item(def_id), substs);
                     if substs == polymorphized_substs {
                         ty
                     } else {
@@ -781,6 +767,12 @@ fn needs_fn_once_adapter_shim(
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Decodable, Encodable, HashStable)]
 pub struct UnusedGenericParams(FiniteBitSet<u32>);
 
+impl Default for UnusedGenericParams {
+    fn default() -> Self {
+        UnusedGenericParams::new_all_used()
+    }
+}
+
 impl UnusedGenericParams {
     pub fn new_all_unused(amount: u32) -> Self {
         let mut bitset = FiniteBitSet::new_empty();
@@ -806,5 +798,13 @@ impl UnusedGenericParams {
 
     pub fn all_used(&self) -> bool {
         self.0.is_empty()
+    }
+
+    pub fn bits(&self) -> u32 {
+        self.0.0
+    }
+
+    pub fn from_bits(bits: u32) -> UnusedGenericParams {
+        UnusedGenericParams(FiniteBitSet(bits))
     }
 }

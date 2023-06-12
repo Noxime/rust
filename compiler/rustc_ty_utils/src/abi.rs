@@ -1,9 +1,10 @@
 use rustc_hir as hir;
 use rustc_hir::lang_items::LangItem;
+use rustc_middle::query::Providers;
 use rustc_middle::ty::layout::{
     fn_can_unwind, FnAbiError, HasParamEnv, HasTyCtxt, LayoutCx, LayoutOf, TyAndLayout,
 };
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::ty::{self, InstanceDef, Ty, TyCtxt};
 use rustc_session::config::OptLevel;
 use rustc_span::def_id::DefId;
 use rustc_target::abi::call::{
@@ -14,8 +15,8 @@ use rustc_target::spec::abi::Abi as SpecAbi;
 
 use std::iter;
 
-pub fn provide(providers: &mut ty::query::Providers) {
-    *providers = ty::query::Providers { fn_abi_of_fn_ptr, fn_abi_of_instance, ..*providers };
+pub fn provide(providers: &mut Providers) {
+    *providers = Providers { fn_abi_of_fn_ptr, fn_abi_of_instance, ..*providers };
 }
 
 // NOTE(eddyb) this is private to avoid using it from outside of
@@ -29,6 +30,16 @@ fn fn_sig_for_fn_abi<'tcx>(
     instance: ty::Instance<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
 ) -> ty::PolyFnSig<'tcx> {
+    if let InstanceDef::ThreadLocalShim(..) = instance.def {
+        return ty::Binder::dummy(tcx.mk_fn_sig(
+            [],
+            tcx.thread_local_ptr_ty(instance.def_id()),
+            false,
+            hir::Unsafety::Normal,
+            rustc_target::spec::abi::Abi::Unadjusted,
+        ));
+    }
+
     let ty = instance.ty(tcx, param_env);
     match *ty.kind() {
         ty::FnDef(..) => {
@@ -54,7 +65,7 @@ fn fn_sig_for_fn_abi<'tcx>(
                 sig = sig.map_bound(|mut sig| {
                     let mut inputs_and_output = sig.inputs_and_output.to_vec();
                     inputs_and_output[0] = tcx.mk_mut_ptr(inputs_and_output[0]);
-                    sig.inputs_and_output = tcx.intern_type_list(&inputs_and_output);
+                    sig.inputs_and_output = tcx.mk_type_list(&inputs_and_output);
                     sig
                 });
             }
@@ -63,14 +74,14 @@ fn fn_sig_for_fn_abi<'tcx>(
         ty::Closure(def_id, substs) => {
             let sig = substs.as_closure().sig();
 
-            let bound_vars = tcx.mk_bound_variable_kinds(
+            let bound_vars = tcx.mk_bound_variable_kinds_from_iter(
                 sig.bound_vars().iter().chain(iter::once(ty::BoundVariableKind::Region(ty::BrEnv))),
             );
             let br = ty::BoundRegion {
                 var: ty::BoundVar::from_usize(bound_vars.len() - 1),
                 kind: ty::BoundRegionKind::BrEnv,
             };
-            let env_region = ty::ReLateBound(ty::INNERMOST, br);
+            let env_region = ty::Region::new_late_bound(tcx, ty::INNERMOST, br);
             let env_ty = tcx.closure_env_ty(def_id, substs, env_region).unwrap();
 
             let sig = sig.skip_binder();
@@ -88,19 +99,18 @@ fn fn_sig_for_fn_abi<'tcx>(
         ty::Generator(did, substs, _) => {
             let sig = substs.as_generator().poly_sig();
 
-            let bound_vars = tcx.mk_bound_variable_kinds(
+            let bound_vars = tcx.mk_bound_variable_kinds_from_iter(
                 sig.bound_vars().iter().chain(iter::once(ty::BoundVariableKind::Region(ty::BrEnv))),
             );
             let br = ty::BoundRegion {
                 var: ty::BoundVar::from_usize(bound_vars.len() - 1),
                 kind: ty::BoundRegionKind::BrEnv,
             };
-            let env_region = ty::ReLateBound(ty::INNERMOST, br);
-            let env_ty = tcx.mk_mut_ref(tcx.mk_region(env_region), ty);
+            let env_ty = tcx.mk_mut_ref(ty::Region::new_late_bound(tcx, ty::INNERMOST, br), ty);
 
             let pin_did = tcx.require_lang_item(LangItem::Pin, None);
             let pin_adt_ref = tcx.adt_def(pin_did);
-            let pin_substs = tcx.intern_substs(&[env_ty.into()]);
+            let pin_substs = tcx.mk_substs(&[env_ty.into()]);
             let env_ty = tcx.mk_adt(pin_adt_ref, pin_substs);
 
             let sig = sig.skip_binder();
@@ -112,7 +122,7 @@ fn fn_sig_for_fn_abi<'tcx>(
                 // The signature should be `Future::poll(_, &mut Context<'_>) -> Poll<Output>`
                 let poll_did = tcx.require_lang_item(LangItem::Poll, None);
                 let poll_adt_ref = tcx.adt_def(poll_did);
-                let poll_substs = tcx.intern_substs(&[sig.return_ty.into()]);
+                let poll_substs = tcx.mk_substs(&[sig.return_ty.into()]);
                 let ret_ty = tcx.mk_adt(poll_adt_ref, poll_substs);
 
                 // We have to replace the `ResumeTy` that is used for type and borrow checking
@@ -134,7 +144,7 @@ fn fn_sig_for_fn_abi<'tcx>(
                 // The signature should be `Generator::resume(_, Resume) -> GeneratorState<Yield, Return>`
                 let state_did = tcx.require_lang_item(LangItem::GeneratorState, None);
                 let state_adt_ref = tcx.adt_def(state_did);
-                let state_substs = tcx.intern_substs(&[sig.yield_ty.into(), sig.return_ty.into()]);
+                let state_substs = tcx.mk_substs(&[sig.yield_ty.into(), sig.return_ty.into()]);
                 let ret_ty = tcx.mk_adt(state_adt_ref, state_substs);
 
                 (sig.resume_ty, ret_ty)
@@ -142,8 +152,8 @@ fn fn_sig_for_fn_abi<'tcx>(
 
             ty::Binder::bind_with_vars(
                 tcx.mk_fn_sig(
-                    [env_ty, resume_ty].iter(),
-                    &ret_ty,
+                    [env_ty, resume_ty],
+                    ret_ty,
                     false,
                     hir::Unsafety::Normal,
                     rustc_target::spec::abi::Abi::Rust,
@@ -207,11 +217,8 @@ fn fn_abi_of_instance<'tcx>(
 
     let sig = fn_sig_for_fn_abi(tcx, instance, param_env);
 
-    let caller_location = if instance.def.requires_caller_location(tcx) {
-        Some(tcx.caller_location_ty())
-    } else {
-        None
-    };
+    let caller_location =
+        instance.def.requires_caller_location(tcx).then(|| tcx.caller_location_ty());
 
     fn_abi_new_uncached(
         &LayoutCx { tcx, param_env },
@@ -231,6 +238,7 @@ fn adjust_for_rust_scalar<'tcx>(
     layout: TyAndLayout<'tcx>,
     offset: Size,
     is_return: bool,
+    drop_target_pointee: Option<Ty<'tcx>>,
 ) {
     // Booleans are always a noundef i1 that needs to be zero-extended.
     if scalar.is_bool() {
@@ -244,25 +252,38 @@ fn adjust_for_rust_scalar<'tcx>(
     }
 
     // Only pointer types handled below.
-    let Scalar::Initialized { value: Pointer(_), valid_range} = scalar else { return };
+    let Scalar::Initialized { value: Pointer(_), valid_range } = scalar else { return };
 
-    if !valid_range.contains(0) {
+    // Set `nonnull` if the validity range excludes zero, or for the argument to `drop_in_place`,
+    // which must be nonnull per its documented safety requirements.
+    if !valid_range.contains(0) || drop_target_pointee.is_some() {
         attrs.set(ArgAttribute::NonNull);
     }
 
     if let Some(pointee) = layout.pointee_info_at(&cx, offset) {
-        if let Some(kind) = pointee.safe {
+        let kind = if let Some(kind) = pointee.safe {
+            Some(kind)
+        } else if let Some(pointee) = drop_target_pointee {
+            // The argument to `drop_in_place` is semantically equivalent to a mutable reference.
+            Some(PointerKind::MutableRef { unpin: pointee.is_unpin(cx.tcx, cx.param_env()) })
+        } else {
+            None
+        };
+        if let Some(kind) = kind {
             attrs.pointee_align = Some(pointee.align);
 
-            // `Box` (`UniqueBorrowed`) are not necessarily dereferenceable
-            // for the entire duration of the function as they can be deallocated
-            // at any time. Same for shared mutable references. If LLVM had a
-            // way to say "dereferenceable on entry" we could use it here.
+            // `Box` are not necessarily dereferenceable for the entire duration of the function as
+            // they can be deallocated at any time. Same for non-frozen shared references (see
+            // <https://github.com/rust-lang/rust/pull/98017>), and for mutable references to
+            // potentially self-referential types (see
+            // <https://github.com/rust-lang/unsafe-code-guidelines/issues/381>). If LLVM had a way
+            // to say "dereferenceable on entry" we could use it here.
             attrs.pointee_size = match kind {
-                PointerKind::UniqueBorrowed
-                | PointerKind::UniqueBorrowedPinned
-                | PointerKind::Frozen => pointee.size,
-                PointerKind::SharedMutable | PointerKind::UniqueOwned => Size::ZERO,
+                PointerKind::Box { .. }
+                | PointerKind::SharedRef { frozen: false }
+                | PointerKind::MutableRef { unpin: false } => Size::ZERO,
+                PointerKind::SharedRef { frozen: true }
+                | PointerKind::MutableRef { unpin: true } => pointee.size,
             };
 
             // The aliasing rules for `Box<T>` are still not decided, but currently we emit
@@ -275,18 +296,16 @@ fn adjust_for_rust_scalar<'tcx>(
             // versions at all anymore. We still support turning it off using -Zmutable-noalias.
             let noalias_mut_ref = cx.tcx.sess.opts.unstable_opts.mutable_noalias;
 
-            // `&mut` pointer parameters never alias other parameters,
-            // or mutable global data
+            // `&T` where `T` contains no `UnsafeCell<U>` is immutable, and can be marked as both
+            // `readonly` and `noalias`, as LLVM's definition of `noalias` is based solely on memory
+            // dependencies rather than pointer equality. However this only applies to arguments,
+            // not return values.
             //
-            // `&T` where `T` contains no `UnsafeCell<U>` is immutable,
-            // and can be marked as both `readonly` and `noalias`, as
-            // LLVM's definition of `noalias` is based solely on memory
-            // dependencies rather than pointer equality
+            // `&mut T` and `Box<T>` where `T: Unpin` are unique and hence `noalias`.
             let no_alias = match kind {
-                PointerKind::SharedMutable | PointerKind::UniqueBorrowedPinned => false,
-                PointerKind::UniqueBorrowed => noalias_mut_ref,
-                PointerKind::UniqueOwned => noalias_for_box,
-                PointerKind::Frozen => true,
+                PointerKind::SharedRef { frozen } => frozen,
+                PointerKind::MutableRef { unpin } => unpin && noalias_mut_ref,
+                PointerKind::Box { unpin } => unpin && noalias_for_box,
             };
             // We can never add `noalias` in return position; that LLVM attribute has some very surprising semantics
             // (see <https://github.com/rust-lang/unsafe-code-guidelines/issues/385#issuecomment-1368055745>).
@@ -294,7 +313,7 @@ fn adjust_for_rust_scalar<'tcx>(
                 attrs.set(ArgAttribute::NoAlias);
             }
 
-            if kind == PointerKind::Frozen && !is_return {
+            if matches!(kind, PointerKind::SharedRef { frozen: true }) && !is_return {
                 attrs.set(ArgAttribute::ReadOnly);
             }
         }
@@ -354,10 +373,18 @@ fn fn_abi_new_uncached<'tcx>(
     use SpecAbi::*;
     let rust_abi = matches!(sig.abi, RustIntrinsic | PlatformIntrinsic | Rust | RustCall);
 
+    let is_drop_in_place =
+        fn_def_id.is_some() && fn_def_id == cx.tcx.lang_items().drop_in_place_fn();
+
     let arg_of = |ty: Ty<'tcx>, arg_idx: Option<usize>| -> Result<_, FnAbiError<'tcx>> {
         let span = tracing::debug_span!("arg_of");
         let _entered = span.enter();
         let is_return = arg_idx.is_none();
+        let is_drop_target = is_drop_in_place && arg_idx == Some(0);
+        let drop_target_pointee = is_drop_target.then(|| match ty.kind() {
+            ty::RawPtr(ty::TypeAndMut { ty, .. }) => *ty,
+            _ => bug!("argument to drop_in_place is not a raw ptr: {:?}", ty),
+        });
 
         let layout = cx.layout_of(ty)?;
         let layout = if force_thin_self_ptr && arg_idx == Some(0) {
@@ -371,7 +398,15 @@ fn fn_abi_new_uncached<'tcx>(
 
         let mut arg = ArgAbi::new(cx, layout, |layout, scalar, offset| {
             let mut attrs = ArgAttributes::new();
-            adjust_for_rust_scalar(*cx, &mut attrs, scalar, *layout, offset, is_return);
+            adjust_for_rust_scalar(
+                *cx,
+                &mut attrs,
+                scalar,
+                *layout,
+                offset,
+                is_return,
+                drop_target_pointee,
+            );
             attrs
         });
 
@@ -542,7 +577,7 @@ fn make_thin_self_ptr<'tcx>(
         // get a built-in pointer type
         let mut fat_pointer_layout = layout;
         'descend_newtypes: while !fat_pointer_layout.ty.is_unsafe_ptr()
-            && !fat_pointer_layout.ty.is_region_ptr()
+            && !fat_pointer_layout.ty.is_ref()
         {
             for i in 0..fat_pointer_layout.fields.count() {
                 let field_layout = fat_pointer_layout.field(cx, i);

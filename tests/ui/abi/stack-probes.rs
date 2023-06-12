@@ -5,10 +5,12 @@
 // ignore-mips64
 // ignore-sparc
 // ignore-sparc64
+// ignore-loongarch64
 // ignore-wasm
 // ignore-emscripten no processes
 // ignore-sgx no processes
 // ignore-fuchsia no exception handler registered for segfault
+// ignore-nto Crash analysis impossible at SIGSEGV in QNX Neutrino
 
 use std::env;
 use std::mem::MaybeUninit;

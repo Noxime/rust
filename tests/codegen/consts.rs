@@ -1,5 +1,4 @@
 // compile-flags: -C no-prepopulate-passes
-// min-llvm-version: 14.0
 
 #![crate_type = "lib"]
 
@@ -10,11 +9,11 @@
 // CHECK: @STATIC = {{.*}}, align 4
 
 // This checks the constants from inline_enum_const
-// CHECK: @alloc12 = {{.*}}, align 2
+// CHECK: @alloc_af1f8e8e6f4b341431a1d405e652df2d = {{.*}}, align 2
 
 // This checks the constants from {low,high}_align_const, they share the same
 // constant, but the alignment differs, so the higher one should be used
-// CHECK: [[LOW_HIGH:@alloc[0-9]+]] = {{.*}}, align 4
+// CHECK: [[LOW_HIGH:@alloc_[a-f0-9]+]] = {{.*}}, align 4
 
 #[derive(Copy, Clone)]
 // repr(i16) is required for the {low,high}_align_const test

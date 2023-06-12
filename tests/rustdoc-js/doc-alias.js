@@ -1,33 +1,6 @@
-// exact-check
-
-const QUERY = [
-    'StructItem',
-    'StructFieldItem',
-    'StructMethodItem',
-    'ImplTraitItem',
-    'StructImplConstItem',
-    'ImplTraitFunction',
-    'EnumItem',
-    'VariantItem',
-    'EnumMethodItem',
-    'TypedefItem',
-    'TraitItem',
-    'TraitTypeItem',
-    'AssociatedConstItem',
-    'TraitFunctionItem',
-    'FunctionItem',
-    'ModuleItem',
-    'ConstItem',
-    'StaticItem',
-    'UnionItem',
-    'UnionFieldItem',
-    'UnionMethodItem',
-    'MacroItem',
-];
-
 const EXPECTED = [
     {
-        // StructItem
+        'query': 'StructItem',
         'others': [
             {
                 'path': 'doc_alias',
@@ -39,7 +12,7 @@ const EXPECTED = [
         ],
     },
     {
-        // StructFieldItem
+        'query': 'StructFieldItem',
         'others': [
             {
                 'path': 'doc_alias::Struct',
@@ -51,7 +24,7 @@ const EXPECTED = [
         ],
     },
     {
-        // StructMethodItem
+        'query': 'StructMethodItem',
         'others': [
             {
                 'path': 'doc_alias::Struct',
@@ -63,11 +36,11 @@ const EXPECTED = [
         ],
     },
     {
-        // ImplTraitItem
+        'query': 'ImplTraitItem',
         'others': [],
     },
     {
-        // StructImplConstItem
+        'query': 'StructImplConstItem',
         'others': [
             {
                 'path': 'doc_alias::Struct',
@@ -79,7 +52,7 @@ const EXPECTED = [
         ],
     },
     {
-        // ImplTraitFunction
+        'query': 'ImplTraitFunction',
         'others': [
             {
                 'path': 'doc_alias::Struct',
@@ -91,7 +64,7 @@ const EXPECTED = [
         ],
     },
     {
-        // EnumItem
+        'query': 'EnumItem',
         'others': [
             {
                 'path': 'doc_alias',
@@ -103,7 +76,7 @@ const EXPECTED = [
         ],
     },
     {
-        // VariantItem
+        'query': 'VariantItem',
         'others': [
             {
                 'path': 'doc_alias::Enum',
@@ -115,7 +88,7 @@ const EXPECTED = [
         ],
     },
     {
-        // EnumMethodItem
+        'query': 'EnumMethodItem',
         'others': [
             {
                 'path': 'doc_alias::Enum',
@@ -127,7 +100,7 @@ const EXPECTED = [
         ],
     },
     {
-        // TypedefItem
+        'query': 'TypedefItem',
         'others': [
             {
                 'path': 'doc_alias',
@@ -139,7 +112,7 @@ const EXPECTED = [
         ],
     },
     {
-        // TraitItem
+        'query': 'TraitItem',
         'others': [
             {
                 'path': 'doc_alias',
@@ -151,7 +124,7 @@ const EXPECTED = [
         ],
     },
     {
-        // TraitTypeItem
+        'query': 'TraitTypeItem',
         'others': [
             {
                 'path': 'doc_alias::Trait',
@@ -163,7 +136,7 @@ const EXPECTED = [
         ],
     },
     {
-        // AssociatedConstItem
+        'query': 'AssociatedConstItem',
         'others': [
             {
                 'path': 'doc_alias::Trait',
@@ -175,7 +148,7 @@ const EXPECTED = [
         ],
     },
     {
-        // TraitFunctionItem
+        'query': 'TraitFunctionItem',
         'others': [
             {
                 'path': 'doc_alias::Trait',
@@ -187,7 +160,7 @@ const EXPECTED = [
         ],
     },
     {
-        // FunctionItem
+        'query': 'FunctionItem',
         'others': [
             {
                 'path': 'doc_alias',
@@ -199,7 +172,7 @@ const EXPECTED = [
         ],
     },
     {
-        // ModuleItem
+        'query': 'ModuleItem',
         'others': [
             {
                 'path': 'doc_alias',
@@ -211,7 +184,7 @@ const EXPECTED = [
         ],
     },
     {
-        // ConstItem
+        'query': 'ConstItem',
         'others': [
             {
                 'path': 'doc_alias',
@@ -227,7 +200,7 @@ const EXPECTED = [
         ],
     },
     {
-        // StaticItem
+        'query': 'StaticItem',
         'others': [
             {
                 'path': 'doc_alias',
@@ -239,7 +212,7 @@ const EXPECTED = [
         ],
     },
     {
-        // UnionItem
+        'query': 'UnionItem',
         'others': [
             {
                 'path': 'doc_alias',
@@ -257,7 +230,7 @@ const EXPECTED = [
         ],
     },
     {
-        // UnionFieldItem
+        'query': 'UnionFieldItem',
         'others': [
             {
                 'path': 'doc_alias::Union',
@@ -269,7 +242,7 @@ const EXPECTED = [
         ],
     },
     {
-        // UnionMethodItem
+        'query': 'UnionMethodItem',
         'others': [
             {
                 'path': 'doc_alias::Union',
@@ -281,7 +254,7 @@ const EXPECTED = [
         ],
     },
     {
-        // MacroItem
+        'query': 'MacroItem',
         'others': [
             {
                 'path': 'doc_alias',

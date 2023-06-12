@@ -46,7 +46,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         // This list should be kept in sync with the one from libstd.
         let min_align = match this.tcx.sess.target.arch.as_ref() {
             "x86" | "arm" | "mips" | "powerpc" | "powerpc64" | "asmjs" | "wasm32" => 8,
-            "x86_64" | "aarch64" | "mips64" | "s390x" | "sparc64" => 16,
+            "x86_64" | "aarch64" | "mips64" | "s390x" | "sparc64" | "loongarch64" => 16,
             arch => bug!("unsupported target architecture for malloc: `{}`", arch),
         };
         // Windows always aligns, even small allocations.
@@ -166,7 +166,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     dependency_format.1.iter().enumerate().filter_map(|(num, &linkage)| {
                         // We add 1 to the number because that's what rustc also does everywhere it
                         // calls `CrateNum::new`...
-                        #[allow(clippy::integer_arithmetic)]
+                        #[allow(clippy::arithmetic_side_effects)]
                         (linkage != Linkage::NotLinked).then_some(CrateNum::new(num + 1))
                     }),
                 ) {
@@ -232,6 +232,19 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
     }
 
+    /// Read bytes from a `(ptr, len)` argument
+    fn read_byte_slice<'i>(&'i self, bytes: &OpTy<'tcx, Provenance>) -> InterpResult<'tcx, &'i [u8]>
+    where
+        'mir: 'i,
+    {
+        let this = self.eval_context_ref();
+        let (ptr, len) = this.read_immediate(bytes)?.to_scalar_pair();
+        let ptr = ptr.to_pointer(this)?;
+        let len = len.to_target_usize(this)?;
+        let bytes = this.read_bytes_ptr_strip_provenance(ptr, Size::from_bytes(len))?;
+        Ok(bytes)
+    }
+
     /// Emulates calling a foreign item, failing if the item is not supported.
     /// This function will handle `goto_block` if needed.
     /// Returns Ok(None) if the foreign item was completely handled
@@ -245,7 +258,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         args: &[OpTy<'tcx, Provenance>],
         dest: &PlaceTy<'tcx, Provenance>,
         ret: Option<mir::BasicBlock>,
-        unwind: StackPopUnwind,
+        unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx, Option<(&'mir mir::Body<'tcx>, ty::Instance<'tcx>)>> {
         let this = self.eval_context_mut();
         let link_name = this.item_link_name(def_id);
@@ -334,7 +347,6 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     /// Emulates calling the internal __rust_* allocator functions
     fn emulate_allocator(
         &mut self,
-        symbol: Symbol,
         default: impl FnOnce(&mut MiriInterpCx<'mir, 'tcx>) -> InterpResult<'tcx>,
     ) -> InterpResult<'tcx, EmulateByNameResult<'mir, 'tcx>> {
         let this = self.eval_context_mut();
@@ -346,11 +358,12 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
 
         match allocator_kind {
             AllocatorKind::Global => {
-                let (body, instance) = this
-                    .lookup_exported_symbol(symbol)?
-                    .expect("symbol should be present if there is a global allocator");
-
-                Ok(EmulateByNameResult::MirBody(body, instance))
+                // When `#[global_allocator]` is used, `__rust_*` is defined by the macro expansion
+                // of this attribute. As such we have to call an exported Rust function,
+                // and not execute any Miri shim. Somewhat unintuitively doing so is done
+                // by returning `NotSupported`, which triggers the `lookup_exported_symbol`
+                // fallback case in `emulate_foreign_item`.
+                return Ok(EmulateByNameResult::NotSupported);
             }
             AllocatorKind::Default => {
                 default(this)?;
@@ -427,12 +440,26 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 })?;
                 this.write_scalar(Scalar::from_u64(alloc_id.0.get()), dest)?;
             }
-            "miri_print_borrow_stacks" => {
-                let [id] = this.check_shim(abi, Abi::Rust, link_name, args)?;
+            "miri_print_borrow_state" => {
+                let [id, show_unnamed] = this.check_shim(abi, Abi::Rust, link_name, args)?;
                 let id = this.read_scalar(id)?.to_u64()?;
+                let show_unnamed = this.read_scalar(show_unnamed)?.to_bool()?;
                 if let Some(id) = std::num::NonZeroU64::new(id) {
-                    this.print_stacks(AllocId(id))?;
+                    this.print_borrow_state(AllocId(id), show_unnamed)?;
                 }
+            }
+            "miri_pointer_name" => {
+                // This associates a name to a tag. Very useful for debugging, and also makes
+                // tests more strict.
+                let [ptr, nth_parent, name] = this.check_shim(abi, Abi::Rust, link_name, args)?;
+                let ptr = this.read_pointer(ptr)?;
+                let nth_parent = this.read_scalar(nth_parent)?.to_u8()?;
+                let name = this.read_byte_slice(name)?;
+                // We must make `name` owned because we need to
+                // end the shared borrow from `read_byte_slice` before we can
+                // start the mutable borrow for `give_pointer_debug_name`.
+                let name = String::from_utf8_lossy(name).into_owned();
+                this.give_pointer_debug_name(ptr, nth_parent, &name)?;
             }
             "miri_static_root" => {
                 let [ptr] = this.check_shim(abi, Abi::Rust, link_name, args)?;
@@ -449,7 +476,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let [ptr, out, out_size] = this.check_shim(abi, Abi::Rust, link_name, args)?;
                 let ptr = this.read_pointer(ptr)?;
                 let out = this.read_pointer(out)?;
-                let out_size = this.read_scalar(out_size)?.to_machine_usize(this)?;
+                let out_size = this.read_scalar(out_size)?.to_target_usize(this)?;
 
                 // The host affects program behavior here, so this requires isolation to be disabled.
                 this.check_no_isolation("`miri_host_to_target_path`")?;
@@ -487,12 +514,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             // Writes some bytes to the interpreter's stdout/stderr. See the
             // README for details.
             "miri_write_to_stdout" | "miri_write_to_stderr" => {
-                let [bytes] = this.check_shim(abi, Abi::Rust, link_name, args)?;
-                let (ptr, len) = this.read_immediate(bytes)?.to_scalar_pair();
-                let ptr = ptr.to_pointer(this)?;
-                let len = len.to_machine_usize(this)?;
-                let msg = this.read_bytes_ptr_strip_provenance(ptr, Size::from_bytes(len))?;
-
+                let [msg] = this.check_shim(abi, Abi::Rust, link_name, args)?;
+                let msg = this.read_byte_slice(msg)?;
                 // Note: we're ignoring errors writing to host stdout/stderr.
                 let _ignore = match link_name.as_str() {
                     "miri_write_to_stdout" => std::io::stdout().write_all(msg),
@@ -504,15 +527,15 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             // Standard C allocation
             "malloc" => {
                 let [size] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                let size = this.read_machine_usize(size)?;
+                let size = this.read_target_usize(size)?;
                 let res = this.malloc(size, /*zero_init:*/ false, MiriMemoryKind::C)?;
                 this.write_pointer(res, dest)?;
             }
             "calloc" => {
                 let [items, len] =
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                let items = this.read_machine_usize(items)?;
-                let len = this.read_machine_usize(len)?;
+                let items = this.read_target_usize(items)?;
+                let len = this.read_target_usize(len)?;
                 let size = items
                     .checked_mul(len)
                     .ok_or_else(|| err_ub_format!("overflow during calloc size computation"))?;
@@ -528,18 +551,20 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let [old_ptr, new_size] =
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let old_ptr = this.read_pointer(old_ptr)?;
-                let new_size = this.read_machine_usize(new_size)?;
+                let new_size = this.read_target_usize(new_size)?;
                 let res = this.realloc(old_ptr, new_size, MiriMemoryKind::C)?;
                 this.write_pointer(res, dest)?;
             }
 
             // Rust allocation
             "__rust_alloc" | "miri_alloc" => {
-                let [size, align] = this.check_shim(abi, Abi::Rust, link_name, args)?;
-                let size = this.read_machine_usize(size)?;
-                let align = this.read_machine_usize(align)?;
-
                 let default = |this: &mut MiriInterpCx<'mir, 'tcx>| {
+                    // Only call `check_shim` when `#[global_allocator]` isn't used. When that
+                    // macro is used, we act like no shim exists, so that the exported function can run.
+                    let [size, align] = this.check_shim(abi, Abi::Rust, link_name, args)?;
+                    let size = this.read_target_usize(size)?;
+                    let align = this.read_target_usize(align)?;
+
                     Self::check_alloc_request(size, align)?;
 
                     let memory_kind = match link_name.as_str() {
@@ -558,8 +583,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 };
 
                 match link_name.as_str() {
-                    "__rust_alloc" =>
-                        return this.emulate_allocator(Symbol::intern("__rg_alloc"), default),
+                    "__rust_alloc" => return this.emulate_allocator(default),
                     "miri_alloc" => {
                         default(this)?;
                         return Ok(EmulateByNameResult::NeedsJumping);
@@ -568,11 +592,13 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 }
             }
             "__rust_alloc_zeroed" => {
-                let [size, align] = this.check_shim(abi, Abi::Rust, link_name, args)?;
-                let size = this.read_machine_usize(size)?;
-                let align = this.read_machine_usize(align)?;
+                return this.emulate_allocator(|this| {
+                    // See the comment for `__rust_alloc` why `check_shim` is only called in the
+                    // default case.
+                    let [size, align] = this.check_shim(abi, Abi::Rust, link_name, args)?;
+                    let size = this.read_target_usize(size)?;
+                    let align = this.read_target_usize(align)?;
 
-                return this.emulate_allocator(Symbol::intern("__rg_alloc_zeroed"), |this| {
                     Self::check_alloc_request(size, align)?;
 
                     let ptr = this.allocate_ptr(
@@ -591,12 +617,15 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 });
             }
             "__rust_dealloc" | "miri_dealloc" => {
-                let [ptr, old_size, align] = this.check_shim(abi, Abi::Rust, link_name, args)?;
-                let ptr = this.read_pointer(ptr)?;
-                let old_size = this.read_machine_usize(old_size)?;
-                let align = this.read_machine_usize(align)?;
-
                 let default = |this: &mut MiriInterpCx<'mir, 'tcx>| {
+                    // See the comment for `__rust_alloc` why `check_shim` is only called in the
+                    // default case.
+                    let [ptr, old_size, align] =
+                        this.check_shim(abi, Abi::Rust, link_name, args)?;
+                    let ptr = this.read_pointer(ptr)?;
+                    let old_size = this.read_target_usize(old_size)?;
+                    let align = this.read_target_usize(align)?;
+
                     let memory_kind = match link_name.as_str() {
                         "__rust_dealloc" => MiriMemoryKind::Rust,
                         "miri_dealloc" => MiriMemoryKind::Miri,
@@ -612,8 +641,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 };
 
                 match link_name.as_str() {
-                    "__rust_dealloc" =>
-                        return this.emulate_allocator(Symbol::intern("__rg_dealloc"), default),
+                    "__rust_dealloc" => {
+                        return this.emulate_allocator(default);
+                    }
                     "miri_dealloc" => {
                         default(this)?;
                         return Ok(EmulateByNameResult::NeedsJumping);
@@ -622,15 +652,17 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 }
             }
             "__rust_realloc" => {
-                let [ptr, old_size, align, new_size] =
-                    this.check_shim(abi, Abi::Rust, link_name, args)?;
-                let ptr = this.read_pointer(ptr)?;
-                let old_size = this.read_machine_usize(old_size)?;
-                let align = this.read_machine_usize(align)?;
-                let new_size = this.read_machine_usize(new_size)?;
-                // No need to check old_size; we anyway check that they match the allocation.
+                return this.emulate_allocator(|this| {
+                    // See the comment for `__rust_alloc` why `check_shim` is only called in the
+                    // default case.
+                    let [ptr, old_size, align, new_size] =
+                        this.check_shim(abi, Abi::Rust, link_name, args)?;
+                    let ptr = this.read_pointer(ptr)?;
+                    let old_size = this.read_target_usize(old_size)?;
+                    let align = this.read_target_usize(align)?;
+                    let new_size = this.read_target_usize(new_size)?;
+                    // No need to check old_size; we anyway check that they match the allocation.
 
-                return this.emulate_allocator(Symbol::intern("__rg_realloc"), |this| {
                     Self::check_alloc_request(new_size, align)?;
 
                     let align = Align::from_bytes(align).unwrap();
@@ -651,7 +683,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let left = this.read_pointer(left)?;
                 let right = this.read_pointer(right)?;
-                let n = Size::from_bytes(this.read_machine_usize(n)?);
+                let n = Size::from_bytes(this.read_target_usize(n)?);
 
                 let result = {
                     let left_bytes = this.read_bytes_ptr_strip_provenance(left, n)?;
@@ -672,7 +704,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let ptr = this.read_pointer(ptr)?;
                 let val = this.read_scalar(val)?.to_i32()?;
-                let num = this.read_machine_usize(num)?;
+                let num = this.read_target_usize(num)?;
                 // The docs say val is "interpreted as unsigned char".
                 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
                 let val = val as u8;
@@ -684,7 +716,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     .position(|&c| c == val)
                 {
                     let idx = u64::try_from(idx).unwrap();
-                    #[allow(clippy::integer_arithmetic)] // idx < num, so this never wraps
+                    #[allow(clippy::arithmetic_side_effects)] // idx < num, so this never wraps
                     let new_ptr = ptr.offset(Size::from_bytes(num - idx - 1), this)?;
                     this.write_pointer(new_ptr, dest)?;
                 } else {
@@ -696,7 +728,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let ptr = this.read_pointer(ptr)?;
                 let val = this.read_scalar(val)?.to_i32()?;
-                let num = this.read_machine_usize(num)?;
+                let num = this.read_target_usize(num)?;
                 // The docs say val is "interpreted as unsigned char".
                 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
                 let val = val as u8;
@@ -717,9 +749,47 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let ptr = this.read_pointer(ptr)?;
                 let n = this.read_c_str(ptr)?.len();
                 this.write_scalar(
-                    Scalar::from_machine_usize(u64::try_from(n).unwrap(), this),
+                    Scalar::from_target_usize(u64::try_from(n).unwrap(), this),
                     dest,
                 )?;
+            }
+            "memcpy" => {
+                let [ptr_dest, ptr_src, n] =
+                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                let ptr_dest = this.read_pointer(ptr_dest)?;
+                let ptr_src = this.read_pointer(ptr_src)?;
+                let n = this.read_target_usize(n)?;
+                this.mem_copy(
+                    ptr_src,
+                    Align::ONE,
+                    ptr_dest,
+                    Align::ONE,
+                    Size::from_bytes(n),
+                    true,
+                )?;
+                this.write_pointer(ptr_dest, dest)?;
+            }
+            "strcpy" => {
+                let [ptr_dest, ptr_src] =
+                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                let ptr_dest = this.read_pointer(ptr_dest)?;
+                let ptr_src = this.read_pointer(ptr_src)?;
+
+                // We use `read_c_str` to determine the amount of data to copy,
+                // and then use `mem_copy` for the actual copy. This means
+                // pointer provenance is preserved by this implementation of `strcpy`.
+                // That is probably overly cautious, but there also is no fundamental
+                // reason to have `strcpy` destroy pointer provenance.
+                let n = this.read_c_str(ptr_src)?.len().checked_add(1).unwrap();
+                this.mem_copy(
+                    ptr_src,
+                    Align::ONE,
+                    ptr_dest,
+                    Align::ONE,
+                    Size::from_bytes(n),
+                    true,
+                )?;
+                this.write_pointer(ptr_dest, dest)?;
             }
 
             // math functions (note that there are also intrinsics for some other functions)
@@ -855,10 +925,10 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let a = this.read_scalar(a)?.to_u64()?;
                 let b = this.read_scalar(b)?.to_u64()?;
 
-                #[allow(clippy::integer_arithmetic)]
+                #[allow(clippy::arithmetic_side_effects)]
                 // adding two u64 and a u8 cannot wrap in a u128
                 let wide_sum = u128::from(c_in) + u128::from(a) + u128::from(b);
-                #[allow(clippy::integer_arithmetic)] // it's a u128, we can shift by 64
+                #[allow(clippy::arithmetic_side_effects)] // it's a u128, we can shift by 64
                 let (c_out, sum) = ((wide_sum >> 64).truncate::<u8>(), wide_sum.truncate::<u64>());
 
                 let c_out_field = this.place_field(dest, 0)?;
@@ -882,6 +952,19 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     }
                     _ => {
                         throw_unsup_format!("unsupported llvm.aarch64.isb argument {}", arg);
+                    }
+                }
+            }
+            "llvm.arm.hint" if this.tcx.sess.target.arch == "arm" => {
+                let [arg] = this.check_shim(abi, Abi::Unadjusted, link_name, args)?;
+                let arg = this.read_scalar(arg)?.to_i32()?;
+                match arg {
+                    // YIELD
+                    1 => {
+                        this.yield_active_thread();
+                    }
+                    _ => {
+                        throw_unsup_format!("unsupported llvm.arm.hint argument {}", arg);
                     }
                 }
             }

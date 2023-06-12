@@ -28,6 +28,7 @@ use super::{
     ValueVisitor,
 };
 use crate::const_eval;
+use crate::errors::{DanglingPtrInFinal, UnsupportedUntypedPointer};
 
 pub trait CompileTimeMachine<'mir, 'tcx, T> = Machine<
         'mir,
@@ -135,7 +136,7 @@ fn intern_shallow<'rt, 'mir, 'tcx, M: CompileTimeMachine<'mir, 'tcx, const_eval:
     };
     // link the alloc id to the actual allocation
     leftover_allocations.extend(alloc.provenance().ptrs().iter().map(|&(_, alloc_id)| alloc_id));
-    let alloc = tcx.intern_const_alloc(alloc);
+    let alloc = tcx.mk_const_alloc(alloc);
     tcx.set_alloc_id_memory(alloc_id, alloc);
     None
 }
@@ -242,7 +243,7 @@ impl<'rt, 'mir, 'tcx: 'mir, M: CompileTimeMachine<'mir, 'tcx, const_eval::Memory
             let mplace = self.ecx.ref_to_mplace(&value)?;
             assert_eq!(mplace.layout.ty, referenced_ty);
             // Handle trait object vtables.
-            if let ty::Dynamic(..) =
+            if let ty::Dynamic(_, _, ty::Dyn) =
                 tcx.struct_tail_erasing_lifetimes(referenced_ty, self.ecx.param_env).kind()
             {
                 let ptr = mplace.meta.unwrap_meta().to_pointer(&tcx)?;
@@ -320,10 +321,12 @@ impl<'rt, 'mir, 'tcx: 'mir, M: CompileTimeMachine<'mir, 'tcx, const_eval::Memory
     }
 }
 
+/// How a constant value should be interned.
 #[derive(Copy, Clone, Debug, PartialEq, Hash, Eq)]
 pub enum InternKind {
     /// The `mutability` of the static, ignoring the type which may have interior mutability.
     Static(hir::Mutability),
+    /// A `const` item
     Constant,
     Promoted,
 }
@@ -387,9 +390,8 @@ pub fn intern_const_alloc_recursive<
             Err(error) => {
                 ecx.tcx.sess.delay_span_bug(
                     ecx.tcx.span,
-                    &format!(
-                        "error during interning should later cause validation failure: {}",
-                        error
+                    format!(
+                        "error during interning should later cause validation failure: {error:?}"
                     ),
                 );
             }
@@ -425,19 +427,21 @@ pub fn intern_const_alloc_recursive<
                     // immutability is so important.
                     alloc.mutability = Mutability::Not;
                 }
+                // If it's a constant, we should not have any "leftovers" as everything
+                // is tracked by const-checking.
+                // FIXME: downgrade this to a warning? It rejects some legitimate consts,
+                // such as `const CONST_RAW: *const Vec<i32> = &Vec::new() as *const _;`.
+                //
+                // NOTE: it looks likes this code path is only reachable when we try to intern
+                // something that cannot be promoted, which in constants means values that have
+                // drop glue, such as the example above.
                 InternKind::Constant => {
-                    // If it's a constant, we should not have any "leftovers" as everything
-                    // is tracked by const-checking.
-                    // FIXME: downgrade this to a warning? It rejects some legitimate consts,
-                    // such as `const CONST_RAW: *const Vec<i32> = &Vec::new() as *const _;`.
-                    ecx.tcx
-                        .sess
-                        .span_err(ecx.tcx.span, "untyped pointers are not allowed in constant");
+                    ecx.tcx.sess.emit_err(UnsupportedUntypedPointer { span: ecx.tcx.span });
                     // For better errors later, mark the allocation as immutable.
                     alloc.mutability = Mutability::Not;
                 }
             }
-            let alloc = tcx.intern_const_alloc(alloc);
+            let alloc = tcx.mk_const_alloc(alloc);
             tcx.set_alloc_id_memory(alloc_id, alloc);
             for &(_, alloc_id) in alloc.inner().provenance().ptrs().iter() {
                 if leftover_allocations.insert(alloc_id) {
@@ -447,10 +451,7 @@ pub fn intern_const_alloc_recursive<
         } else if ecx.memory.dead_alloc_map.contains_key(&alloc_id) {
             // Codegen does not like dangling pointers, and generally `tcx` assumes that
             // all allocations referenced anywhere actually exist. So, make sure we error here.
-            let reported = ecx
-                .tcx
-                .sess
-                .span_err(ecx.tcx.span, "encountered dangling pointer in final constant");
+            let reported = ecx.tcx.sess.emit_err(DanglingPtrInFinal { span: ecx.tcx.span });
             return Err(reported);
         } else if ecx.tcx.try_get_global_alloc(alloc_id).is_none() {
             // We have hit an `AllocId` that is neither in local or global memory and isn't
@@ -479,6 +480,6 @@ impl<'mir, 'tcx: 'mir, M: super::intern::CompileTimeMachine<'mir, 'tcx, !>>
         f(self, &dest.into())?;
         let mut alloc = self.memory.alloc_map.remove(&dest.ptr.provenance.unwrap()).unwrap().1;
         alloc.mutability = Mutability::Not;
-        Ok(self.tcx.intern_const_alloc(alloc))
+        Ok(self.tcx.mk_const_alloc(alloc))
     }
 }

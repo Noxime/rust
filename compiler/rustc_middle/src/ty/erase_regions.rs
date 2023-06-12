@@ -1,9 +1,9 @@
+use crate::query::Providers;
 use crate::ty::fold::{TypeFoldable, TypeFolder, TypeSuperFoldable};
-use crate::ty::visit::TypeVisitable;
-use crate::ty::{self, Ty, TyCtxt, TypeFlags};
+use crate::ty::{self, Ty, TyCtxt, TypeFlags, TypeVisitableExt};
 
-pub(super) fn provide(providers: &mut ty::query::Providers) {
-    *providers = ty::query::Providers { erase_regions_ty, ..*providers };
+pub(super) fn provide(providers: &mut Providers) {
+    *providers = Providers { erase_regions_ty, ..*providers };
 }
 
 fn erase_regions_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Ty<'tcx> {
@@ -18,7 +18,7 @@ impl<'tcx> TyCtxt<'tcx> {
     /// subtyping, but they are anonymized and normalized as well)..
     pub fn erase_regions<T>(self, value: T) -> T
     where
-        T: TypeFoldable<'tcx>,
+        T: TypeFoldable<TyCtxt<'tcx>>,
     {
         // If there's nothing to erase avoid performing the query at all
         if !value.has_type_flags(TypeFlags::HAS_LATE_BOUND | TypeFlags::HAS_FREE_REGIONS) {
@@ -35,18 +35,18 @@ struct RegionEraserVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
 }
 
-impl<'tcx> TypeFolder<'tcx> for RegionEraserVisitor<'tcx> {
-    fn tcx<'b>(&'b self) -> TyCtxt<'tcx> {
+impl<'tcx> TypeFolder<TyCtxt<'tcx>> for RegionEraserVisitor<'tcx> {
+    fn interner(&self) -> TyCtxt<'tcx> {
         self.tcx
     }
 
     fn fold_ty(&mut self, ty: Ty<'tcx>) -> Ty<'tcx> {
-        if ty.needs_infer() { ty.super_fold_with(self) } else { self.tcx.erase_regions_ty(ty) }
+        if ty.has_infer() { ty.super_fold_with(self) } else { self.tcx.erase_regions_ty(ty) }
     }
 
     fn fold_binder<T>(&mut self, t: ty::Binder<'tcx, T>) -> ty::Binder<'tcx, T>
     where
-        T: TypeFoldable<'tcx>,
+        T: TypeFoldable<TyCtxt<'tcx>>,
     {
         let u = self.tcx.anonymize_bound_vars(t);
         u.super_fold_with(self)

@@ -1,7 +1,10 @@
 //! Conversion lsp_types types to rust-analyzer specific ones.
 use anyhow::format_err;
-use ide::{Annotation, AnnotationKind, AssistKind, LineCol, LineColUtf16};
-use ide_db::base_db::{FileId, FilePosition, FileRange};
+use ide::{Annotation, AnnotationKind, AssistKind, LineCol};
+use ide_db::{
+    base_db::{FileId, FilePosition, FileRange},
+    line_index::WideLineCol,
+};
 use syntax::{TextRange, TextSize};
 use vfs::AbsPathBuf;
 
@@ -26,9 +29,12 @@ pub(crate) fn vfs_path(url: &lsp_types::Url) -> Result<vfs::VfsPath> {
 pub(crate) fn offset(line_index: &LineIndex, position: lsp_types::Position) -> Result<TextSize> {
     let line_col = match line_index.encoding {
         PositionEncoding::Utf8 => LineCol { line: position.line, col: position.character },
-        PositionEncoding::Utf16 => {
-            let line_col = LineColUtf16 { line: position.line, col: position.character };
-            line_index.index.to_utf8(line_col)
+        PositionEncoding::Wide(enc) => {
+            let line_col = WideLineCol { line: position.line, col: position.character };
+            line_index
+                .index
+                .to_utf8(enc, line_col)
+                .ok_or_else(|| format_err!("Invalid wide col offset"))?
         }
     };
     let text_size =
@@ -95,13 +101,18 @@ pub(crate) fn assist_kind(kind: lsp_types::CodeActionKind) -> Option<AssistKind>
 pub(crate) fn annotation(
     snap: &GlobalStateSnapshot,
     code_lens: lsp_types::CodeLens,
-) -> Result<Annotation> {
+) -> Result<Option<Annotation>> {
     let data =
         code_lens.data.ok_or_else(|| invalid_params_error("code lens without data".to_string()))?;
     let resolve = from_json::<lsp_ext::CodeLensResolveData>("CodeLensResolveData", &data)?;
 
-    match resolve {
-        lsp_ext::CodeLensResolveData::Impls(params) => {
+    match resolve.kind {
+        lsp_ext::CodeLensResolveDataKind::Impls(params) => {
+            if snap.url_file_version(&params.text_document_position_params.text_document.uri)
+                != Some(resolve.version)
+            {
+                return Ok(None);
+            }
             let pos @ FilePosition { file_id, .. } =
                 file_position(snap, params.text_document_position_params)?;
             let line_index = snap.file_line_index(file_id)?;
@@ -111,7 +122,10 @@ pub(crate) fn annotation(
                 kind: AnnotationKind::HasImpls { pos, data: None },
             })
         }
-        lsp_ext::CodeLensResolveData::References(params) => {
+        lsp_ext::CodeLensResolveDataKind::References(params) => {
+            if snap.url_file_version(&params.text_document.uri) != Some(resolve.version) {
+                return Ok(None);
+            }
             let pos @ FilePosition { file_id, .. } = file_position(snap, params)?;
             let line_index = snap.file_line_index(file_id)?;
 
@@ -121,4 +135,5 @@ pub(crate) fn annotation(
             })
         }
     }
+    .map(Some)
 }

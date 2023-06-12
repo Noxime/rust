@@ -8,7 +8,8 @@ use crate::{
     CachedModuleCodegen, CodegenResults, CompiledModule, CrateInfo, ModuleCodegen, ModuleKind,
 };
 use jobserver::{Acquired, Client};
-use rustc_data_structures::fx::FxHashMap;
+use rustc_ast::attr;
+use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
 use rustc_data_structures::memmap::Mmap;
 use rustc_data_structures::profiling::SelfProfilerRef;
 use rustc_data_structures::profiling::TimingGuard;
@@ -22,12 +23,13 @@ use rustc_hir::def_id::{CrateNum, LOCAL_CRATE};
 use rustc_incremental::{
     copy_cgu_workproduct_to_incr_comp_cache_dir, in_incr_comp_dir, in_incr_comp_dir_sess,
 };
+use rustc_metadata::fs::copy_to_stdout;
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
 use rustc_middle::middle::exported_symbols::SymbolExportInfo;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::cgu_reuse_tracker::CguReuseTracker;
-use rustc_session::config::{self, CrateType, Lto, OutputFilenames, OutputType};
+use rustc_session::config::{self, CrateType, Lto, OutFileName, OutputFilenames, OutputType};
 use rustc_session::config::{Passes, SwitchWithOptPath};
 use rustc_session::Session;
 use rustc_span::source_map::SourceMap;
@@ -447,8 +449,8 @@ pub fn start_async_codegen<B: ExtraBackendMethods>(
     let sess = tcx.sess;
 
     let crate_attrs = tcx.hir().attrs(rustc_hir::CRATE_HIR_ID);
-    let no_builtins = tcx.sess.contains_name(crate_attrs, sym::no_builtins);
-    let is_compiler_builtins = tcx.sess.contains_name(crate_attrs, sym::compiler_builtins);
+    let no_builtins = attr::contains_name(crate_attrs, sym::no_builtins);
+    let is_compiler_builtins = attr::contains_name(crate_attrs, sym::compiler_builtins);
 
     let crate_info = CrateInfo::new(tcx, target_cpu);
 
@@ -497,8 +499,8 @@ pub fn start_async_codegen<B: ExtraBackendMethods>(
 fn copy_all_cgu_workproducts_to_incr_comp_cache_dir(
     sess: &Session,
     compiled_modules: &CompiledModules,
-) -> FxHashMap<WorkProductId, WorkProduct> {
-    let mut work_products = FxHashMap::default();
+) -> FxIndexMap<WorkProductId, WorkProduct> {
+    let mut work_products = FxIndexMap::default();
 
     if sess.opts.incremental.is_none() {
         return work_products;
@@ -534,9 +536,16 @@ fn produce_final_output_artifacts(
     let mut user_wants_objects = false;
 
     // Produce final compile outputs.
-    let copy_gracefully = |from: &Path, to: &Path| {
-        if let Err(e) = fs::copy(from, to) {
-            sess.emit_err(errors::CopyPath::new(from, to, e));
+    let copy_gracefully = |from: &Path, to: &OutFileName| match to {
+        OutFileName::Stdout => {
+            if let Err(e) = copy_to_stdout(from) {
+                sess.emit_err(errors::CopyPath::new(from, to.as_path(), e));
+            }
+        }
+        OutFileName::Real(path) => {
+            if let Err(e) = fs::copy(from, path) {
+                sess.emit_err(errors::CopyPath::new(from, path, e));
+            }
         }
     };
 
@@ -546,7 +555,12 @@ fn produce_final_output_artifacts(
             //    to copy `foo.0.x` to `foo.x`.
             let module_name = Some(&compiled_modules.modules[0].name[..]);
             let path = crate_output.temp_path(output_type, module_name);
-            copy_gracefully(&path, &crate_output.path(output_type));
+            let output = crate_output.path(output_type);
+            if !output_type.is_text_output() && output.is_tty() {
+                sess.emit_err(errors::BinaryOutputToTty { shorthand: output_type.shorthand() });
+            } else {
+                copy_gracefully(&path, &output);
+            }
             if !sess.opts.cg.save_temps && !keep_numbered {
                 // The user just wants `foo.x`, not `foo.#module-name#.x`.
                 ensure_removed(sess.diagnostic(), &path);
@@ -871,7 +885,7 @@ fn execute_copy_from_cache_work_item<B: ExtraBackendMethods>(
     let load_from_incr_comp_dir = |output_path: PathBuf, saved_path: &str| {
         let source_file = in_incr_comp_dir(&incr_comp_session_dir, saved_path);
         debug!(
-            "copying pre-existing module `{}` from {:?} to {}",
+            "copying preexisting module `{}` from {:?} to {}",
             module.name,
             source_file,
             output_path.display()
@@ -1451,8 +1465,8 @@ fn start_executing_work<B: ExtraBackendMethods>(
                         Err(e) => {
                             let msg = &format!("failed to acquire jobserver token: {}", e);
                             shared_emitter.fatal(msg);
-                            // Exit the coordinator thread
-                            panic!("{}", msg)
+                            codegen_done = true;
+                            codegen_aborted = true;
                         }
                     }
                 }
@@ -1799,7 +1813,7 @@ impl SharedEmitterMain {
                     handler.emit_diagnostic(&mut d);
                 }
                 Ok(SharedEmitterMessage::InlineAsmError(cookie, msg, level, source)) => {
-                    let msg = msg.strip_prefix("error: ").unwrap_or(&msg);
+                    let msg = msg.strip_prefix("error: ").unwrap_or(&msg).to_string();
 
                     let mut err = match level {
                         Level::Error { lint: false } => sess.struct_err(msg).forget_guarantee(),
@@ -1820,9 +1834,15 @@ impl SharedEmitterMain {
                         let source = sess
                             .source_map()
                             .new_source_file(FileName::inline_asm_source_code(&buffer), buffer);
-                        let source_span = Span::with_root_ctxt(source.start_pos, source.end_pos);
-                        let spans: Vec<_> =
-                            spans.iter().map(|sp| source_span.from_inner(*sp)).collect();
+                        let spans: Vec<_> = spans
+                            .iter()
+                            .map(|sp| {
+                                Span::with_root_ctxt(
+                                    source.normalized_byte_pos(sp.start as u32),
+                                    source.normalized_byte_pos(sp.end as u32),
+                                )
+                            })
+                            .collect();
                         err.span_note(spans, "instantiated into assembly here");
                     }
 
@@ -1832,7 +1852,7 @@ impl SharedEmitterMain {
                     sess.abort_if_errors();
                 }
                 Ok(SharedEmitterMessage::Fatal(msg)) => {
-                    sess.fatal(&msg);
+                    sess.fatal(msg);
                 }
                 Err(_) => {
                     break;
@@ -1878,7 +1898,7 @@ pub struct OngoingCodegen<B: ExtraBackendMethods> {
 }
 
 impl<B: ExtraBackendMethods> OngoingCodegen<B> {
-    pub fn join(self, sess: &Session) -> (CodegenResults, FxHashMap<WorkProductId, WorkProduct>) {
+    pub fn join(self, sess: &Session) -> (CodegenResults, FxIndexMap<WorkProductId, WorkProduct>) {
         let _timer = sess.timer("finish_ongoing_codegen");
 
         self.shared_emitter_main.check(sess, true);

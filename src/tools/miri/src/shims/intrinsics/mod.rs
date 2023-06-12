@@ -26,7 +26,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         args: &[OpTy<'tcx, Provenance>],
         dest: &PlaceTy<'tcx, Provenance>,
         ret: Option<mir::BasicBlock>,
-        _unwind: StackPopUnwind,
+        _unwind: mir::UnwindAction,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
 
@@ -111,8 +111,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let ty_layout = this.layout_of(ty)?;
                 let val_byte = this.read_scalar(val_byte)?.to_u8()?;
                 let ptr = this.read_pointer(ptr)?;
-                let count = this.read_machine_usize(count)?;
-                // `checked_mul` enforces a too small bound (the correct one would probably be machine_isize_max),
+                let count = this.read_target_usize(count)?;
+                // `checked_mul` enforces a too small bound (the correct one would probably be target_isize_max),
                 // but no actual allocation can be big enough for the difference to be noticeable.
                 let byte_count = ty_layout.size.checked_mul(count, this).ok_or_else(|| {
                     err_ub_format!("overflow computing total size of `{intrinsic_name}`")
@@ -124,7 +124,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let [ptr, mask] = check_arg_count(args)?;
 
                 let ptr = this.read_pointer(ptr)?;
-                let mask = this.read_machine_usize(mask)?;
+                let mask = this.read_target_usize(mask)?;
 
                 let masked_addr = Size::from_bytes(ptr.addr().bytes() & mask);
 
@@ -157,6 +157,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             | "ceilf32"
             | "truncf32"
             | "roundf32"
+            | "rintf32"
             => {
                 let [f] = check_arg_count(args)?;
                 // FIXME: Using host floats.
@@ -174,6 +175,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     "ceilf32" => f.ceil(),
                     "truncf32" => f.trunc(),
                     "roundf32" => f.round(),
+                    "rintf32" => f.round_ties_even(),
                     _ => bug!(),
                 };
                 this.write_scalar(Scalar::from_u32(f.to_bits()), dest)?;
@@ -192,6 +194,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             | "ceilf64"
             | "truncf64"
             | "roundf64"
+            | "rintf64"
             => {
                 let [f] = check_arg_count(args)?;
                 // FIXME: Using host floats.
@@ -209,6 +212,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     "ceilf64" => f.ceil(),
                     "truncf64" => f.trunc(),
                     "roundf64" => f.round(),
+                    "rintf64" => f.round_ties_even(),
                     _ => bug!(),
                 };
                 this.write_scalar(Scalar::from_u64(f.to_bits()), dest)?;

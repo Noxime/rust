@@ -5,7 +5,7 @@
 // makes all other generics or inline functions that it references
 // reachable as well.
 
-use rustc_data_structures::fx::FxHashSet;
+use hir::def_id::LocalDefIdSet;
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId};
@@ -13,8 +13,8 @@ use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::Node;
 use rustc_middle::middle::codegen_fn_attrs::{CodegenFnAttrFlags, CodegenFnAttrs};
 use rustc_middle::middle::privacy::{self, Level};
-use rustc_middle::ty::query::Providers;
-use rustc_middle::ty::{self, DefIdTree, TyCtxt};
+use rustc_middle::query::Providers;
+use rustc_middle::ty::{self, TyCtxt};
 use rustc_session::config::CrateType;
 use rustc_target::spec::abi::Abi;
 
@@ -63,7 +63,7 @@ struct ReachableContext<'tcx> {
     tcx: TyCtxt<'tcx>,
     maybe_typeck_results: Option<&'tcx ty::TypeckResults<'tcx>>,
     // The set of items which must be exported in the linkage sense.
-    reachable_symbols: FxHashSet<LocalDefId>,
+    reachable_symbols: LocalDefIdSet,
     // A worklist of item IDs. Each item ID in this worklist will be inlined
     // and will be scanned for further references.
     // FIXME(eddyb) benchmark if this would be faster as a `VecDeque`.
@@ -175,7 +175,7 @@ impl<'tcx> ReachableContext<'tcx> {
 
     // Step 2: Mark all symbols that the symbols on the worklist touch.
     fn propagate(&mut self) {
-        let mut scanned = FxHashSet::default();
+        let mut scanned = LocalDefIdSet::default();
         while let Some(search_item) = self.worklist.pop() {
             if !scanned.insert(search_item) {
                 continue;
@@ -320,31 +320,28 @@ fn check_item<'tcx>(
         worklist.push(id.owner_id.def_id);
     }
 
-    if !matches!(tcx.def_kind(id.owner_id), DefKind::Impl) {
+    if !matches!(tcx.def_kind(id.owner_id), DefKind::Impl { of_trait: true }) {
         return;
     }
 
     // We need only trait impls here, not inherent impls, and only non-exported ones
-    let item = tcx.hir().item(id);
-    if let hir::ItemKind::Impl(hir::Impl { of_trait: Some(ref trait_ref), ref items, .. }) =
-        item.kind
-    {
-        if !effective_visibilities.is_reachable(item.owner_id.def_id) {
-            worklist.extend(items.iter().map(|ii_ref| ii_ref.id.owner_id.def_id));
-
-            let Res::Def(DefKind::Trait, trait_def_id) = trait_ref.path.res else {
-                unreachable!();
-            };
-
-            if !trait_def_id.is_local() {
-                return;
-            }
-
-            worklist.extend(
-                tcx.provided_trait_methods(trait_def_id).map(|assoc| assoc.def_id.expect_local()),
-            );
-        }
+    if effective_visibilities.is_reachable(id.owner_id.def_id) {
+        return;
     }
+
+    let items = tcx.associated_item_def_ids(id.owner_id);
+    worklist.extend(items.iter().map(|ii_ref| ii_ref.expect_local()));
+
+    let Some(trait_def_id) = tcx.trait_id_of_impl(id.owner_id.to_def_id()) else {
+        unreachable!();
+    };
+
+    if !trait_def_id.is_local() {
+        return;
+    }
+
+    worklist
+        .extend(tcx.provided_trait_methods(trait_def_id).map(|assoc| assoc.def_id.expect_local()));
 }
 
 fn has_custom_linkage(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
@@ -364,7 +361,7 @@ fn has_custom_linkage(tcx: TyCtxt<'_>, def_id: LocalDefId) -> bool {
         || codegen_attrs.flags.contains(CodegenFnAttrFlags::USED_LINKER)
 }
 
-fn reachable_set(tcx: TyCtxt<'_>, (): ()) -> FxHashSet<LocalDefId> {
+fn reachable_set(tcx: TyCtxt<'_>, (): ()) -> LocalDefIdSet {
     let effective_visibilities = &tcx.effective_visibilities(());
 
     let any_library =

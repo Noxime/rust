@@ -19,7 +19,7 @@ include!("../dylib_util.rs");
 
 use std::env;
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{exit, Child, Command};
 use std::str::FromStr;
 use std::time::Instant;
 
@@ -47,7 +47,12 @@ fn main() {
     } else {
         ("RUSTC_REAL", "RUSTC_LIBDIR")
     };
-    let stage = env::var("RUSTC_STAGE").expect("RUSTC_STAGE was not set");
+    let stage = env::var("RUSTC_STAGE").unwrap_or_else(|_| {
+        // Don't panic here; it's reasonable to try and run these shims directly. Give a helpful error instead.
+        eprintln!("rustc shim: fatal: RUSTC_STAGE was not set");
+        eprintln!("rustc shim: note: use `x.py build -vvv` to see all environment variables set by bootstrap");
+        exit(101);
+    });
     let sysroot = env::var_os("RUSTC_SYSROOT").expect("RUSTC_SYSROOT was not set");
     let on_fail = env::var_os("RUSTC_ON_FAIL").map(Command::new);
 
@@ -150,7 +155,7 @@ fn main() {
     // allow the `rustc_private` feature to link to other unstable crates
     // also in the sysroot. We also do this for host crates, since those
     // may be proc macros, in which case we might ship them.
-    if env::var_os("RUSTC_FORCE_UNSTABLE").is_some() && (stage != "0" || target.is_some()) {
+    if env::var_os("RUSTC_FORCE_UNSTABLE").is_some() {
         cmd.arg("-Z").arg("force-unstable-if-unmarked");
     }
 
@@ -281,41 +286,49 @@ fn format_rusage_data(_child: Child) -> Option<String> {
 #[cfg(windows)]
 fn format_rusage_data(child: Child) -> Option<String> {
     use std::os::windows::io::AsRawHandle;
-    use winapi::um::{processthreadsapi, psapi, timezoneapi};
-    let handle = child.as_raw_handle();
-    macro_rules! try_bool {
-        ($e:expr) => {
-            if $e != 1 {
-                return None;
-            }
-        };
-    }
+
+    use windows::{
+        Win32::Foundation::HANDLE,
+        Win32::System::ProcessStatus::{
+            K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+        },
+        Win32::System::Threading::GetProcessTimes,
+        Win32::System::Time::FileTimeToSystemTime,
+    };
+
+    let handle = HANDLE(child.as_raw_handle() as isize);
 
     let mut user_filetime = Default::default();
     let mut user_time = Default::default();
     let mut kernel_filetime = Default::default();
     let mut kernel_time = Default::default();
-    let mut memory_counters = psapi::PROCESS_MEMORY_COUNTERS::default();
+    let mut memory_counters = PROCESS_MEMORY_COUNTERS::default();
 
     unsafe {
-        try_bool!(processthreadsapi::GetProcessTimes(
+        GetProcessTimes(
             handle,
             &mut Default::default(),
             &mut Default::default(),
             &mut kernel_filetime,
             &mut user_filetime,
-        ));
-        try_bool!(timezoneapi::FileTimeToSystemTime(&user_filetime, &mut user_time));
-        try_bool!(timezoneapi::FileTimeToSystemTime(&kernel_filetime, &mut kernel_time));
-
-        // Unlike on Linux with RUSAGE_CHILDREN, this will only return memory information for the process
-        // with the given handle and none of that process's children.
-        try_bool!(psapi::GetProcessMemoryInfo(
-            handle as _,
-            &mut memory_counters as *mut _ as _,
-            std::mem::size_of::<psapi::PROCESS_MEMORY_COUNTERS_EX>() as u32,
-        ));
+        )
     }
+    .ok()
+    .ok()?;
+    unsafe { FileTimeToSystemTime(&user_filetime, &mut user_time) }.ok().ok()?;
+    unsafe { FileTimeToSystemTime(&kernel_filetime, &mut kernel_time) }.ok().ok()?;
+
+    // Unlike on Linux with RUSAGE_CHILDREN, this will only return memory information for the process
+    // with the given handle and none of that process's children.
+    unsafe {
+        K32GetProcessMemoryInfo(
+            handle,
+            &mut memory_counters,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        )
+    }
+    .ok()
+    .ok()?;
 
     // Guide on interpreting these numbers:
     // https://docs.microsoft.com/en-us/windows/win32/psapi/process-memory-usage-information

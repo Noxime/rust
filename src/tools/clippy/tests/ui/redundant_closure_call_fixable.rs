@@ -1,7 +1,8 @@
-// run-rustfix
+//@run-rustfix
 
 #![feature(async_closure)]
 #![warn(clippy::redundant_closure_call)]
+#![allow(clippy::redundant_async_block)]
 #![allow(unused)]
 
 async fn something() -> u32 {

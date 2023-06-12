@@ -14,7 +14,7 @@ use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::sorted_map::SortedMap;
 use rustc_error_messages::MultiSpan;
-use rustc_index::vec::IndexVec;
+use rustc_index::IndexVec;
 use rustc_macros::HashStable_Generic;
 use rustc_span::hygiene::MacroKind;
 use rustc_span::source_map::Spanned;
@@ -26,7 +26,7 @@ use rustc_target::spec::abi::Abi;
 use smallvec::SmallVec;
 use std::fmt;
 
-#[derive(Debug, Copy, Clone, Encodable, HashStable_Generic)]
+#[derive(Debug, Copy, Clone, HashStable_Generic)]
 pub struct Lifetime {
     pub hir_id: HirId,
 
@@ -41,8 +41,7 @@ pub struct Lifetime {
     pub res: LifetimeName,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Encodable, Hash, Copy)]
-#[derive(HashStable_Generic)]
+#[derive(Debug, Copy, Clone, HashStable_Generic)]
 pub enum ParamName {
     /// Some user-given name like `T` or `'x`.
     Plain(Ident),
@@ -85,8 +84,7 @@ impl ParamName {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Encodable, Hash, Copy)]
-#[derive(HashStable_Generic)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, HashStable_Generic)]
 pub enum LifetimeName {
     /// User-given names or fresh (synthetic) names.
     Param(LocalDefId),
@@ -182,7 +180,7 @@ impl Lifetime {
 /// A `Path` is essentially Rust's notion of a name; for instance,
 /// `std::cmp::PartialEq`. It's represented as a sequence of identifiers,
 /// along with a bunch of supporting information.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct Path<'hir, R = Res> {
     pub span: Span,
     /// The resolution for the path.
@@ -202,7 +200,7 @@ impl Path<'_> {
 
 /// A segment of a path: an identifier, an optional lifetime, and a set of
 /// types.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct PathSegment<'hir> {
     /// The identifier portion of this path segment.
     pub ident: Ident,
@@ -243,13 +241,13 @@ impl<'hir> PathSegment<'hir> {
     }
 }
 
-#[derive(Encodable, Debug, HashStable_Generic)]
+#[derive(Clone, Copy, Debug, HashStable_Generic)]
 pub struct ConstArg {
     pub value: AnonConst,
     pub span: Span,
 }
 
-#[derive(Encodable, Debug, HashStable_Generic)]
+#[derive(Clone, Copy, Debug, HashStable_Generic)]
 pub struct InferArg {
     pub hir_id: HirId,
     pub span: Span,
@@ -261,7 +259,7 @@ impl InferArg {
     }
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum GenericArg<'hir> {
     Lifetime(&'hir Lifetime),
     Type(&'hir Ty<'hir>),
@@ -318,7 +316,7 @@ impl GenericArg<'_> {
     }
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct GenericArgs<'hir> {
     /// The generic arguments for this path segment.
     pub args: &'hir [GenericArg<'hir>],
@@ -328,7 +326,7 @@ pub struct GenericArgs<'hir> {
     /// Were arguments written in parenthesized form `Fn(T) -> U`?
     /// This is required mostly for pretty-printing and diagnostics,
     /// but also for changing lifetime elision rules to be "function-like".
-    pub parenthesized: bool,
+    pub parenthesized: GenericArgsParentheses,
     /// The span encompassing arguments and the surrounding brackets `<>` or `()`
     ///       Foo<A, B, AssocTy = D>           Fn(T, U, V) -> W
     ///          ^^^^^^^^^^^^^^^^^^^             ^^^^^^^^^
@@ -340,11 +338,16 @@ pub struct GenericArgs<'hir> {
 
 impl<'hir> GenericArgs<'hir> {
     pub const fn none() -> Self {
-        Self { args: &[], bindings: &[], parenthesized: false, span_ext: DUMMY_SP }
+        Self {
+            args: &[],
+            bindings: &[],
+            parenthesized: GenericArgsParentheses::No,
+            span_ext: DUMMY_SP,
+        }
     }
 
     pub fn inputs(&self) -> &[Ty<'hir>] {
-        if self.parenthesized {
+        if self.parenthesized == GenericArgsParentheses::ParenSugar {
             for arg in self.args {
                 match arg {
                     GenericArg::Lifetime(_) => {}
@@ -369,10 +372,10 @@ impl<'hir> GenericArgs<'hir> {
 
     pub fn has_err(&self) -> bool {
         self.args.iter().any(|arg| match arg {
-            GenericArg::Type(ty) => matches!(ty.kind, TyKind::Err),
+            GenericArg::Type(ty) => matches!(ty.kind, TyKind::Err(_)),
             _ => false,
         }) || self.bindings.iter().any(|arg| match arg.kind {
-            TypeBindingKind::Equality { term: Term::Ty(ty) } => matches!(ty.kind, TyKind::Err),
+            TypeBindingKind::Equality { term: Term::Ty(ty) } => matches!(ty.kind, TyKind::Err(_)),
             _ => false,
         })
     }
@@ -417,12 +420,22 @@ impl<'hir> GenericArgs<'hir> {
     }
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug, HashStable_Generic)]
+pub enum GenericArgsParentheses {
+    No,
+    /// Bounds for `feature(return_type_notation)`, like `T: Trait<method(..): Send>`,
+    /// where the args are explicitly elided with `..`
+    ReturnTypeNotation,
+    /// parenthesized function-family traits, like `T: Fn(u32) -> i32`
+    ParenSugar,
+}
+
 /// A modifier on a bound, currently this is only used for `?Sized`, where the
 /// modifier is `Maybe`. Negative bounds should also be handled here.
-#[derive(Copy, Clone, PartialEq, Eq, Encodable, Hash, Debug)]
-#[derive(HashStable_Generic)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, HashStable_Generic)]
 pub enum TraitBoundModifier {
     None,
+    Negative,
     Maybe,
     MaybeConst,
 }
@@ -431,7 +444,7 @@ pub enum TraitBoundModifier {
 /// `typeck::collect::compute_bounds` matches these against
 /// the "special" built-in traits (see `middle::lang_items`) and
 /// detects `Copy`, `Send` and `Sync`.
-#[derive(Clone, Debug, HashStable_Generic)]
+#[derive(Clone, Copy, Debug, HashStable_Generic)]
 pub enum GenericBound<'hir> {
     Trait(PolyTraitRef<'hir>, TraitBoundModifier),
     // FIXME(davidtwco): Introduce `PolyTraitRef::LangItem`
@@ -458,7 +471,7 @@ impl GenericBound<'_> {
 
 pub type GenericBounds<'hir> = &'hir [GenericBound<'hir>];
 
-#[derive(Copy, Clone, PartialEq, Eq, Encodable, Debug, HashStable_Generic)]
+#[derive(Copy, Clone, Debug, HashStable_Generic)]
 pub enum LifetimeParamKind {
     // Indicates that the lifetime definition was explicitly declared (e.g., in
     // `fn foo<'a>(x: &'a u8) -> &'a u8 { x }`).
@@ -472,7 +485,7 @@ pub enum LifetimeParamKind {
     Error,
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum GenericParamKind<'hir> {
     /// A lifetime definition (e.g., `'a: 'b + 'c + 'd`).
     Lifetime {
@@ -489,7 +502,7 @@ pub enum GenericParamKind<'hir> {
     },
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct GenericParam<'hir> {
     pub hir_id: HirId,
     pub def_id: LocalDefId,
@@ -498,6 +511,7 @@ pub struct GenericParam<'hir> {
     pub pure_wrt_drop: bool,
     pub kind: GenericParamKind<'hir>,
     pub colon_span: Option<Span>,
+    pub source: GenericParamSource,
 }
 
 impl<'hir> GenericParam<'hir> {
@@ -516,6 +530,20 @@ impl<'hir> GenericParam<'hir> {
     }
 }
 
+/// Records where the generic parameter originated from.
+///
+/// This can either be from an item's generics, in which case it's typically
+/// early-bound (but can be a late-bound lifetime in functions, for example),
+/// or from a `for<...>` binder, in which case it's late-bound (and notably,
+/// does not show up in the parent item's generics).
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
+pub enum GenericParamSource {
+    // Early or late-bound parameters defined on an item
+    Generics,
+    // Late-bound parameters defined via a `for<...>`
+    Binder,
+}
+
 #[derive(Default)]
 pub struct GenericParamCount {
     pub lifetimes: usize,
@@ -526,7 +554,7 @@ pub struct GenericParamCount {
 
 /// Represents lifetimes and type parameters attached to a declaration
 /// of a function, enum, trait, etc.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct Generics<'hir> {
     pub params: &'hir [GenericParam<'hir>],
     pub predicates: &'hir [WherePredicate<'hir>],
@@ -574,14 +602,11 @@ impl<'hir> Generics<'hir> {
 
     /// If there are generic parameters, return where to introduce a new one.
     pub fn span_for_param_suggestion(&self) -> Option<Span> {
-        if self.params.iter().any(|p| self.span.contains(p.span)) {
+        self.params.iter().any(|p| self.span.contains(p.span)).then(|| {
             // `fn foo<A>(t: impl Trait)`
             //          ^ suggest `, T: Trait` here
-            let span = self.span.with_lo(self.span.hi() - BytePos(1)).shrink_to_lo();
-            Some(span)
-        } else {
-            None
-        }
+            self.span.with_lo(self.span.hi() - BytePos(1)).shrink_to_lo()
+        })
     }
 
     /// `Span` where further predicates would be suggested, accounting for trailing commas, like
@@ -639,7 +664,7 @@ impl<'hir> Generics<'hir> {
                 // We include bounds that come from a `#[derive(_)]` but point at the user's code,
                 // as we use this method to get a span appropriate for suggestions.
                 let bs = bound.span();
-                if bs.can_be_used_for_suggestions() { Some(bs.shrink_to_hi()) } else { None }
+                bs.can_be_used_for_suggestions().then(|| bs.shrink_to_hi())
             },
         )
     }
@@ -701,7 +726,7 @@ impl<'hir> Generics<'hir> {
 }
 
 /// A single predicate in a where-clause.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum WherePredicate<'hir> {
     /// A type binding (e.g., `for<'c> Foo: Send + Clone + 'c`).
     BoundPredicate(WhereBoundPredicate<'hir>),
@@ -745,7 +770,7 @@ pub enum PredicateOrigin {
 }
 
 /// A type bound (e.g., `for<'c> Foo: Send + Clone + 'c`).
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct WhereBoundPredicate<'hir> {
     pub hir_id: HirId,
     pub span: Span,
@@ -762,12 +787,12 @@ pub struct WhereBoundPredicate<'hir> {
 impl<'hir> WhereBoundPredicate<'hir> {
     /// Returns `true` if `param_def_id` matches the `bounded_ty` of this predicate.
     pub fn is_param_bound(&self, param_def_id: DefId) -> bool {
-        self.bounded_ty.as_generic_param().map_or(false, |(def_id, _)| def_id == param_def_id)
+        self.bounded_ty.as_generic_param().is_some_and(|(def_id, _)| def_id == param_def_id)
     }
 }
 
 /// A lifetime predicate (e.g., `'a: 'b + 'c`).
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct WhereRegionPredicate<'hir> {
     pub span: Span,
     pub in_where_clause: bool,
@@ -783,7 +808,7 @@ impl<'hir> WhereRegionPredicate<'hir> {
 }
 
 /// An equality predicate (e.g., `T = int`); currently unsupported.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct WhereEqPredicate<'hir> {
     pub span: Span,
     pub lhs_ty: &'hir Ty<'hir>,
@@ -793,7 +818,7 @@ pub struct WhereEqPredicate<'hir> {
 /// HIR node coupled with its parent's id in the same HIR owner.
 ///
 /// The parent is trash when the node is a HIR owner.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct ParentedNode<'tcx> {
     pub parent: ItemLocalId,
     pub node: Node<'tcx>,
@@ -803,12 +828,13 @@ pub struct ParentedNode<'tcx> {
 #[derive(Debug)]
 pub struct AttributeMap<'tcx> {
     pub map: SortedMap<ItemLocalId, &'tcx [Attribute]>,
-    pub hash: Fingerprint,
+    // Only present when the crate hash is needed.
+    pub opt_hash: Option<Fingerprint>,
 }
 
 impl<'tcx> AttributeMap<'tcx> {
     pub const EMPTY: &'static AttributeMap<'static> =
-        &AttributeMap { map: SortedMap::new(), hash: Fingerprint::ZERO };
+        &AttributeMap { map: SortedMap::new(), opt_hash: Some(Fingerprint::ZERO) };
 
     #[inline]
     pub fn get(&self, id: ItemLocalId) -> &'tcx [Attribute] {
@@ -820,10 +846,9 @@ impl<'tcx> AttributeMap<'tcx> {
 /// These nodes are mapped by `ItemLocalId` alongside the index of their parent node.
 /// The HIR tree, including bodies, is pre-hashed.
 pub struct OwnerNodes<'tcx> {
-    /// Pre-computed hash of the full HIR.
-    pub hash_including_bodies: Fingerprint,
-    /// Pre-computed hash of the item signature, without recursing into the body.
-    pub hash_without_bodies: Fingerprint,
+    /// Pre-computed hash of the full HIR. Used in the crate hash. Only present
+    /// when incr. comp. is enabled.
+    pub opt_hash_including_bodies: Option<Fingerprint>,
     /// Full HIR for the current owner.
     // The zeroth node's parent should never be accessed: the owner's parent is computed by the
     // hir_owner_parent query. It is set to `ItemLocalId::INVALID` to force an ICE if accidentally
@@ -835,7 +860,7 @@ pub struct OwnerNodes<'tcx> {
 
 impl<'tcx> OwnerNodes<'tcx> {
     pub fn node(&self) -> OwnerNode<'tcx> {
-        use rustc_index::vec::Idx;
+        use rustc_index::Idx;
         let node = self.nodes[ItemLocalId::new(0)].as_ref().unwrap().node;
         let node = node.as_owner().unwrap(); // Indexing must ensure it is an OwnerNode.
         node
@@ -860,8 +885,7 @@ impl fmt::Debug for OwnerNodes<'_> {
                     .collect::<Vec<_>>(),
             )
             .field("bodies", &self.bodies)
-            .field("hash_without_bodies", &self.hash_without_bodies)
-            .field("hash_including_bodies", &self.hash_including_bodies)
+            .field("opt_hash_including_bodies", &self.opt_hash_including_bodies)
             .finish()
     }
 }
@@ -928,10 +952,11 @@ impl<T> MaybeOwner<T> {
 #[derive(Debug)]
 pub struct Crate<'hir> {
     pub owners: IndexVec<LocalDefId, MaybeOwner<&'hir OwnerInfo<'hir>>>,
-    pub hir_hash: Fingerprint,
+    // Only present when incr. comp. is enabled.
+    pub opt_hir_hash: Option<Fingerprint>,
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct Closure<'hir> {
     pub def_id: LocalDefId,
     pub binder: ClosureBinder,
@@ -950,7 +975,7 @@ pub struct Closure<'hir> {
 /// A block of statements `{ .. }`, which may have a label (in this case the
 /// `targeted_by_break` field will be `true`) and may be `unsafe` by means of
 /// the `rules` being anything but `DefaultBlock`.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct Block<'hir> {
     /// Statements in a block.
     pub stmts: &'hir [Stmt<'hir>],
@@ -978,7 +1003,7 @@ impl<'hir> Block<'hir> {
     }
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct Pat<'hir> {
     #[stable_hasher(ignore)]
     pub hir_id: HirId,
@@ -990,7 +1015,6 @@ pub struct Pat<'hir> {
 }
 
 impl<'hir> Pat<'hir> {
-    // FIXME(#19596) this is a workaround, but there should be a better way
     fn walk_short_(&self, it: &mut impl FnMut(&Pat<'hir>) -> bool) -> bool {
         if !it(self) {
             return false;
@@ -1018,7 +1042,6 @@ impl<'hir> Pat<'hir> {
         self.walk_short_(&mut it)
     }
 
-    // FIXME(#19596) this is a workaround, but there should be a better way
     fn walk_(&self, it: &mut impl FnMut(&Pat<'hir>) -> bool) {
         if !it(self) {
             return;
@@ -1059,7 +1082,7 @@ impl<'hir> Pat<'hir> {
 /// Patterns like the fields of Foo `{ x, ref y, ref mut z }`
 /// are treated the same as` x: x, y: ref y, z: ref mut z`,
 /// except `is_shorthand` is true.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct PatField<'hir> {
     #[stable_hasher(ignore)]
     pub hir_id: HirId,
@@ -1071,7 +1094,7 @@ pub struct PatField<'hir> {
     pub span: Span,
 }
 
-#[derive(Copy, Clone, PartialEq, Encodable, Debug, HashStable_Generic)]
+#[derive(Copy, Clone, PartialEq, Debug, HashStable_Generic)]
 pub enum RangeEnd {
     Included,
     Excluded,
@@ -1115,7 +1138,7 @@ impl fmt::Debug for DotDotPos {
     }
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum PatKind<'hir> {
     /// Represents a wildcard pattern (i.e., `_`).
     Wild,
@@ -1171,7 +1194,7 @@ pub enum PatKind<'hir> {
     Slice(&'hir [Pat<'hir>], Option<&'hir Pat<'hir>>, &'hir [Pat<'hir>]),
 }
 
-#[derive(Copy, Clone, PartialEq, Encodable, Debug, HashStable_Generic)]
+#[derive(Copy, Clone, PartialEq, Debug, HashStable_Generic)]
 pub enum BinOpKind {
     /// The `+` operator (addition).
     Add,
@@ -1299,7 +1322,7 @@ impl Into<ast::BinOpKind> for BinOpKind {
 
 pub type BinOp = Spanned<BinOpKind>;
 
-#[derive(Copy, Clone, PartialEq, Encodable, Debug, HashStable_Generic)]
+#[derive(Copy, Clone, PartialEq, Debug, HashStable_Generic)]
 pub enum UnOp {
     /// The `*` operator (dereferencing).
     Deref,
@@ -1325,7 +1348,7 @@ impl UnOp {
 }
 
 /// A statement.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct Stmt<'hir> {
     pub hir_id: HirId,
     pub kind: StmtKind<'hir>,
@@ -1333,7 +1356,7 @@ pub struct Stmt<'hir> {
 }
 
 /// The contents of a statement.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum StmtKind<'hir> {
     /// A local (`let`) binding.
     Local(&'hir Local<'hir>),
@@ -1349,7 +1372,7 @@ pub enum StmtKind<'hir> {
 }
 
 /// Represents a `let` statement (i.e., `let <pat>:<ty> = <init>;`).
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct Local<'hir> {
     pub pat: &'hir Pat<'hir>,
     /// Type annotation, if any (otherwise the type will be inferred).
@@ -1367,7 +1390,7 @@ pub struct Local<'hir> {
 
 /// Represents a single arm of a `match` expression, e.g.
 /// `<pat> (if <guard>) => <body>`.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct Arm<'hir> {
     #[stable_hasher(ignore)]
     pub hir_id: HirId,
@@ -1385,7 +1408,7 @@ pub struct Arm<'hir> {
 ///
 /// In an if-let, imagine it as `if (let <pat> = <expr>) { ... }`; in a let-else, it is part of the
 /// desugaring to if-let. Only let-else supports the type annotation at present.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct Let<'hir> {
     pub hir_id: HirId,
     pub span: Span,
@@ -1394,7 +1417,7 @@ pub struct Let<'hir> {
     pub init: &'hir Expr<'hir>,
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum Guard<'hir> {
     If(&'hir Expr<'hir>),
     IfLet(&'hir Let<'hir>),
@@ -1414,7 +1437,7 @@ impl<'hir> Guard<'hir> {
     }
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct ExprField<'hir> {
     #[stable_hasher(ignore)]
     pub hir_id: HirId,
@@ -1424,19 +1447,19 @@ pub struct ExprField<'hir> {
     pub is_shorthand: bool,
 }
 
-#[derive(Copy, Clone, PartialEq, Encodable, Debug, HashStable_Generic)]
+#[derive(Copy, Clone, PartialEq, Debug, HashStable_Generic)]
 pub enum BlockCheckMode {
     DefaultBlock,
     UnsafeBlock(UnsafeSource),
 }
 
-#[derive(Copy, Clone, PartialEq, Encodable, Debug, HashStable_Generic)]
+#[derive(Copy, Clone, PartialEq, Debug, HashStable_Generic)]
 pub enum UnsafeSource {
     CompilerGenerated,
     UserProvided,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Encodable, Decodable, Hash, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct BodyId {
     pub hir_id: HirId,
 }
@@ -1462,7 +1485,7 @@ pub struct BodyId {
 ///
 /// All bodies have an **owner**, which can be accessed via the HIR
 /// map using `body_owner_def_id()`.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct Body<'hir> {
     pub params: &'hir [Param<'hir>],
     pub value: &'hir Expr<'hir>,
@@ -1480,7 +1503,7 @@ impl<'hir> Body<'hir> {
 }
 
 /// The type of source expression that caused this generator to be created.
-#[derive(Clone, PartialEq, PartialOrd, Eq, Hash, Debug, Copy)]
+#[derive(Clone, PartialEq, Eq, Debug, Copy, Hash)]
 #[derive(HashStable_Generic, Encodable, Decodable)]
 pub enum GeneratorKind {
     /// An explicit `async` block or the body of an async function.
@@ -1513,7 +1536,7 @@ impl GeneratorKind {
 ///
 /// This helps error messages but is also used to drive coercions in
 /// type-checking (see #60424).
-#[derive(Clone, PartialEq, PartialOrd, Eq, Hash, Debug, Copy)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Copy)]
 #[derive(HashStable_Generic, Encodable, Decodable)]
 pub enum AsyncGeneratorKind {
     /// An explicit `async` block written by the user.
@@ -1623,7 +1646,7 @@ impl fmt::Display for ConstContext {
 /// A literal.
 pub type Lit = Spanned<LitKind>;
 
-#[derive(Copy, Clone, PartialEq, Eq, Encodable, Debug, HashStable_Generic)]
+#[derive(Copy, Clone, Debug, HashStable_Generic)]
 pub enum ArrayLen {
     Infer(HirId, Span),
     Body(AnonConst),
@@ -1645,15 +1668,23 @@ impl ArrayLen {
 ///
 /// You can check if this anon const is a default in a const param
 /// `const N: usize = { ... }` with `tcx.hir().opt_const_param_default_param_def_id(..)`
-#[derive(Copy, Clone, PartialEq, Eq, Encodable, Debug, HashStable_Generic)]
+#[derive(Copy, Clone, Debug, HashStable_Generic)]
 pub struct AnonConst {
     pub hir_id: HirId,
     pub def_id: LocalDefId,
     pub body: BodyId,
 }
 
+/// An inline constant expression `const { something }`.
+#[derive(Copy, Clone, Debug, HashStable_Generic)]
+pub struct ConstBlock {
+    pub hir_id: HirId,
+    pub def_id: LocalDefId,
+    pub body: BodyId,
+}
+
 /// An expression.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct Expr<'hir> {
     pub hir_id: HirId,
     pub kind: ExprKind<'hir>,
@@ -1663,7 +1694,6 @@ pub struct Expr<'hir> {
 impl Expr<'_> {
     pub fn precedence(&self) -> ExprPrecedence {
         match self.kind {
-            ExprKind::Box(_) => ExprPrecedence::Box,
             ExprKind::ConstBlock(_) => ExprPrecedence::ConstBlock,
             ExprKind::Array(_) => ExprPrecedence::Array,
             ExprKind::Call(..) => ExprPrecedence::Call,
@@ -1690,10 +1720,11 @@ impl Expr<'_> {
             ExprKind::Continue(..) => ExprPrecedence::Continue,
             ExprKind::Ret(..) => ExprPrecedence::Ret,
             ExprKind::InlineAsm(..) => ExprPrecedence::InlineAsm,
+            ExprKind::OffsetOf(..) => ExprPrecedence::OffsetOf,
             ExprKind::Struct(..) => ExprPrecedence::Struct,
             ExprKind::Repeat(..) => ExprPrecedence::Repeat,
             ExprKind::Yield(..) => ExprPrecedence::Yield,
-            ExprKind::Err => ExprPrecedence::Err,
+            ExprKind::Err(_) => ExprPrecedence::Err,
         }
     }
 
@@ -1749,17 +1780,17 @@ impl Expr<'_> {
             | ExprKind::Loop(..)
             | ExprKind::Assign(..)
             | ExprKind::InlineAsm(..)
+            | ExprKind::OffsetOf(..)
             | ExprKind::AssignOp(..)
             | ExprKind::Lit(_)
             | ExprKind::ConstBlock(..)
             | ExprKind::Unary(..)
-            | ExprKind::Box(..)
             | ExprKind::AddrOf(..)
             | ExprKind::Binary(..)
             | ExprKind::Yield(..)
             | ExprKind::Cast(..)
             | ExprKind::DropTemps(..)
-            | ExprKind::Err => false,
+            | ExprKind::Err(_) => false,
         }
     }
 
@@ -1794,7 +1825,7 @@ impl Expr<'_> {
 
     pub fn can_have_side_effects(&self) -> bool {
         match self.peel_drop_temps().kind {
-            ExprKind::Path(_) | ExprKind::Lit(_) => false,
+            ExprKind::Path(_) | ExprKind::Lit(_) | ExprKind::OffsetOf(..) => false,
             ExprKind::Type(base, _)
             | ExprKind::Unary(_, base)
             | ExprKind::Field(base, _)
@@ -1841,19 +1872,17 @@ impl Expr<'_> {
             | ExprKind::InlineAsm(..)
             | ExprKind::AssignOp(..)
             | ExprKind::ConstBlock(..)
-            | ExprKind::Box(..)
             | ExprKind::Binary(..)
             | ExprKind::Yield(..)
             | ExprKind::DropTemps(..)
-            | ExprKind::Err => true,
+            | ExprKind::Err(_) => true,
         }
     }
 
     /// To a first-order approximation, is this a pattern?
     pub fn is_approximately_pattern(&self) -> bool {
         match &self.kind {
-            ExprKind::Box(_)
-            | ExprKind::Array(_)
+            ExprKind::Array(_)
             | ExprKind::Call(..)
             | ExprKind::Tup(_)
             | ExprKind::Lit(_)
@@ -1898,12 +1927,10 @@ pub fn is_range_literal(expr: &Expr<'_>) -> bool {
     }
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum ExprKind<'hir> {
-    /// A `box x` expression.
-    Box(&'hir Expr<'hir>),
     /// Allow anonymous constants from an inline `const` block
-    ConstBlock(AnonConst),
+    ConstBlock(ConstBlock),
     /// An array (e.g., `[a, b, c, d]`).
     Array(&'hir [Expr<'hir>]),
     /// A function call.
@@ -1937,10 +1964,10 @@ pub enum ExprKind<'hir> {
     /// A unary operation (e.g., `!x`, `*x`).
     Unary(UnOp, &'hir Expr<'hir>),
     /// A literal (e.g., `1`, `"foo"`).
-    Lit(Lit),
+    Lit(&'hir Lit),
     /// A cast (e.g., `foo as f64`).
     Cast(&'hir Expr<'hir>, &'hir Ty<'hir>),
-    /// A type reference (e.g., `Foo`).
+    /// A type ascription (e.g., `x: Foo`). See RFC 3307.
     Type(&'hir Expr<'hir>, &'hir Ty<'hir>),
     /// Wraps the expression in a terminating scope.
     /// This makes it semantically equivalent to `{ let _t = expr; _t }`.
@@ -2002,6 +2029,9 @@ pub enum ExprKind<'hir> {
     /// Inline assembly (from `asm!`), with its outputs and inputs.
     InlineAsm(&'hir InlineAsm<'hir>),
 
+    /// Field offset (`offset_of!`)
+    OffsetOf(&'hir Ty<'hir>, &'hir [Ident]),
+
     /// A struct or struct-like variant literal expression.
     ///
     /// E.g., `Foo {x: 1, y: 2}`, or `Foo {x: 1, .. base}`,
@@ -2018,7 +2048,7 @@ pub enum ExprKind<'hir> {
     Yield(&'hir Expr<'hir>, YieldSource),
 
     /// A placeholder for an expression that wasn't syntactically well formed in some way.
-    Err,
+    Err(rustc_span::ErrorGuaranteed),
 }
 
 /// Represents an optionally `Self`-qualified value/type path or associated extension.
@@ -2026,7 +2056,7 @@ pub enum ExprKind<'hir> {
 /// To resolve the path to a `DefId`, call [`qpath_res`].
 ///
 /// [`qpath_res`]: ../../rustc_middle/ty/struct.TypeckResults.html#method.qpath_res
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum QPath<'hir> {
     /// Path to a definition, optionally "fully-qualified" with a `Self`
     /// type, if the path points to an associated item in a trait.
@@ -2080,7 +2110,7 @@ impl<'hir> QPath<'hir> {
 }
 
 /// Hints at the original code for a let statement.
-#[derive(Copy, Clone, Encodable, Debug, HashStable_Generic)]
+#[derive(Copy, Clone, Debug, HashStable_Generic)]
 pub enum LocalSource {
     /// A `match _ { .. }`.
     Normal,
@@ -2133,7 +2163,7 @@ impl MatchSource {
 }
 
 /// The loop type that yielded an `ExprKind::Loop`.
-#[derive(Copy, Clone, PartialEq, Encodable, Debug, HashStable_Generic)]
+#[derive(Copy, Clone, PartialEq, Debug, HashStable_Generic)]
 pub enum LoopSource {
     /// A `loop { .. }` loop.
     Loop,
@@ -2153,7 +2183,7 @@ impl LoopSource {
     }
 }
 
-#[derive(Copy, Clone, Encodable, Debug, HashStable_Generic)]
+#[derive(Copy, Clone, Debug, HashStable_Generic)]
 pub enum LoopIdError {
     OutsideLoopScope,
     UnlabeledCfInWhileCondition,
@@ -2172,7 +2202,7 @@ impl fmt::Display for LoopIdError {
     }
 }
 
-#[derive(Copy, Clone, Encodable, Debug, HashStable_Generic)]
+#[derive(Copy, Clone, Debug, HashStable_Generic)]
 pub struct Destination {
     /// This is `Some(_)` iff there is an explicit user-specified 'label
     pub label: Option<Label>,
@@ -2183,7 +2213,7 @@ pub struct Destination {
 }
 
 /// The yield kind that caused an `ExprKind::Yield`.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Encodable, Decodable, HashStable_Generic)]
+#[derive(Copy, Clone, Debug, HashStable_Generic)]
 pub enum YieldSource {
     /// An `<expr>.await`.
     Await { expr: Option<HirId> },
@@ -2218,7 +2248,7 @@ impl From<GeneratorKind> for YieldSource {
 
 // N.B., if you change this, you'll probably want to change the corresponding
 // type structure in middle/ty.rs as well.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct MutTy<'hir> {
     pub ty: &'hir Ty<'hir>,
     pub mutbl: Mutability,
@@ -2226,7 +2256,7 @@ pub struct MutTy<'hir> {
 
 /// Represents a function's signature in a trait declaration,
 /// trait implementation, or a free function.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct FnSig<'hir> {
     pub header: FnHeader,
     pub decl: &'hir FnDecl<'hir>,
@@ -2253,7 +2283,7 @@ impl TraitItemId {
 /// possibly including a default implementation. A trait item is
 /// either required (meaning it doesn't have an implementation, just a
 /// signature) or provided (meaning it has a default implementation).
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct TraitItem<'hir> {
     pub ident: Ident,
     pub owner_id: OwnerId,
@@ -2302,7 +2332,7 @@ impl<'hir> TraitItem<'hir> {
 }
 
 /// Represents a trait method's body (or just argument names).
-#[derive(Encodable, Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum TraitFn<'hir> {
     /// No default body in the trait, just a signature.
     Required(&'hir [Ident]),
@@ -2312,7 +2342,7 @@ pub enum TraitFn<'hir> {
 }
 
 /// Represents a trait method or associated constant or type
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum TraitItemKind<'hir> {
     /// An associated constant with an optional value (otherwise `impl`s must contain a value).
     Const(&'hir Ty<'hir>, Option<BodyId>),
@@ -2340,7 +2370,7 @@ impl ImplItemId {
 }
 
 /// Represents anything within an `impl` block.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct ImplItem<'hir> {
     pub ident: Ident,
     pub owner_id: OwnerId,
@@ -2390,7 +2420,7 @@ impl<'hir> ImplItem<'hir> {
 }
 
 /// Represents various kinds of content within an `impl`.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum ImplItemKind<'hir> {
     /// An associated constant of the given type, set to the constant result
     /// of the expression.
@@ -2419,7 +2449,7 @@ pub const FN_OUTPUT_NAME: Symbol = sym::Output;
 ///    Binding(...),
 /// }
 /// ```
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct TypeBinding<'hir> {
     pub hir_id: HirId,
     pub ident: Ident,
@@ -2428,7 +2458,7 @@ pub struct TypeBinding<'hir> {
     pub span: Span,
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum Term<'hir> {
     Ty(&'hir Ty<'hir>),
     Const(AnonConst),
@@ -2447,7 +2477,7 @@ impl<'hir> From<AnonConst> for Term<'hir> {
 }
 
 // Represents the two kinds of type bindings.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum TypeBindingKind<'hir> {
     /// E.g., `Foo<Bar: Send>`.
     Constraint { bounds: &'hir [GenericBound<'hir>] },
@@ -2470,7 +2500,7 @@ impl TypeBinding<'_> {
     }
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct Ty<'hir> {
     pub hir_id: HirId,
     pub kind: TyKind<'hir>,
@@ -2615,7 +2645,7 @@ impl PrimTy {
     }
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct BareFnTy<'hir> {
     pub unsafety: Unsafety,
     pub abi: Abi,
@@ -2624,7 +2654,7 @@ pub struct BareFnTy<'hir> {
     pub param_names: &'hir [Ident],
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct OpaqueTy<'hir> {
     pub generics: &'hir Generics<'hir>,
     pub bounds: GenericBounds<'hir>,
@@ -2633,18 +2663,21 @@ pub struct OpaqueTy<'hir> {
 }
 
 /// From whence the opaque type came.
-#[derive(Copy, Clone, PartialEq, Eq, Encodable, Decodable, Debug, HashStable_Generic)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, HashStable_Generic)]
 pub enum OpaqueTyOrigin {
     /// `-> impl Trait`
     FnReturn(LocalDefId),
     /// `async fn`
     AsyncFn(LocalDefId),
     /// type aliases: `type Foo = impl Trait;`
-    TyAlias,
+    TyAlias {
+        /// associated types in impl blocks for traits.
+        in_assoc_ty: bool,
+    },
 }
 
 /// The various kinds of types recognized by the compiler.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum TyKind<'hir> {
     /// A variable length slice (i.e., `[T]`).
     Slice(&'hir Ty<'hir>),
@@ -2681,10 +2714,10 @@ pub enum TyKind<'hir> {
     /// specified. This can appear anywhere in a type.
     Infer,
     /// Placeholder for a type that has failed to be defined.
-    Err,
+    Err(rustc_span::ErrorGuaranteed),
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum InlineAsmOperand<'hir> {
     In {
         reg: InlineAsmRegOrRegClass,
@@ -2737,7 +2770,7 @@ impl<'hir> InlineAsmOperand<'hir> {
     }
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct InlineAsm<'hir> {
     pub template: &'hir [InlineAsmTemplatePiece],
     pub template_strs: &'hir [(Symbol, Option<Symbol>, Span)],
@@ -2747,7 +2780,7 @@ pub struct InlineAsm<'hir> {
 }
 
 /// Represents a parameter in a function header.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct Param<'hir> {
     pub hir_id: HirId,
     pub pat: &'hir Pat<'hir>,
@@ -2756,7 +2789,7 @@ pub struct Param<'hir> {
 }
 
 /// Represents the header (not the body) of a function declaration.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct FnDecl<'hir> {
     /// The types of the function's parameters.
     ///
@@ -2793,7 +2826,7 @@ impl ImplicitSelfKind {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Encodable, Decodable, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Encodable, Decodable, Debug)]
 #[derive(HashStable_Generic)]
 pub enum IsAsync {
     Async,
@@ -2806,7 +2839,7 @@ impl IsAsync {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Encodable, Decodable, HashStable_Generic)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Encodable, Decodable, HashStable_Generic)]
 pub enum Defaultness {
     Default { has_value: bool },
     Final,
@@ -2829,7 +2862,7 @@ impl Defaultness {
     }
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum FnRetTy<'hir> {
     /// Return type is not specified.
     ///
@@ -2862,13 +2895,13 @@ pub enum ClosureBinder {
     For { span: Span },
 }
 
-#[derive(Encodable, Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct Mod<'hir> {
     pub spans: ModSpans,
     pub item_ids: &'hir [ItemId],
 }
 
-#[derive(Copy, Clone, Debug, HashStable_Generic, Encodable)]
+#[derive(Copy, Clone, Debug, HashStable_Generic)]
 pub struct ModSpans {
     /// A span from the first token past `{` to the last token until `}`.
     /// For `mod foo;`, the inner span ranges from the first token
@@ -2877,12 +2910,12 @@ pub struct ModSpans {
     pub inject_use_span: Span,
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct EnumDef<'hir> {
     pub variants: &'hir [Variant<'hir>],
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct Variant<'hir> {
     /// Name of the variant.
     pub ident: Ident,
@@ -2897,7 +2930,7 @@ pub struct Variant<'hir> {
     pub span: Span,
 }
 
-#[derive(Copy, Clone, PartialEq, Encodable, Debug, HashStable_Generic)]
+#[derive(Copy, Clone, PartialEq, Debug, HashStable_Generic)]
 pub enum UseKind {
     /// One import, e.g., `use foo::bar` or `use foo::bar as baz`.
     /// Also produced for each element of a list `use`, e.g.
@@ -2919,7 +2952,7 @@ pub enum UseKind {
 /// that the `ref_id` is for. Note that `ref_id`'s value is not the `HirId` of the
 /// trait being referred to but just a unique `HirId` that serves as a key
 /// within the resolution map.
-#[derive(Clone, Debug, HashStable_Generic)]
+#[derive(Clone, Debug, Copy, HashStable_Generic)]
 pub struct TraitRef<'hir> {
     pub path: &'hir Path<'hir>,
     // Don't hash the `ref_id`. It is tracked via the thing it is used to access.
@@ -2938,7 +2971,7 @@ impl TraitRef<'_> {
     }
 }
 
-#[derive(Clone, Debug, HashStable_Generic)]
+#[derive(Clone, Debug, Copy, HashStable_Generic)]
 pub struct PolyTraitRef<'hir> {
     /// The `'a` in `for<'a> Foo<&'a T>`.
     pub bound_generic_params: &'hir [GenericParam<'hir>],
@@ -2949,7 +2982,7 @@ pub struct PolyTraitRef<'hir> {
     pub span: Span,
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct FieldDef<'hir> {
     pub span: Span,
     pub vis_span: Span,
@@ -2968,7 +3001,7 @@ impl FieldDef<'_> {
 }
 
 /// Fields and constructor IDs of enum variants and structs.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum VariantData<'hir> {
     /// A struct variant.
     ///
@@ -3038,7 +3071,7 @@ impl ItemId {
 /// An item
 ///
 /// The name might be a dummy name in case of anonymous items
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct Item<'hir> {
     pub ident: Ident,
     pub owner_id: OwnerId,
@@ -3126,7 +3159,6 @@ impl<'hir> Item<'hir> {
         (ty, gen)
     }
 
-    /// An opaque `impl Trait` type alias, e.g., `type Foo = impl Bar;`.
     /// Expect an [`ItemKind::OpaqueTy`] or panic.
     #[track_caller]
     pub fn expect_opaque_ty(&self) -> &OpaqueTy<'hir> {
@@ -3148,7 +3180,6 @@ impl<'hir> Item<'hir> {
         (data, gen)
     }
 
-    /// A union definition, e.g., `union Foo<A, B> {x: A, y: B}`.
     /// Expect an [`ItemKind::Union`] or panic.
     #[track_caller]
     pub fn expect_union(&self) -> (&VariantData<'hir>, &'hir Generics<'hir>) {
@@ -3210,7 +3241,7 @@ impl fmt::Display for Unsafety {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[derive(Encodable, Decodable, HashStable_Generic)]
 pub enum Constness {
     Const,
@@ -3226,7 +3257,7 @@ impl fmt::Display for Constness {
     }
 }
 
-#[derive(Copy, Clone, Encodable, Debug, HashStable_Generic)]
+#[derive(Copy, Clone, Debug, HashStable_Generic)]
 pub struct FnHeader {
     pub unsafety: Unsafety,
     pub constness: Constness,
@@ -3248,7 +3279,7 @@ impl FnHeader {
     }
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum ItemKind<'hir> {
     /// An `extern crate` item, with optional *original* crate name if the crate was renamed.
     ///
@@ -3269,7 +3300,7 @@ pub enum ItemKind<'hir> {
     /// A function declaration.
     Fn(FnSig<'hir>, &'hir Generics<'hir>, BodyId),
     /// A MBE macro definition (`macro_rules!` or `macro`).
-    Macro(ast::MacroDef, MacroKind),
+    Macro(&'hir ast::MacroDef, MacroKind),
     /// A module.
     Mod(&'hir Mod<'hir>),
     /// An external module, e.g. `extern { .. }`.
@@ -3295,7 +3326,7 @@ pub enum ItemKind<'hir> {
     Impl(&'hir Impl<'hir>),
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct Impl<'hir> {
     pub unsafety: Unsafety,
     pub polarity: ImplPolarity,
@@ -3358,7 +3389,7 @@ impl ItemKind<'_> {
 /// type or method, and whether it is public). This allows other
 /// passes to find the impl they want without loading the ID (which
 /// means fewer edges in the incremental compilation graph).
-#[derive(Encodable, Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct TraitItemRef {
     pub id: TraitItemId,
     pub ident: Ident,
@@ -3372,7 +3403,7 @@ pub struct TraitItemRef {
 /// type or method, and whether it is public). This allows other
 /// passes to find the impl they want without loading the ID (which
 /// means fewer edges in the incremental compilation graph).
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct ImplItemRef {
     pub id: ImplItemId,
     pub ident: Ident,
@@ -3382,7 +3413,7 @@ pub struct ImplItemRef {
     pub trait_item_def_id: Option<DefId>,
 }
 
-#[derive(Copy, Clone, PartialEq, Encodable, Debug, HashStable_Generic)]
+#[derive(Copy, Clone, PartialEq, Debug, HashStable_Generic)]
 pub enum AssocItemKind {
     Const,
     Fn { has_self: bool },
@@ -3411,14 +3442,14 @@ impl ForeignItemId {
 /// type or method, and whether it is public). This allows other
 /// passes to find the impl they want without loading the ID (which
 /// means fewer edges in the incremental compilation graph).
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct ForeignItemRef {
     pub id: ForeignItemId,
     pub ident: Ident,
     pub span: Span,
 }
 
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub struct ForeignItem<'hir> {
     pub ident: Ident,
     pub kind: ForeignItemKind<'hir>,
@@ -3440,7 +3471,7 @@ impl ForeignItem<'_> {
 }
 
 /// An item within an `extern` block.
-#[derive(Debug, HashStable_Generic)]
+#[derive(Debug, Clone, Copy, HashStable_Generic)]
 pub enum ForeignItemKind<'hir> {
     /// A foreign function.
     Fn(&'hir FnDecl<'hir>, &'hir [Ident], &'hir Generics<'hir>),
@@ -3451,7 +3482,7 @@ pub enum ForeignItemKind<'hir> {
 }
 
 /// A variable captured by a closure.
-#[derive(Debug, Copy, Clone, Encodable, HashStable_Generic)]
+#[derive(Debug, Copy, Clone, HashStable_Generic)]
 pub struct Upvar {
     /// First span where it is accessed (there can be multiple).
     pub span: Span,
@@ -3460,7 +3491,7 @@ pub struct Upvar {
 // The TraitCandidate's import_ids is empty if the trait is defined in the same module, and
 // has length > 0 if the trait is found through an chain of imports, starting with the
 // import/use statement in the scope where the trait is used.
-#[derive(Encodable, Decodable, Clone, Debug, HashStable_Generic)]
+#[derive(Debug, Clone, HashStable_Generic)]
 pub struct TraitCandidate {
     pub def_id: DefId,
     pub import_ids: SmallVec<[LocalDefId; 1]>,
@@ -3511,12 +3542,20 @@ impl<'hir> OwnerNode<'hir> {
 
     pub fn body_id(&self) -> Option<BodyId> {
         match self {
-            OwnerNode::TraitItem(TraitItem {
-                kind: TraitItemKind::Fn(_, TraitFn::Provided(body_id)),
+            OwnerNode::Item(Item {
+                kind:
+                    ItemKind::Static(_, _, body) | ItemKind::Const(_, body) | ItemKind::Fn(_, _, body),
                 ..
             })
-            | OwnerNode::ImplItem(ImplItem { kind: ImplItemKind::Fn(_, body_id), .. })
-            | OwnerNode::Item(Item { kind: ItemKind::Fn(.., body_id), .. }) => Some(*body_id),
+            | OwnerNode::TraitItem(TraitItem {
+                kind:
+                    TraitItemKind::Fn(_, TraitFn::Provided(body)) | TraitItemKind::Const(_, Some(body)),
+                ..
+            })
+            | OwnerNode::ImplItem(ImplItem {
+                kind: ImplItemKind::Fn(_, body) | ImplItemKind::Const(_, body),
+                ..
+            }) => Some(*body),
             _ => None,
         }
     }
@@ -3610,6 +3649,7 @@ pub enum Node<'hir> {
     Variant(&'hir Variant<'hir>),
     Field(&'hir FieldDef<'hir>),
     AnonConst(&'hir AnonConst),
+    ConstBlock(&'hir ConstBlock),
     Expr(&'hir Expr<'hir>),
     ExprField(&'hir ExprField<'hir>),
     Stmt(&'hir Stmt<'hir>),
@@ -3664,6 +3704,7 @@ impl<'hir> Node<'hir> {
             Node::TypeBinding(b) => Some(b.ident),
             Node::Param(..)
             | Node::AnonConst(..)
+            | Node::ConstBlock(..)
             | Node::Expr(..)
             | Node::Stmt(..)
             | Node::Block(..)
@@ -3711,12 +3752,27 @@ impl<'hir> Node<'hir> {
 
     pub fn body_id(&self) -> Option<BodyId> {
         match self {
-            Node::TraitItem(TraitItem {
-                kind: TraitItemKind::Fn(_, TraitFn::Provided(body_id)),
+            Node::Item(Item {
+                kind:
+                    ItemKind::Static(_, _, body) | ItemKind::Const(_, body) | ItemKind::Fn(_, _, body),
                 ..
             })
-            | Node::ImplItem(ImplItem { kind: ImplItemKind::Fn(_, body_id), .. })
-            | Node::Item(Item { kind: ItemKind::Fn(.., body_id), .. }) => Some(*body_id),
+            | Node::TraitItem(TraitItem {
+                kind:
+                    TraitItemKind::Fn(_, TraitFn::Provided(body)) | TraitItemKind::Const(_, Some(body)),
+                ..
+            })
+            | Node::ImplItem(ImplItem {
+                kind: ImplItemKind::Fn(_, body) | ImplItemKind::Const(_, body),
+                ..
+            })
+            | Node::Expr(Expr {
+                kind:
+                    ExprKind::ConstBlock(ConstBlock { body, .. })
+                    | ExprKind::Closure(Closure { body, .. })
+                    | ExprKind::Repeat(_, ArrayLen::Body(AnonConst { body, .. })),
+                ..
+            }) => Some(*body),
             _ => None,
         }
     }
@@ -3829,6 +3885,13 @@ impl<'hir> Node<'hir> {
     #[track_caller]
     pub fn expect_anon_const(self) -> &'hir AnonConst {
         let Node::AnonConst(this) = self else { self.expect_failed("an anonymous constant") };
+        this
+    }
+
+    /// Expect a [`Node::ConstBlock`] or panic.
+    #[track_caller]
+    pub fn expect_inline_const(self) -> &'hir ConstBlock {
+        let Node::ConstBlock(this) = self else { self.expect_failed("an inline constant") };
         this
     }
 

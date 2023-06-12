@@ -3,7 +3,7 @@ mod generated;
 mod sourcegen;
 
 use expect_test::expect;
-use hir::{db::DefDatabase, Semantics};
+use hir::Semantics;
 use ide_db::{
     base_db::{fixture::WithFixture, FileId, FileRange, SourceDatabaseExt},
     imports::insert_use::{ImportGranularity, InsertUseConfig},
@@ -33,6 +33,20 @@ pub(crate) const TEST_CONFIG: AssistConfig = AssistConfig {
     assist_emit_must_use: false,
 };
 
+pub(crate) const TEST_CONFIG_NO_SNIPPET_CAP: AssistConfig = AssistConfig {
+    snippet_cap: None,
+    allowed: None,
+    insert_use: InsertUseConfig {
+        granularity: ImportGranularity::Crate,
+        prefix_kind: hir::PrefixKind::Plain,
+        enforce_granularity: true,
+        group: true,
+        skip_glob_imports: true,
+    },
+    prefer_no_std: false,
+    assist_emit_must_use: false,
+};
+
 pub(crate) fn with_single_file(text: &str) -> (RootDatabase, FileId) {
     RootDatabase::with_single_file(text)
 }
@@ -41,6 +55,22 @@ pub(crate) fn with_single_file(text: &str) -> (RootDatabase, FileId) {
 pub(crate) fn check_assist(assist: Handler, ra_fixture_before: &str, ra_fixture_after: &str) {
     let ra_fixture_after = trim_indent(ra_fixture_after);
     check(assist, ra_fixture_before, ExpectedResult::After(&ra_fixture_after), None);
+}
+
+#[track_caller]
+pub(crate) fn check_assist_no_snippet_cap(
+    assist: Handler,
+    ra_fixture_before: &str,
+    ra_fixture_after: &str,
+) {
+    let ra_fixture_after = trim_indent(ra_fixture_after);
+    check_with_config(
+        TEST_CONFIG_NO_SNIPPET_CAP,
+        assist,
+        ra_fixture_before,
+        ExpectedResult::After(&ra_fixture_after),
+        None,
+    );
 }
 
 // There is no way to choose what assist within a group you want to test against,
@@ -119,14 +149,24 @@ enum ExpectedResult<'a> {
 
 #[track_caller]
 fn check(handler: Handler, before: &str, expected: ExpectedResult<'_>, assist_label: Option<&str>) {
+    check_with_config(TEST_CONFIG, handler, before, expected, assist_label);
+}
+
+#[track_caller]
+fn check_with_config(
+    config: AssistConfig,
+    handler: Handler,
+    before: &str,
+    expected: ExpectedResult<'_>,
+    assist_label: Option<&str>,
+) {
     let (mut db, file_with_caret_id, range_or_offset) = RootDatabase::with_range_or_offset(before);
-    db.set_enable_proc_attr_macros(true);
+    db.enable_proc_attr_macros();
     let text_without_caret = db.file_text(file_with_caret_id).to_string();
 
     let frange = FileRange { file_id: file_with_caret_id, range: range_or_offset.into() };
 
     let sema = Semantics::new(&db);
-    let config = TEST_CONFIG;
     let ctx = AssistContext::new(sema, &config, frange);
     let resolve = match expected {
         ExpectedResult::Unresolved => AssistResolveStrategy::None,
@@ -233,8 +273,9 @@ fn assist_order_field_struct() {
     assert_eq!(assists.next().expect("expected assist").label, "Generate a getter method");
     assert_eq!(assists.next().expect("expected assist").label, "Generate a mut getter method");
     assert_eq!(assists.next().expect("expected assist").label, "Generate a setter method");
-    assert_eq!(assists.next().expect("expected assist").label, "Convert to tuple struct");
     assert_eq!(assists.next().expect("expected assist").label, "Add `#[derive]`");
+    assert_eq!(assists.next().expect("expected assist").label, "Generate `new`");
+    assert_eq!(assists.next().map(|it| it.label.to_string()), None);
 }
 
 #[test]

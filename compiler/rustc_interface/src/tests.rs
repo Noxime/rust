@@ -2,13 +2,16 @@
 use crate::interface::parse_cfgspecs;
 
 use rustc_data_structures::fx::FxHashSet;
+use rustc_data_structures::profiling::TimePassesFormat;
 use rustc_errors::{emitter::HumanReadableErrorType, registry, ColorConfig};
 use rustc_session::config::rustc_optgroups;
+use rustc_session::config::DebugInfo;
 use rustc_session::config::Input;
+use rustc_session::config::InstrumentXRay;
 use rustc_session::config::TraitSolver;
 use rustc_session::config::{build_configuration, build_session_options, to_crate_config};
 use rustc_session::config::{
-    BranchProtection, Externs, OomStrategy, OutputType, OutputTypes, PAuthKey, PacRet,
+    BranchProtection, Externs, OomStrategy, OutFileName, OutputType, OutputTypes, PAuthKey, PacRet,
     ProcMacroExecutionStrategy, SymbolManglingVersion, WasiExecModel,
 };
 use rustc_session::config::{CFGuard, ExternEntry, LinkerPluginLto, LtoCli, SwitchWithOptPath};
@@ -49,7 +52,8 @@ fn mk_session(matches: getopts::Matches) -> (Session, CfgSpecs) {
         output_file: None,
         temps_dir,
     };
-    let sess = build_session(sessopts, io, None, registry, Default::default(), None, None);
+    let sess =
+        build_session(sessopts, io, None, registry, vec![], Default::default(), None, None, "");
     (sess, cfg)
 }
 
@@ -66,6 +70,7 @@ where
         is_private_dep: false,
         add_prelude: true,
         nounused_dep: false,
+        force: false,
     }
 }
 
@@ -162,8 +167,14 @@ fn test_output_types_tracking_hash_different_paths() {
     let mut v2 = Options::default();
     let mut v3 = Options::default();
 
-    v1.output_types = OutputTypes::new(&[(OutputType::Exe, Some(PathBuf::from("./some/thing")))]);
-    v2.output_types = OutputTypes::new(&[(OutputType::Exe, Some(PathBuf::from("/some/thing")))]);
+    v1.output_types = OutputTypes::new(&[(
+        OutputType::Exe,
+        Some(OutFileName::Real(PathBuf::from("./some/thing"))),
+    )]);
+    v2.output_types = OutputTypes::new(&[(
+        OutputType::Exe,
+        Some(OutFileName::Real(PathBuf::from("/some/thing"))),
+    )]);
     v3.output_types = OutputTypes::new(&[(OutputType::Exe, None)]);
 
     assert_non_crate_hash_different(&v1, &v2);
@@ -177,13 +188,13 @@ fn test_output_types_tracking_hash_different_construction_order() {
     let mut v2 = Options::default();
 
     v1.output_types = OutputTypes::new(&[
-        (OutputType::Exe, Some(PathBuf::from("./some/thing"))),
-        (OutputType::Bitcode, Some(PathBuf::from("./some/thing.bc"))),
+        (OutputType::Exe, Some(OutFileName::Real(PathBuf::from("./some/thing")))),
+        (OutputType::Bitcode, Some(OutFileName::Real(PathBuf::from("./some/thing.bc")))),
     ]);
 
     v2.output_types = OutputTypes::new(&[
-        (OutputType::Bitcode, Some(PathBuf::from("./some/thing.bc"))),
-        (OutputType::Exe, Some(PathBuf::from("./some/thing"))),
+        (OutputType::Bitcode, Some(OutFileName::Real(PathBuf::from("./some/thing.bc")))),
+        (OutputType::Exe, Some(OutFileName::Real(PathBuf::from("./some/thing")))),
     ]);
 
     assert_same_hash(&v1, &v2);
@@ -544,6 +555,7 @@ fn test_codegen_options_tracking_hash() {
     untracked!(ar, String::from("abc"));
     untracked!(codegen_units, Some(42));
     untracked!(default_linker_libraries, true);
+    untracked!(dlltool, Some(PathBuf::from("custom_dlltool.exe")));
     untracked!(extra_filename, String::from("extra-filename"));
     untracked!(incremental, Some(String::from("abc")));
     // `link_arg` is omitted because it just forwards to `link_args`.
@@ -572,7 +584,7 @@ fn test_codegen_options_tracking_hash() {
     tracked!(code_model, Some(CodeModel::Large));
     tracked!(control_flow_guard, CFGuard::Checks);
     tracked!(debug_assertions, Some(true));
-    tracked!(debuginfo, 0xdeadbeef);
+    tracked!(debuginfo, DebugInfo::Limited);
     tracked!(embed_bitcode, false);
     tracked!(force_frame_pointers, Some(false));
     tracked!(force_unwind_tables, Some(true));
@@ -648,7 +660,6 @@ fn test_unstable_options_tracking_hash() {
     untracked!(assert_incr_state, Some(String::from("loaded")));
     untracked!(deduplicate_diagnostics, false);
     untracked!(dep_tasks, true);
-    untracked!(dlltool, Some(PathBuf::from("custom_dlltool.exe")));
     untracked!(dont_buffer_diagnostics, true);
     untracked!(dump_dep_graph, true);
     untracked!(dump_drop_tracking_cfg, Some("cfg.dot".to_string()));
@@ -690,7 +701,6 @@ fn test_unstable_options_tracking_hash() {
     untracked!(proc_macro_execution_strategy, ProcMacroExecutionStrategy::CrossThread);
     untracked!(profile_closures, true);
     untracked!(query_dep_graph, true);
-    untracked!(save_analysis, true);
     untracked!(self_profile, SwitchWithOptPath::Enabled(None));
     untracked!(self_profile_events, Some(vec![String::new()]));
     untracked!(span_debug, true);
@@ -699,6 +709,7 @@ fn test_unstable_options_tracking_hash() {
     untracked!(threads, 99);
     untracked!(time_llvm_passes, true);
     untracked!(time_passes, true);
+    untracked!(time_passes_format, TimePassesFormat::Json);
     untracked!(trace_macros, true);
     untracked!(track_diagnostics, true);
     untracked!(trim_diagnostic_paths, false);
@@ -744,6 +755,7 @@ fn test_unstable_options_tracking_hash() {
     tracked!(emit_thin_lto, false);
     tracked!(export_executable_symbols, true);
     tracked!(fewer_names, Some(true));
+    tracked!(flatten_format_args, false);
     tracked!(force_unstable_if_unmarked, true);
     tracked!(fuel, Some(("abc".to_string(), 99)));
     tracked!(function_sections, Some(false));
@@ -755,14 +767,16 @@ fn test_unstable_options_tracking_hash() {
     tracked!(inline_mir_threshold, Some(123));
     tracked!(instrument_coverage, Some(InstrumentCoverage::All));
     tracked!(instrument_mcount, true);
+    tracked!(instrument_xray, Some(InstrumentXRay::default()));
+    tracked!(link_directives, false);
     tracked!(link_only, true);
     tracked!(llvm_plugins, vec![String::from("plugin_name")]);
     tracked!(location_detail, LocationDetail { file: true, line: false, column: false });
-    tracked!(log_backtrace, Some("filter".to_string()));
     tracked!(maximal_hir_to_mir_coverage, true);
     tracked!(merge_functions, Some(MergeFunctions::Disabled));
     tracked!(mir_emit_retag, true);
     tracked!(mir_enable_passes, vec![("DestProp".to_string(), false)]);
+    tracked!(mir_keep_place_mention, true);
     tracked!(mir_opt_level, Some(4));
     tracked!(move_size_limit, Some(4096));
     tracked!(mutable_noalias, false);
@@ -776,7 +790,6 @@ fn test_unstable_options_tracking_hash() {
     tracked!(packed_bundled_libs, true);
     tracked!(panic_abort_tests, true);
     tracked!(panic_in_drop, PanicStrategy::Abort);
-    tracked!(pick_stable_methods_before_any_unstable, false);
     tracked!(plt, Some(true));
     tracked!(polonius, true);
     tracked!(precise_enum_drop_elaboration, false);
@@ -790,12 +803,16 @@ fn test_unstable_options_tracking_hash() {
     tracked!(remap_cwd_prefix, Some(PathBuf::from("abc")));
     tracked!(report_delayed_bugs, true);
     tracked!(sanitizer, SanitizerSet::ADDRESS);
+    tracked!(sanitizer_cfi_canonical_jump_tables, None);
+    tracked!(sanitizer_cfi_generalize_pointers, Some(true));
+    tracked!(sanitizer_cfi_normalize_integers, Some(true));
     tracked!(sanitizer_memory_track_origins, 2);
     tracked!(sanitizer_recover, SanitizerSet::ADDRESS);
     tracked!(saturating_float_casts, Some(true));
     tracked!(share_generics, Some(true));
     tracked!(show_span, Some(String::from("abc")));
     tracked!(simulate_remapped_rust_src_base, Some(PathBuf::from("/rustc/abc")));
+    tracked!(split_lto_unit, Some(true));
     tracked!(src_hash_algorithm, Some(SourceFileHashAlgorithm::Sha1));
     tracked!(stack_protector, StackProtector::All);
     tracked!(symbol_mangling_version, Some(SymbolManglingVersion::V0));

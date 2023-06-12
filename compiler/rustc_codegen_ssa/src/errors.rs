@@ -1,8 +1,9 @@
 //! Errors emitted by codegen_ssa
 
 use crate::back::command::Command;
+use crate::fluent_generated as fluent;
 use rustc_errors::{
-    fluent, DiagnosticArgValue, DiagnosticBuilder, ErrorGuaranteed, Handler, IntoDiagnostic,
+    DiagnosticArgValue, DiagnosticBuilder, ErrorGuaranteed, Handler, IntoDiagnostic,
     IntoDiagnosticArg,
 };
 use rustc_macros::Diagnostic;
@@ -79,6 +80,12 @@ impl IntoDiagnosticArg for DebugArgPath<'_> {
     fn into_diagnostic_arg(self) -> rustc_errors::DiagnosticArgValue<'static> {
         DiagnosticArgValue::Str(Cow::Owned(format!("{:?}", self.0)))
     }
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_binary_output_to_tty)]
+pub struct BinaryOutputToTty {
+    pub shorthand: &'static str,
 }
 
 #[derive(Diagnostic)]
@@ -335,7 +342,7 @@ pub struct LinkingFailed<'a> {
     pub linker_path: &'a PathBuf,
     pub exit_status: ExitStatus,
     pub command: &'a Command,
-    pub escaped_output: &'a str,
+    pub escaped_output: String,
 }
 
 impl IntoDiagnostic<'_> for LinkingFailed<'_> {
@@ -344,11 +351,13 @@ impl IntoDiagnostic<'_> for LinkingFailed<'_> {
         diag.set_arg("linker_path", format!("{}", self.linker_path.display()));
         diag.set_arg("exit_status", format!("{}", self.exit_status));
 
-        diag.note(format!("{:?}", self.command)).note(self.escaped_output);
+        let contains_undefined_ref = self.escaped_output.contains("undefined reference to");
+
+        diag.note(format!("{:?}", self.command)).note(self.escaped_output.to_string());
 
         // Trying to match an error from OS linkers
         // which by now we have no way to translate.
-        if self.escaped_output.contains("undefined reference to") {
+        if contains_undefined_ref {
             diag.note(fluent::codegen_ssa_extern_funcs_not_found)
                 .note(fluent::codegen_ssa_specify_libraries_to_link)
                 .note(fluent::codegen_ssa_use_cargo_directive);
@@ -388,7 +397,7 @@ pub struct LinkerNotFound {
 #[derive(Diagnostic)]
 #[diag(codegen_ssa_unable_to_exe_linker)]
 #[note]
-#[note(command_note)]
+#[note(codegen_ssa_command_note)]
 pub struct UnableToExeLinker {
     pub linker_path: PathBuf,
     pub error: Error,
@@ -404,8 +413,8 @@ pub struct MsvcMissingLinker;
 pub struct CheckInstalledVisualStudio;
 
 #[derive(Diagnostic)]
-#[diag(codegen_ssa_unsufficient_vs_code_product)]
-pub struct UnsufficientVSCodeProduct;
+#[diag(codegen_ssa_insufficient_vs_code_product)]
+pub struct InsufficientVSCodeProduct;
 
 #[derive(Diagnostic)]
 #[diag(codegen_ssa_processing_dymutil_failed)]
@@ -423,7 +432,7 @@ pub struct UnableToRunDsymutil {
 }
 
 #[derive(Diagnostic)]
-#[diag(codegen_ssa_stripping_debu_info_failed)]
+#[diag(codegen_ssa_stripping_debug_info_failed)]
 #[note]
 pub struct StrippingDebugInfoFailed<'a> {
     pub util: &'a str,
@@ -979,4 +988,38 @@ impl IntoDiagnosticArg for ExpectedPointerMutability {
             ExpectedPointerMutability::Not => DiagnosticArgValue::Str(Cow::Borrowed("*_")),
         }
     }
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_invalid_no_sanitize)]
+#[note]
+pub struct InvalidNoSanitize {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_invalid_link_ordinal_nargs)]
+#[note]
+pub struct InvalidLinkOrdinalNargs {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_illegal_link_ordinal_format)]
+#[note]
+pub struct InvalidLinkOrdinalFormat {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(codegen_ssa_target_feature_safe_trait)]
+pub struct TargetFeatureSafeTrait {
+    #[primary_span]
+    #[label]
+    pub span: Span,
+    #[label(codegen_ssa_label_def)]
+    pub def: Span,
 }

@@ -1,3 +1,4 @@
+mod impl_trait_in_params;
 mod misnamed_getters;
 mod must_use;
 mod not_unsafe_ptr_arg_deref;
@@ -184,7 +185,7 @@ declare_clippy_lint! {
     /// ### Examples
     /// ```rust
     /// // this could be annotated with `#[must_use]`.
-    /// fn id<T>(t: T) -> T { t }
+    /// pub fn id<T>(t: T) -> T { t }
     /// ```
     #[clippy::version = "1.40.0"]
     pub MUST_USE_CANDIDATE,
@@ -251,6 +252,11 @@ declare_clippy_lint! {
     /// A `Result` is at least as large as the `Err`-variant. While we
     /// expect that variant to be seldomly used, the compiler needs to reserve
     /// and move that much memory every single time.
+    /// Furthermore, errors are often simply passed up the call-stack, making
+    /// use of the `?`-operator and its type-conversion mechanics. If the
+    /// `Err`-variant further up the call-stack stores the `Err`-variant in
+    /// question (as library code often does), it itself needs to be at least
+    /// as large, propagating the problem.
     ///
     /// ### Known problems
     /// The size determined by Clippy is platform-dependent.
@@ -327,6 +333,32 @@ declare_clippy_lint! {
     "getter method returning the wrong field"
 }
 
+declare_clippy_lint! {
+    /// ### What it does
+    /// Lints when `impl Trait` is being used in a function's parameters.
+    /// ### Why is this bad?
+    /// Turbofish syntax (`::<>`) cannot be used when `impl Trait` is being used, making `impl Trait` less powerful. Readability may also be a factor.
+    ///
+    /// ### Example
+    /// ```rust
+    /// trait MyTrait {}
+    /// fn foo(a: impl MyTrait) {
+    /// 	// [...]
+    /// }
+    /// ```
+    /// Use instead:
+    /// ```rust
+    /// trait MyTrait {}
+    /// fn foo<T: MyTrait>(a: T) {
+    /// 	// [...]
+    /// }
+    /// ```
+    #[clippy::version = "1.69.0"]
+    pub IMPL_TRAIT_IN_PARAMS,
+    restriction,
+    "`impl Trait` is used in the function's parameters"
+}
+
 #[derive(Copy, Clone)]
 pub struct Functions {
     too_many_arguments_threshold: u64,
@@ -354,6 +386,7 @@ impl_lint_pass!(Functions => [
     RESULT_UNIT_ERR,
     RESULT_LARGE_ERR,
     MISNAMED_GETTERS,
+    IMPL_TRAIT_IN_PARAMS,
 ]);
 
 impl<'tcx> LateLintPass<'tcx> for Functions {
@@ -371,6 +404,7 @@ impl<'tcx> LateLintPass<'tcx> for Functions {
         too_many_lines::check_fn(cx, kind, span, body, self.too_many_lines_threshold);
         not_unsafe_ptr_arg_deref::check_fn(cx, kind, decl, body, def_id);
         misnamed_getters::check_fn(cx, kind, decl, body, span);
+        impl_trait_in_params::check_fn(cx, &kind, body, hir_id);
     }
 
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx hir::Item<'_>) {

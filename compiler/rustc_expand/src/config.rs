@@ -12,8 +12,8 @@ use rustc_ast::tokenstream::{LazyAttrTokenStream, TokenTree};
 use rustc_ast::NodeId;
 use rustc_ast::{self as ast, AttrStyle, Attribute, HasAttrs, HasTokens, MetaItem};
 use rustc_attr as attr;
+use rustc_data_structures::flat_map_in_place::FlatMapInPlace;
 use rustc_data_structures::fx::FxHashMap;
-use rustc_data_structures::map_in_place::MapInPlace;
 use rustc_feature::{Feature, Features, State as FeatureState};
 use rustc_feature::{
     ACCEPTED_FEATURES, ACTIVE_FEATURES, REMOVED_FEATURES, STABLE_REMOVED_FEATURES,
@@ -36,7 +36,7 @@ pub struct StripUnconfigured<'a> {
     pub lint_node_id: NodeId,
 }
 
-fn get_features(sess: &Session, krate_attrs: &[ast::Attribute]) -> Features {
+pub fn features(sess: &Session, krate_attrs: &[Attribute]) -> Features {
     fn feature_removed(sess: &Session, span: Span, reason: Option<&str>) {
         sess.emit_err(FeatureRemoved {
             span,
@@ -190,39 +190,18 @@ fn get_features(sess: &Session, krate_attrs: &[ast::Attribute]) -> Features {
     features
 }
 
-/// `cfg_attr`-process the crate's attributes and compute the crate's features.
-pub fn features(
-    sess: &Session,
-    mut krate: ast::Crate,
-    lint_node_id: NodeId,
-) -> (ast::Crate, Features) {
-    let mut strip_unconfigured =
-        StripUnconfigured { sess, features: None, config_tokens: false, lint_node_id };
-
-    let unconfigured_attrs = krate.attrs.clone();
-    let diag = &sess.parse_sess.span_diagnostic;
-    let err_count = diag.err_count();
-    let features = match strip_unconfigured.configure_krate_attrs(krate.attrs) {
-        None => {
-            // The entire crate is unconfigured.
-            krate.attrs = ast::AttrVec::new();
-            krate.items = Vec::new();
-            Features::default()
-        }
-        Some(attrs) => {
-            krate.attrs = attrs;
-            let features = get_features(sess, &krate.attrs);
-            if err_count == diag.err_count() {
-                // Avoid reconfiguring malformed `cfg_attr`s.
-                strip_unconfigured.features = Some(&features);
-                // Run configuration again, this time with features available
-                // so that we can perform feature-gating.
-                strip_unconfigured.configure_krate_attrs(unconfigured_attrs);
-            }
-            features
-        }
+pub fn pre_configure_attrs(sess: &Session, attrs: &[Attribute]) -> ast::AttrVec {
+    let strip_unconfigured = StripUnconfigured {
+        sess,
+        features: None,
+        config_tokens: false,
+        lint_node_id: ast::CRATE_NODE_ID,
     };
-    (krate, features)
+    attrs
+        .iter()
+        .flat_map(|attr| strip_unconfigured.process_cfg_attr(attr))
+        .take_while(|attr| !is_cfg(attr) || strip_unconfigured.cfg_true(attr).0)
+        .collect()
 }
 
 #[macro_export]
@@ -238,12 +217,10 @@ macro_rules! configure {
 impl<'a> StripUnconfigured<'a> {
     pub fn configure<T: HasAttrs + HasTokens>(&self, mut node: T) -> Option<T> {
         self.process_cfg_attrs(&mut node);
-        if self.in_cfg(node.attrs()) {
+        self.in_cfg(node.attrs()).then(|| {
             self.try_configure_tokens(&mut node);
-            Some(node)
-        } else {
-            None
-        }
+            node
+        })
     }
 
     fn try_configure_tokens<T: HasTokens>(&self, node: &mut T) {
@@ -253,11 +230,6 @@ impl<'a> StripUnconfigured<'a> {
                 *tokens = LazyAttrTokenStream::new(self.configure_tokens(&attr_stream));
             }
         }
-    }
-
-    fn configure_krate_attrs(&self, mut attrs: ast::AttrVec) -> Option<ast::AttrVec> {
-        attrs.flat_map_in_place(|attr| self.process_cfg_attr(attr));
-        if self.in_cfg(&attrs) { Some(attrs) } else { None }
     }
 
     /// Performs cfg-expansion on `stream`, producing a new `AttrTokenStream`.
@@ -282,7 +254,7 @@ impl<'a> StripUnconfigured<'a> {
             .iter()
             .flat_map(|tree| match tree.clone() {
                 AttrTokenTree::Attributes(mut data) => {
-                    data.attrs.flat_map_in_place(|attr| self.process_cfg_attr(attr));
+                    data.attrs.flat_map_in_place(|attr| self.process_cfg_attr(&attr));
 
                     if self.in_cfg(&data.attrs) {
                         data.tokens = LazyAttrTokenStream::new(
@@ -320,12 +292,16 @@ impl<'a> StripUnconfigured<'a> {
     /// the syntax of any `cfg_attr` is incorrect.
     fn process_cfg_attrs<T: HasAttrs>(&self, node: &mut T) {
         node.visit_attrs(|attrs| {
-            attrs.flat_map_in_place(|attr| self.process_cfg_attr(attr));
+            attrs.flat_map_in_place(|attr| self.process_cfg_attr(&attr));
         });
     }
 
-    fn process_cfg_attr(&self, attr: Attribute) -> Vec<Attribute> {
-        if attr.has_name(sym::cfg_attr) { self.expand_cfg_attr(attr, true) } else { vec![attr] }
+    fn process_cfg_attr(&self, attr: &Attribute) -> Vec<Attribute> {
+        if attr.has_name(sym::cfg_attr) {
+            self.expand_cfg_attr(attr, true)
+        } else {
+            vec![attr.clone()]
+        }
     }
 
     /// Parse and expand a single `cfg_attr` attribute into a list of attributes
@@ -335,9 +311,9 @@ impl<'a> StripUnconfigured<'a> {
     /// Gives a compiler warning when the `cfg_attr` contains no attributes and
     /// is in the original source file. Gives a compiler error if the syntax of
     /// the attribute is incorrect.
-    pub(crate) fn expand_cfg_attr(&self, attr: Attribute, recursive: bool) -> Vec<Attribute> {
+    pub(crate) fn expand_cfg_attr(&self, attr: &Attribute, recursive: bool) -> Vec<Attribute> {
         let Some((cfg_predicate, expanded_attrs)) =
-            rustc_parse::parse_cfg_attr(&attr, &self.sess.parse_sess) else {
+            rustc_parse::parse_cfg_attr(attr, &self.sess.parse_sess) else {
                 return vec![];
             };
 
@@ -366,10 +342,10 @@ impl<'a> StripUnconfigured<'a> {
             //  `#[cfg_attr(false, cfg_attr(true, some_attr))]`.
             expanded_attrs
                 .into_iter()
-                .flat_map(|item| self.process_cfg_attr(self.expand_cfg_attr_item(&attr, item)))
+                .flat_map(|item| self.process_cfg_attr(&self.expand_cfg_attr_item(attr, item)))
                 .collect()
         } else {
-            expanded_attrs.into_iter().map(|item| self.expand_cfg_attr_item(&attr, item)).collect()
+            expanded_attrs.into_iter().map(|item| self.expand_cfg_attr_item(attr, item)).collect()
         }
     }
 
@@ -442,20 +418,28 @@ impl<'a> StripUnconfigured<'a> {
 
     /// Determines if a node with the given attributes should be included in this configuration.
     fn in_cfg(&self, attrs: &[Attribute]) -> bool {
-        attrs.iter().all(|attr| !is_cfg(attr) || self.cfg_true(attr))
+        attrs.iter().all(|attr| !is_cfg(attr) || self.cfg_true(attr).0)
     }
 
-    pub(crate) fn cfg_true(&self, attr: &Attribute) -> bool {
+    pub(crate) fn cfg_true(&self, attr: &Attribute) -> (bool, Option<MetaItem>) {
         let meta_item = match validate_attr::parse_meta(&self.sess.parse_sess, attr) {
             Ok(meta_item) => meta_item,
             Err(mut err) => {
                 err.emit();
-                return true;
+                return (true, None);
             }
         };
-        parse_cfg(&meta_item, &self.sess).map_or(true, |meta_item| {
-            attr::cfg_matches(&meta_item, &self.sess.parse_sess, self.lint_node_id, self.features)
-        })
+        (
+            parse_cfg(&meta_item, &self.sess).map_or(true, |meta_item| {
+                attr::cfg_matches(
+                    &meta_item,
+                    &self.sess.parse_sess,
+                    self.lint_node_id,
+                    self.features,
+                )
+            }),
+            Some(meta_item),
+        )
     }
 
     /// If attributes are not allowed on expressions, emit an error for `attr`
@@ -492,7 +476,7 @@ impl<'a> StripUnconfigured<'a> {
         //
         // N.B., this is intentionally not part of the visit_expr() function
         //     in order for filter_map_expr() to be able to avoid this check
-        if let Some(attr) = expr.attrs().iter().find(|a| is_cfg(*a)) {
+        if let Some(attr) = expr.attrs().iter().find(|a| is_cfg(a)) {
             self.sess.emit_err(RemoveExprNotSupported { span: attr.span });
         }
 
