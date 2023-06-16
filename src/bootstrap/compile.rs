@@ -948,7 +948,7 @@ fn rustc_llvm_env(builder: &Builder<'_>, cargo: &mut Cargo, target: TargetSelect
     let target_config = builder.config.target_config.get(&target);
 
     if builder.is_rust_llvm(target) {
-        cargo.env("LLVM_RUSTLLVM", "1");
+        // cargo.env("LLVM_RUSTLLVM", "1"); eat shit
     }
     let llvm::LlvmResult { llvm_config, .. } = builder.ensure(llvm::Llvm { target });
     cargo.env("LLVM_CONFIG", &llvm_config);
